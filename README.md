@@ -1,565 +1,278 @@
-# Engine — Milestone 1: Hello Quad
+# Engine
 
-A small **C++17 game-engine core** built from scratch for **Windows, macOS, and Linux**.
+A small, dependency-light C++17 3D engine core for Windows, macOS, and Linux.
+Renders an animated quad through a real 3D pipeline (perspective camera, view
+transform, depth test, indexed drawing) and ships with an event-driven input
+system and an FPS-style fly camera.
 
-Milestone 1 establishes the engine's first real rendering pipeline:
-
-* Perspective camera
-* View and projection transforms
-* Depth testing
-* Indexed rendering
-* GPU shaders
-* Vertex/index buffers
-* Frame timing and FPS telemetry
-* Basic keyboard input
-* Cross-platform windowing through GLFW
-
-The result is a simple **animated 3D quad** rendered through OpenGL rather than a 2D blit.
+**Current milestone:** M2 — *Event-driven input + fly camera*.
 
 ---
 
-## Milestone 1 — Hello Quad
+## Features
 
-When running the sandbox, you should see a four-colored quad rotating in 3D with perspective foreshortening and depth testing.
+- Cross-platform (Windows / macOS / Linux) C++17 core.
+- Real 3D pipeline: perspective projection, look-at view, depth test, indexed draws.
+- Hand-rolled OpenGL 3.3 core loader (`rendering/GL.h`) — no glad/GLEW dependency.
+- In-house `Vec3` / `Mat4` math (column-major, OpenGL conventions) — no GLM yet.
+- Event-driven input with edge detection (`pressed` / `released`), mouse motion, scroll, and locked-cursor (raw-motion where supported) mode.
+- FPS-style fly camera with clamped pitch, resize-safe aspect, frame-rate-independent movement.
+- Per-frame telemetry in the title bar: resolution, FPS, triangle count.
+- Variable-delta main loop with `dt` clamped to `0.1 s` so debugger pauses or window drags cannot explode simulation state.
+- Minimal math test harness (`engine_math_tests`) wired into CTest.
 
-### Controls
+---
 
-| Key     | Action                  |
-| ------- | ----------------------- |
-| `SPACE` | Pause / resume rotation |
-| `ESC`   | Exit                    |
+## Project layout
 
-The window title displays the current **FPS** and **triangle count**.
+```
+.
+├── CMakeLists.txt          # top-level: project, GLFW fetch, CTest
+├── engine/                 # the engine core (static lib)
+│   ├── CMakeLists.txt
+│   ├── src/
+│   │   ├── core/           # Application — boot, main loop, telemetry
+│   │   ├── platform/       # Window (GLFW), Input (callbacks/edge state), KeyCodes
+│   │   ├── rendering/      # GL loader, Shader, Mesh (VAO/VBO/EBO), Renderer, Camera
+│   │   └── math/           # Vec3, Mat4 (column-major)
+│   └── tests/              # math_tests.cpp — ctest target
+├── sandbox/                # thin client that drives the engine
+│   ├── CMakeLists.txt
+│   └── src/main.cpp
+└── README.md
+```
+
+Dependency rule: `sandbox → engine → glfw`. GL types do not leak into the
+`core` or `platform` public headers.
+
+---
+
+## Prerequisites
+
+- VS Code + extensions (recommended): [CMake Tools](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cmake-tools), [C/C++](https://marketplace.visualstudio.com/items?itemName=ms-vscode.cpptools).
+- C++17 compiler:
+  - **Windows**: Visual Studio 2022 Build Tools (MSVC) or MinGW-w64.
+  - **macOS**: `xcode-select --install`.
+  - **Linux**: `sudo apt install build-essential cmake libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev`.
+- CMake 3.16+.
+- Internet access for the **first** configure — GLFW is fetched once via `FetchContent` into `build/_deps/`. Subsequent offline builds reuse the cached download.
+
+---
+
+## Build & run
+
+### VS Code
+
+1. `File → Open Folder…` (this folder).
+2. `Ctrl+Shift+P → CMake: Select a Kit → choose your compiler`.
+3. Build: `F7`.
+4. Run: `Shift+F5` (target `sandbox`), or run the binary directly:
+   - VS generator: `build\bin\Debug\sandbox.exe`
+   - Ninja/Make:   `build/bin/sandbox`
+
+### Terminal
+
+```bash
+cmake -B build
+cmake --build build
+./build/bin/sandbox            # Windows VS generator: build\bin\Debug\sandbox.exe
+```
+
+### Run the math tests
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+---
+
+## Controls
+
+The sandbox exposes the M2 fly camera over a spinning quad and a reference floor.
+
+| Input             | Action                                                       |
+|-------------------|--------------------------------------------------------------|
+| Left click        | Lock the cursor and look with the mouse.                     |
+| ESC               | Unlock the cursor (when locked); quit (when already unlocked). |
+| W / A / S / D     | Fly forward / left / back / right (`W` follows the view direction, including pitch). |
+| E / Q             | Fly up / down (world-space).                                 |
+| SPACE             | Pause / resume the quad's spin (toggles per press, not while held). |
+
+The window title bar reports `width × height`, current FPS, and triangle count.
 
 ---
 
 ## Architecture
 
-The engine is intentionally split into small modules with narrow interfaces.
+### Module responsibilities
 
-```text
-.
-├── sandbox/
-│   └── Thin client / gameplay / editor shell
-│
-├── engine/
-│   ├── core/
-│   │   └── Application
-│   │       ├── Boot order
-│   │       ├── Main loop
-│   │       ├── Frame timing
-│   │       └── Telemetry
-│   │
-│   ├── platform/
-│   │   └── Window
-│   │       ├── GLFW wrapper
-│   │       ├── Context creation
-│   │       ├── Input polling
-│   │       └── Event handling
-│   │
-│   ├── rendering/
-│   │   ├── GL
-│   │   ├── Shader
-│   │   ├── Mesh
-│   │   └── Renderer
-│   │
-│   └── math/
-│       ├── Vec3
-│       └── Mat4
-│
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── VERIFICATION.md
-│   └── CHANGELOG.md
-│
-└── CMakeLists.txt
-```
+| Module                  | Responsibility                                                            |
+|-------------------------|---------------------------------------------------------------------------|
+| `core::Application`     | Boot order, main loop, frame timing, telemetry (title-bar FPS / tris).    |
+| `platform::Window`      | GLFW wrapper: GL context, swap, vsync, title, framebuffer size, lifecycle.|
+| `platform::Input`       | Keyboard / mouse / cursor state with edge detection; GLFW callbacks.      |
+| `rendering::GL`          | Scoped GL 3.3 core loader (entry points loaded explicitly on demand).     |
+| `rendering::Shader`     | GLSL program compile/link, uniform setters. Move-only.                     |
+| `rendering::Mesh`       | VAO + VBO + EBO for a fixed `{position, color}` vertex layout. Move-only.  |
+| `rendering::Renderer`   | Global GL state, per-frame clear, indexed draw submission, stats.          |
+| `rendering::Camera`     | FPS-style yaw/pitch fly camera with perspective projection.                |
+| `math::Vec3` / `Mat4`   | In-house math, column-major, OpenGL uniform layout.                       |
 
-### Dependency Direction
+### Key decisions (M2)
 
-```text
-sandbox
-   |
-   v
-engine
-   |
-   v
- GLFW
-```
+| Decision                                | Rationale                                                        | Exit condition                                       |
+|-----------------------------------------|------------------------------------------------------------------|------------------------------------------------------|
+| GLFW as the only third-party dependency | Mature, tiny, permissive; window + GL context + input in one.   | Keep.                                                |
+| Hand-scoped GL loader (`rendering/GL.h`) | No glad/GLEW/generator dependency at M1/M2; GL surface stays explicit and reviewable. | Replace with glad2 when >~60 entry points or extensions are needed. |
+| Own `Vec3` / `Mat4`                     | M1/M2 need ~10 ops; no GLM dependency yet.                       | Adopt GLM (or extend) when math demands grow.        |
+| Immediate bind-and-draw submission       | One object on screen.                                            | Batched submission when object counts grow.          |
+| Variable-delta loop, `dt` clamped to 0.1 s | No fixed-step simulation yet.                                  | Fixed timestep with the physics milestone.           |
+| State-snapshot input (not an event queue) | Sufficient for camera controls; press/release edges captured per frame. | Event queue when text input / rebinding / fast-tap fidelity is needed. |
+| Minimal math test harness                | Project rule: minimize dependencies.                              | Switch to doctest/Catch2 when test surface grows.    |
 
-OpenGL types are kept out of the `core` and `platform` public interfaces.
+### Lifetime rules
+
+- `Application` owns the GL context. Create `Shader` / `Mesh` **after** the `Application` and destroy them **before** it (normal C++ scoping handles this — see `sandbox/src/main.cpp`).
+- One `Window` per process: GLFW is terminated in `Window`'s destructor.
+- `Shader` and `Mesh` are move-only; their GL handles are released on destruction.
+
+### Frame contract
+
+Driven by `Application::run`:
+
+1. `input.newFrame()` — previous := current; reset per-frame mouse / scroll deltas.
+2. `window.pollEvents()` — GLFW callbacks update current state.
+3. Gameplay queries `isKeyDown` / `pressed` / `released` / `mouseDX` / `mouseDY` / `scrollDelta`.
+4. `dt` passed to the frame callback is clamped to `Application::kMaxDeltaTime` (`0.1 s`). Telemetry uses unclamped time.
+
+`pressed()`  = down this frame AND up last frame (rising edge).
+`released()` = up this frame AND down last frame (falling edge).
 
 ---
 
-## Public Engine API
+## Public API
 
-Gameplay code is built against a small, explicit interface.
-
-### Application
+The contract gameplay codes against:
 
 ```cpp
-Application::valid()
-Application::run(onFrame(dt))
-Application::window()
-Application::renderer()
-```
+// core/Application.h
+class Application {
+public:
+    static constexpr float kMaxDeltaTime = 0.1f;
+    explicit Application(const WindowDesc& desc = {});
+    bool valid() const;
+    Window&   window();   Renderer& renderer();   Input& input();
+    void run(const std::function<void(float dt)>& onFrame);
+    double fps() const;
+};
 
-### Window
+// platform/Window.h
+struct WindowDesc { std::string title; int width, height; bool vsync;
+                    int glVersionMajor, glVersionMinor; };
+class Window {
+public:
+    bool shouldClose() const;            void requestClose();
+    void pollEvents();                   void swapBuffers();
+    void getFramebufferSize(int& w, int& h) const;
+    void setTitle(const std::string&);   bool vsync() const;   void setVSync(bool);
+};
 
-```cpp
-Window::isKeyDown(Key)
-Window::requestClose()
-Window::getFramebufferSize()
-Window::setTitle()
-Window::setVSync()
-```
+// platform/Input.h
+class Input {
+public:
+    void attach(Window& window);         void newFrame();
+    bool isKeyDown(Key) const;           bool wasKeyDown(Key) const;
+    bool pressed(Key) const;            bool released(Key) const;
+    bool isMouseButtonDown(MouseButton) const;   bool mousePressed(MouseButton) const;
+    bool mouseReleased(MouseButton) const;
+    float mouseDX() const;              float mouseDY() const;   float scrollDelta() const;
+    void setCursorMode(CursorMode);      CursorMode cursorMode() const;   bool cursorLocked() const;
+};
 
-### Renderer
+// platform/KeyCodes.h — single source of truth for `enum class Key`.
 
-```cpp
-Renderer::setViewport()
-Renderer::setClearColor()
-Renderer::clear()
-Renderer::drawIndexed(Mesh)
-Renderer::stats()
-```
+// rendering/Renderer.h
+struct RenderStats { std::uint64_t drawCalls, triangles; };
+class Renderer {
+public:
+    void init();
+    void setViewport(int x, int y, int w, int h);
+    void setClearColor(float r, float g, float b, float a);
+    void clear();                       // begins a frame; resets stats
+    void drawIndexed(const Mesh&);       const RenderStats& stats() const;
+};
 
-### Shader
+// rendering/Shader.h
+class Shader {  // move-only
+public:
+    static Shader fromSource(const char* vs, const char* fs);
+    void bind() const;
+    void setMat4(const char* name, const Mat4&);
+    void setFloat4(const char* name, float x, float y, float z, float w);
+};
 
-```cpp
-Shader::fromSource(vs, fs)
-Shader::bind()
-Shader::setMat4()
-Shader::setFloat4()
-```
+// rendering/Mesh.h
+struct Vertex { float x, y, z, r, g, b; };  // fixed layout for M1/M2
+class Mesh {  // move-only
+public:
+    bool create(const Vertex* verts, uint32_t vertCount,
+                const uint32_t* indices, uint32_t indexCount);
+    void bind() const;    void release();
+    bool valid() const;   uint32_t indexCount() const;
+};
 
-GPU resources are move-only.
-
-### Mesh
-
-```cpp
-Mesh::create(vertices, indices)
-Mesh::bind()
-Mesh::indexCount()
-```
-
-### Vertex
-
-Milestone 1 uses a fixed vertex layout:
-
-```cpp
-struct Vertex {
-    float x, y, z;
-    float r, g, b;
+// rendering/Camera.h
+class Camera {
+public:
+    void setPerspective(float fovYRad, float aspect, float nearZ, float farZ);
+    const Vec3& position() const;        void setPosition(const Vec3&);
+    float yaw() const;                   float pitch() const;
+    void setYaw(float);                  void setPitch(float);   // clamped
+    void addYaw(float);                  void addPitch(float);
+    Vec3 forward() const;                Vec3 right() const;     Vec3 up() const;
+    Mat4 view() const;                   Mat4 viewProjection() const;
 };
 ```
 
-### Input
-
-The initial input layer intentionally uses a small key enum and polling API.
-
-A full event/input system will be introduced in a later milestone.
+Any change to the above is written up in `docs/CHANGELOG.md` **before** it lands.
 
 ---
 
-## Design Decisions
-
-Milestone 1 deliberately keeps the engine small.
-
-| Decision                      | Reason                                                                                  |
-| ----------------------------- | --------------------------------------------------------------------------------------- |
-| **GLFW only**                 | Provides windowing, OpenGL context creation, and input with minimal dependency overhead |
-| **Hand-scoped OpenGL loader** | Keeps the OpenGL surface explicit without introducing glad/GLEW at M1                   |
-| **Custom `Vec3` / `Mat4`**    | M1 only needs a small amount of math and avoids an unnecessary dependency               |
-| **Immediate bind-and-draw**   | Only one object exists at this stage                                                    |
-| **Variable timestep**         | A fixed timestep is unnecessary until simulation / physics                              |
-
-### Planned Upgrade Paths
-
-**OpenGL loader**
-
-Replace the hand-scoped loader with `glad2` once the engine requires significantly more OpenGL entry points or extensions.
-
-**Math**
-
-Adopt GLM or expand the existing math library once the engine's math requirements grow.
-
-**Rendering**
-
-Move toward batched submission as object counts increase.
-
-**Simulation**
-
-Introduce a fixed timestep once physics and deterministic simulation are added.
-
----
-
-## Lifetime Rules
-
-The engine follows strict OpenGL resource lifetime ordering.
-
-```text
-Application
-    |
-    +-- creates GL context
-    |
-    +-- Shader / Mesh created
-    |
-    +-- Shader / Mesh destroyed
-        |
-        +-- Application destroyed
-```
-
-Normal C++ scope ordering enforces this.
-
-`Application` owns the OpenGL context, so GPU resources must be created **after** the application and destroyed **before** it.
-
-There is intentionally **one `Window` per process**.
-
-GLFW is terminated when the window system shuts down.
-
----
-
-## Dependencies
-
-### Required
-
-| Dependency         | Purpose                          |
-| ------------------ | -------------------------------- |
-| **CMake 3.16+**    | Build system                     |
-| **C++17 compiler** | Engine compilation               |
-| **GLFW**           | Windowing, OpenGL context, input |
-| **OpenGL 3.3+**    | Rendering                        |
-
-GLFW is fetched automatically during the first CMake configuration.
-
-> An internet connection is required for the first configure only.
-
----
-
-## Platform Setup
-
-### Windows
-
-Install one of:
-
-* Visual Studio 2022 Build Tools / MSVC
-* MinGW-w64
-
-Recommended VS Code extensions:
-
-```text
-ms-vscode.cmake-tools
-ms-vscode.cpptools
-```
-
-### macOS
-
-Install the Xcode command-line tools:
-
-```bash
-xcode-select --install
-```
-
-### Linux
-
-Ubuntu / Debian:
-
-```bash
-sudo apt install build-essential cmake \
-    libx11-dev \
-    libxkbcommon-dev \
-    libwayland-dev \
-    libgl1-mesa-dev
-```
-
----
-
-# Build and Run
-
-## VS Code
-
-1. Open the project folder in VS Code.
-2. Run:
-
-```text
-CMake: Select a Kit
-```
-
-3. Select your compiler.
-4. Build with:
-
-```text
-F7
-```
-
-5. Run the `sandbox` target with:
-
-```text
-Shift + F5
-```
-
-The first configuration downloads GLFW automatically.
-
----
-
-## Terminal
-
-Configure:
-
-```bash
-cmake -B build
-```
-
-Build:
-
-```bash
-cmake --build build
-```
-
-### Linux / macOS
-
-```bash
-./build/bin/sandbox
-```
-
-### Windows — Visual Studio generator
-
-```powershell
-build\bin\Debug\sandbox.exe
-```
-
-### Ninja / Make
-
-```bash
-build/bin/sandbox
-```
-
----
-
-## Verification
-
-Milestone 1 has an explicit verification checklist.
-
-See [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
-
-### Build
-
-```text
-cmake -B build
-cmake --build build
-```
-
-Expected:
-
-```text
-Build succeeds with zero errors.
-```
-
-The first configure may display third-party CMake deprecation warnings from GLFW. These are expected and do not indicate an engine build failure.
-
-### Runtime
-
-Expected initialization:
-
-```text
-[Engine] Initialized. OpenGL: <version>
-```
-
-OpenGL must be **3.3 or newer**.
-
-The sandbox should open at:
-
-```text
-1280 x 720
-```
-
-with the title:
-
-```text
-Sandbox - M1 Hello Quad
-```
-
-The quad should:
-
-* Render with four vertex colors
-* Interpolate the colors smoothly
-* Rotate around the Y axis
-* Show perspective foreshortening
-* Demonstrate depth testing
-* Display approximately `2 tris`
-* Run near monitor refresh rate with VSync
-* Pause/resume with `SPACE`
-* Exit cleanly with `ESC` or the window close button
+## Known stopgaps (deliberate)
+
+- **Input is state-snapshot, not an event queue.** A press+release fully contained inside one frame is not reported. Fine for camera controls; revisit for text input / rebinding / fast-tap fidelity.
+- **No asset pipeline yet.** Shaders are inline strings in the sandbox for M1/M2.
+- **Raw mouse motion is platform-dependent.** Locked-cursor deltas work everywhere; bypassing OS acceleration (raw motion) is unavailable on some platforms (e.g. macOS).
 
 ---
 
 ## Diagnostics
 
-| Symptom                                 | Likely Cause                                              |
-| --------------------------------------- | --------------------------------------------------------- |
-| `glfwCreateWindow failed`               | No OpenGL 3.3+ driver or unsupported graphics environment |
-| `[GLLoader] Missing entry point: glXxx` | Broken or incomplete graphics driver                      |
-| `[Shader] ... compile error`            | Shader compilation failure; investigate shader log        |
-| No renderer GL error lines              | Expected clean state                                      |
+| Symptom                                          | Likely cause                                                                                       |
+|--------------------------------------------------|----------------------------------------------------------------------------------------------------|
+| `glfwCreateWindow failed`                        | No GL 3.3+ driver (common over Remote Desktop; run on the physical GPU).                           |
+| `[GLLoader] Missing entry point: glXxx`          | Broken driver install. If persistent, switch the loader to glad2 (see Architecture → Decisions).   |
+| `[Shader] ... compile error`                     | Should be unreachable with the bundled shaders; file a bug with the log.                          |
+| `[Renderer] GL error 0x%04x raised during drawIndexed` | Unexpected GL state. Should not appear during a clean run.                                    |
 
-### Remote Desktop
-
-OpenGL context creation can fail under some Remote Desktop configurations.
-
-When possible, run the engine directly against the machine's physical GPU.
+Math (`Vec3` / `Mat4`) is verified transitively in M1/M2 (a wrong perspective/`lookAt`/multiply produces a missing or badly distorted quad, not a clean render) and is also covered by `engine_math_tests` (Vec3 basics, identity laws, translation, rotation, perspective depth mapping, lookAt, camera yaw/pitch).
 
 ---
 
-## Math Verification
+## Status against operating requirements
 
-`Vec3` and `Mat4` are currently verified transitively through rendering.
-
-A broken:
-
-```text
-perspective()
-lookAt()
-matrix multiplication
-```
-
-should result in a visibly incorrect or missing quad.
-
-Dedicated math unit tests will be introduced with the test harness in **Milestone 2**.
+- **Compiles** — full CMake build config provided; single external dependency (GLFW) fetched automatically on first configure.
+- **Test/verification procedure** — `ctest --test-dir build --output-on-failure` for math; runtime checklist in `docs/VERIFICATION.md` for the sandbox.
+- **Documentation updated** — README, ARCHITECTURE, VERIFICATION, CHANGELOG maintained per milestone.
+- **Minimal dependencies** — GLFW only; GL loader and math are in-house with documented upgrade paths (glad2 / GLM).
+- **Modular, not monolithic** — `core` / `platform` / `rendering` / `math` are separate systems behind a narrow public API; the gameplay-facing interface contract is logged in `docs/CHANGELOG.md`, and all future changes to it are documented there before landing.
 
 ---
 
-## Intentional Stopgaps
+## Roadmap
 
-Milestone 1 is deliberately incomplete.
+Proposed next milestones (ordering is flexible):
 
-### Input
-
-Current implementation:
-
-```text
-Window::isKeyDown(...)
-```
-
-with a small key enum.
-
-Future input system:
-
-```text
-Event queue
-Edge detection
-Mouse input
-Bindings
-Input actions
-```
-
-### Assets
-
-There is no asset pipeline yet.
-
-Shaders currently live as inline strings inside the sandbox.
-
-External shader and mesh loading will arrive in a later milestone.
-
----
-
-## Documentation
-
-Detailed project documentation lives in `docs/`.
-
-| Document                                  | Purpose                               |
-| ----------------------------------------- | ------------------------------------- |
-| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Engine structure and design decisions |
-| [`VERIFICATION.md`](docs/VERIFICATION.md) | Milestone verification checklist      |
-| [`CHANGELOG.md`](docs/CHANGELOG.md)       | Gameplay-facing interface changes     |
-
----
-
-## Interface Contract
-
-The following APIs form the current gameplay-facing contract:
-
-```text
-Application
-Window
-Renderer
-Shader
-Mesh
-Vertex
-Key
-```
-
-Any change to these interfaces must be documented in:
-
-```text
-docs/CHANGELOG.md
-```
-
-**before the change lands.**
-
-This keeps the engine's public surface explicit as development continues.
-
----
-
-## Milestones
-
-### M1 — Hello Quad
-
-* OpenGL context
-* Window system
-* Shader pipeline
-* Indexed rendering
-* Perspective projection
-* Depth testing
-* Basic input
-* Frame timing
-* Renderer statistics
-
-### M2 — Input and Camera
-
-* Event queue
-* Key edge detection
-* Mouse input
-* Camera controls
-* Math unit tests
-
-### M3 — Asset Pipeline
-
-* External shaders
-* Mesh loading
-* Asset management
-* Runtime resource loading
-
-### M4 — Scene and Batching
-
-* Scene graph
-* Multiple objects
-* Batched rendering
-* Renderer statistics at scale
-
----
-
-## Current Status
-
-**Milestone 1: Complete**
-
-The current implementation satisfies the initial engine requirements:
-
-```text
-✓ Cross-platform C++17 foundation
-✓ CMake build
-✓ GLFW dependency fetched automatically
-✓ Modular engine architecture
-✓ Real OpenGL 3.3+ rendering pipeline
-✓ Perspective camera
-✓ Indexed geometry
-✓ Depth testing
-✓ Shader abstraction
-✓ Mesh abstraction
-✓ Frame timing / FPS telemetry
-✓ Verification procedure
-✓ Architecture documentation
-✓ Public interface changelog
-```
-
-The engine is intentionally starting with a small surface area so later systems can be added without turning the codebase into a monolithic renderer.
+- **M3** — Asset pipeline: shaders and meshes loaded from disk.
+- **M4** — Scene graph + batched renderer stats (draw calls / triangles / materials per frame).
+- **M5** — Fixed-step physics with interpolation.
