@@ -1,6 +1,6 @@
 Engine - Milestone 1: Hello Quad
 
-C++17 engine core (Windows / macOS / Linux) rendering an animated quad through areal 3D pipeline: perspective camera, view transform, depth test, indexed drawing.
+C++17 engine core (Windows / macOS / Linux) rendering an animated quad through a real 3D pipeline: perspective camera, view transform, depth test, indexed drawing.
 Prerequisites
 
     VS Code + extensions: CMake Tools (ms-vscode.cmake-tools), C/C++ (ms-vscode.cpptools)
@@ -23,21 +23,33 @@ Build & run (VS Code)
 
 Build & run (terminal)
 
-cmake -B buildcmake --build build./build/bin/sandbox        # Windows VS generator: build\bin\Debug\sandbox.exe
+cmake -B build
+cmake --build build
+./build/bin/sandbox        # Windows VS generator: build\bin\Debug\sandbox.exe
 
 What you should see
 
-A colored quad spinning in 3D under a perspective camera. SPACE pauses the spin,ESC quits. The title bar shows FPS and triangle count.
+A colored quad spinning in 3D under a perspective camera. SPACE pauses the spin,
+ESC quits. The title bar shows FPS and triangle count.
 
-Docs: docs/ARCHITECTURE.md (design), docs/VERIFICATION.md (milestone checklist),docs/CHANGELOG.md (interface changes).
+Docs:
+docs/ARCHITECTURE.md (design)
+docs/VERIFICATION.md (milestone checklist)
+docs/CHANGELOG.md (interface changes).
 
 docs/ARCHITECTURE.md
 Architecture - Milestone 1
 Module map
 
-sandbox/    thin client (will become gameplay / editor shell)engine/  core/       Application -- boot order, main loop, frame timing, telemetry  platform/   Window -- GLFW wrapper: context, swap, events, key polling  rendering/  GL (scoped loader), Shader, Mesh (VAO/VBO/EBO), Renderer (state, clear, draw, stats)  math/       Vec3, Mat4 (column-major, OpenGL conventions)
+sandbox/        thin client (will become gameplay / editor shell)
+engine/
+  core/        Application -- boot order, main loop, frame timing, telemetry
+  platform/    Window -- GLFW wrapper: context, swap, events, key polling
+  rendering/   GL (scoped loader), Shader, Mesh (VAO/VBO/EBO), Renderer (state, clear, draw, stats)
+  math/        Vec3, Mat4 (column-major, OpenGL conventions)
 
-Dependency rule: sandbox -> engine -> glfw. GL types do not leak into core orplatform headers.
+Dependency rule: sandbox -> engine -> glfw. GL types do not leak into core or
+platform headers.
 Decisions (M1)
 Decision	Rationale	Exit condition
 GLFW as the only third-party dependency	Mature, tiny, permissive. Window + GL context + input in one.	Keep.
@@ -47,7 +59,8 @@ Immediate bind-and-draw submission	One object on screen.	Batched submission when
 Variable-delta loop	No fixed-step simulation yet.	Fixed timestep with the physics milestone.
 Lifetime rules
 
-    Application owns the GL context. Create Shader/Mesh AFTER the Applicationand destroy them BEFORE it (normal C++ scoping does this - see sandbox/src/main.cpp).
+    Application owns the GL context. Create Shader/Mesh AFTER the Application
+    and destroy them BEFORE it (normal C++ scoping does this - see sandbox/src/main.cpp).
     One Window per process: GLFW is terminated in Window's destructor.
 
 Public API (the contract gameplay codes against)
@@ -62,22 +75,26 @@ Public API (the contract gameplay codes against)
 Any change to the above is written up in docs/CHANGELOG.md BEFORE it lands.
 Known stopgaps (deliberate)
 
-    Input: Window::isKeyDown polling + a 6-key enum. A real input system (eventqueue, edge-detection API, mouse, bindings) is the next engine milestone.
+    Input: Window::isKeyDown polling + a 6-key enum. A real input system (event
+    queue, edge-detection API, mouse, bindings) is the next engine milestone.
     No asset pipeline yet: shaders are inline strings in the sandbox for M1.
 
 docs/VERIFICATION.md
 Verification - Milestone 1: Hello Quad
 Build
 
-     cmake -B build succeeds (first run downloads GLFW; third-party CMakedeprecation warnings are harmless)
+     cmake -B build succeeds (first run downloads GLFW; third-party CMake
+deprecation warnings are harmless)
      cmake --build build succeeds with zero errors
 
 Runtime
 
      Console prints [Engine] Initialized. OpenGL: <version> (3.3 or newer)
      1280x720 window opens: "Sandbox - M1 Hello Quad"
-     Quad visible; corners red / green / blue / yellow, smoothly interpolated(proves vertex positions + color attributes + varyings)
-     Quad spins about Y; it foreshortens and its near edge renders larger thanthe far edge (proves perspective projection - real 3D, not a 2D blit)
+     Quad visible; corners red / green / blue / yellow, smoothly interpolated
+(proves vertex positions + color attributes + varyings)
+     Quad spins about Y; it foreshortens and its near edge renders larger than
+the far edge (proves perspective projection - real 3D, not a 2D blit)
      Title bar shows FPS near monitor refresh (vsync) and "2 tris"
      SPACE toggles spin per press (no rapid toggle while held)
      ESC / close button exits with exit code 0
@@ -89,7 +106,8 @@ glfwCreateWindow failed	No GL 3.3+ driver (common over Remote Desktop; run on th
 [Shader] ... compile error	Should be unreachable; file a bug with the log
 No [Renderer] GL error lines during a run	Expected clean state
 
-Math (Vec3/Mat4) is verified transitively in M1: a wrong perspective/lookAt/multiply produces a missing or badly distorted quad, not a clean render.Unit tests for math land with the test harness in M2.
+Math (Vec3/Mat4) is verified transitively in M1: a wrong perspective/lookAt/multiply produces a missing or badly distorted quad, not a clean render.
+Unit tests for math land with the test harness in M2.
 
 docs/CHANGELOG.md
 Changelog - engine interfaces

@@ -13,18 +13,6 @@ void glfwErrorCallback(int error, const char* description) {
     std::fprintf(stderr, "[GLFW] error %d: %s\n", error, description);
 }
 
-int toGlfwKey(Key key) {
-    switch (key) {
-        case Key::Escape: return GLFW_KEY_ESCAPE;
-        case Key::Space:  return GLFW_KEY_SPACE;
-        case Key::W:      return GLFW_KEY_W;
-        case Key::A:      return GLFW_KEY_A;
-        case Key::S:      return GLFW_KEY_S;
-        case Key::D:      return GLFW_KEY_D;
-        default:          return GLFW_KEY_UNKNOWN;
-    }
-}
-
 } // namespace
 
 Window::Window(const WindowDesc& desc) : m_vsync(desc.vsync) {
@@ -87,13 +75,6 @@ void Window::swapBuffers() {
     if (m_window != nullptr) {
         glfwSwapBuffers(m_window);
     }
-}
-
-bool Window::isKeyDown(Key key) const {
-    if (m_window == nullptr) {
-        return false;
-    }
-    return glfwGetKey(m_window, toGlfwKey(key)) == GLFW_PRESS;
 }
 
 void Window::getFramebufferSize(int& outWidth, int& outHeight) const {

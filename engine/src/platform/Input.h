@@ -19,6 +19,8 @@
 // reported (state snapshot, not an event queue). Fine for camera controls;
 // revisit when text input / rebinding / fast-tap fidelity is needed.
 
+#include "platform/KeyCodes.h"  // engine::Key
+
 #include <array>
 #include <cstdint>
 
@@ -27,13 +29,6 @@ struct GLFWwindow;
 namespace engine {
 
 class Window;
-
-enum class Key {
-    Escape, Space, Enter, Tab,
-    LeftShift, LeftControl,
-    Q, W, E, A, S, D,
-    Digit1, Digit2, Digit3,
-};
 
 enum class MouseButton { Left = 0, Middle = 1, Right = 2 };
 
