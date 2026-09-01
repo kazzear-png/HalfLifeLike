@@ -3,20 +3,14 @@
 // GLFW-backed window + OpenGL context. One window per process (GLFW is
 // terminated in the destructor).
 //
-// NOTE: key queries are a stopgap. A proper input system (event queue, edge
-// detection, mouse, bindings) is the next engine milestone.
+// M2: keyboard/mouse/cursor input moved to platform/Input (GLFW callbacks).
+// Window owns: lifecycle, GL context, presentation, vsync, title, size.
 
 #include <string>
 
 struct GLFWwindow;
 
 namespace engine {
-
-// Minimal key set -- grows with the input system.
-enum class Key {
-    Escape, Space,
-    W, A, S, D,
-};
 
 struct WindowDesc {
     std::string title  = "Engine";
@@ -40,10 +34,8 @@ public:
     bool shouldClose() const;
     void requestClose();
 
-    void pollEvents();     // process OS events / input
+    void pollEvents();     // process OS events (input callbacks fire here)
     void swapBuffers();    // present the frame
-
-    bool isKeyDown(Key key) const;
 
     // Size of the GL framebuffer in pixels (differs from window size on HiDPI).
     void getFramebufferSize(int& outWidth, int& outHeight) const;
@@ -51,6 +43,10 @@ public:
     void setTitle(const std::string& title);
     bool vsync() const { return m_vsync; }
     void setVSync(bool enabled);
+
+    // Engine-internal: raw GLFW handle for platform-layer code (Input) to
+    // register callbacks. NOT part of the gameplay-facing API.
+    GLFWwindow* nativeHandle() const { return m_window; }
 
 private:
     GLFWwindow* m_window = nullptr;

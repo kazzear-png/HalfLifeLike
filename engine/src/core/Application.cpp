@@ -31,6 +31,7 @@ Application::Application(const WindowDesc& windowDesc)
     }
 
     m_renderer.init();
+    m_input.attach(m_window);
 
     const char* version = reinterpret_cast<const char*>(gl::GetString(gl::Version));
     std::printf("[Engine] Initialized. OpenGL: %s\n", version ? version : "unknown");
@@ -53,11 +54,15 @@ void Application::run(const std::function<void(float dt)>& onFrame) {
     std::uint64_t statFrames = 0;
 
     while (!m_window.shouldClose()) {
-        m_window.pollEvents();
+        m_input.newFrame();      // advance edge state BEFORE events arrive
+        m_window.pollEvents();   // input callbacks fire during this call
 
         const Clock::time_point now = Clock::now();
-        const float dt = std::chrono::duration<float>(now - last).count();
+        const float rawDt = std::chrono::duration<float>(now - last).count();
         last = now;
+
+        // Clamp: debugger breaks / stalls must not explode simulation state.
+        const float dt = (rawDt > kMaxDeltaTime) ? kMaxDeltaTime : rawDt;
 
         if (onFrame) {
             onFrame(dt);
@@ -68,8 +73,8 @@ void Application::run(const std::function<void(float dt)>& onFrame) {
 
         m_window.swapBuffers();
 
-        // Title-bar telemetry (also our verification signal).
-        statTimer += dt;
+        // Title-bar telemetry (verification signal). Uses UNCLAMPED time.
+        statTimer += rawDt;
         statFrames += 1;
         if (statTimer >= 0.5) {
             m_fps = static_cast<double>(statFrames) / statTimer;

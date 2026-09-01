@@ -1,9 +1,15 @@
 //
-// Milestone 1: render a quad through a real 3D pipeline.
-// SPACE = pause/resume spin. ESC or close button = quit.
+// Milestone 2: event-driven input + FPS fly camera.
+//   click     lock the cursor and look with the mouse
+//   ESC       unlock (when locked); when already unlocked, quit
+//   W/A/S/D   fly (W follows the view direction, including pitch)
+//   E / Q     up / down
+//   SPACE     pause/resume the quad's spin
 
 #include "core/Application.h"
 #include "math/Mat4.h"
+#include "math/Vec3.h"
+#include "rendering/Camera.h"
 #include "rendering/Mesh.h"
 #include "rendering/Shader.h"
 
@@ -43,7 +49,7 @@ void main()
 
 int main() {
     engine::WindowDesc desc;
-    desc.title  = "Sandbox - M1 Hello Quad";
+    desc.title  = "Sandbox - M2 Fly Camera";
     desc.width  = 1280;
     desc.height = 720;
     desc.vsync  = true;
@@ -54,68 +60,102 @@ int main() {
         return 1;
     }
 
-    // Unit quad in the XY plane: 4 vertices, 2 triangles, one color per corner.
-    const engine::Vertex vertices[] = {
-        // position                 color
-        { -0.5f, -0.5f, 0.0f,      0.92f, 0.26f, 0.21f },  // bottom-left  red
-        {  0.5f, -0.5f, 0.0f,      0.30f, 0.69f, 0.31f },  // bottom-right green
-        {  0.5f,  0.5f, 0.0f,      0.26f, 0.58f, 0.97f },  // top-right     blue
-        { -0.5f,  0.5f, 0.0f,      0.99f, 0.75f, 0.19f },  // top-left      yellow
+    // --- static scene: spinning quad (M1 regression target) + reference floor ---
+    const engine::Vertex quadVerts[] = {
+        // position                color
+        { -0.5f, -0.5f, 0.0f,     0.92f, 0.26f, 0.21f },  // bottom-left  red
+        {  0.5f, -0.5f, 0.0f,     0.30f, 0.69f, 0.31f },  // bottom-right green
+        {  0.5f,  0.5f, 0.0f,     0.26f, 0.58f, 0.97f },  // top-right     blue
+        { -0.5f,  0.5f, 0.0f,     0.99f, 0.75f, 0.19f },  // top-left      yellow
     };
-    const std::uint32_t indices[] = { 0, 1, 2, 0, 2, 3 };
+    const std::uint32_t quadIndices[] = { 0, 1, 2, 0, 2, 3 };
+
+    const engine::Vertex floorVerts[] = {
+        { -6.0f, -0.75f, -6.0f,   0.30f, 0.32f, 0.36f },
+        {  6.0f, -0.75f, -6.0f,   0.30f, 0.32f, 0.36f },
+        {  6.0f, -0.75f,  6.0f,   0.30f, 0.32f, 0.36f },
+        { -6.0f, -0.75f,  6.0f,   0.30f, 0.32f, 0.36f },
+    };
+    const std::uint32_t floorIndices[] = { 0, 1, 2, 0, 2, 3 };
 
     engine::Shader shader = engine::Shader::fromSource(kVertexShader, kFragmentShader);
     engine::Mesh quad;
-    if (!shader.valid() || !quad.create(vertices, 4, indices, 6)) {
-        std::fprintf(stderr, "Failed to create shader or mesh; see messages above.\n");
+    engine::Mesh floor;
+    if (!shader.valid() || !quad.create(quadVerts, 4, quadIndices, 6)
+                         || !floor.create(floorVerts, 4, floorIndices, 6)) {
+        std::fprintf(stderr, "Failed to create shader or meshes; see messages above.\n");
         return 1;
     }
 
-    // Static camera looking at the quad from above/right/front.
-    const engine::Vec3 eye   (1.6f, 1.1f, 2.6f);
-    const engine::Vec3 target(0.0f, 0.0f, 0.0f);
-    const engine::Vec3 up    (0.0f, 1.0f, 0.0f);
+    engine::Camera camera;
+    camera.setPosition(engine::Vec3(0.0f, 0.6f, 2.8f));
+    camera.setPitch(-0.25f);  // slight downward tilt to see floor + quad
+
+    constexpr float kMouseSensitivity = 0.0025f;  // radians per pixel
+    constexpr float kMoveSpeed        = 2.5f;     // units per second
 
     float spinAngle = 0.0f;
     bool spinning = true;
-    bool wasSpaceDown = false;
 
     app.run([&](float dt) {
-        // --- input (edge-triggered pause) ---
-        const bool spaceDown = app.window().isKeyDown(engine::Key::Space);
-        if (spaceDown && !wasSpaceDown) {
+        engine::Input& in = app.input();
+        engine::Renderer& renderer = app.renderer();
+
+        // --- input ---
+        if (in.pressed(engine::Key::Escape)) {
+            if (in.cursorLocked()) {
+                in.setCursorMode(engine::CursorMode::Normal);
+            } else {
+                app.window().requestClose();
+            }
+        }
+        if (!in.cursorLocked() && in.mousePressed(engine::MouseButton::Left)) {
+            in.setCursorMode(engine::CursorMode::Locked);
+        }
+        if (in.pressed(engine::Key::Space)) {
             spinning = !spinning;
         }
-        wasSpaceDown = spaceDown;
 
-        if (app.window().isKeyDown(engine::Key::Escape)) {
-            app.window().requestClose();
+        if (in.cursorLocked()) {
+            camera.addYaw(in.mouseDX() * kMouseSensitivity);
+            camera.addPitch(-in.mouseDY() * kMouseSensitivity);  // mouse down = look down
+        }
+
+        // --- movement (fly-cam: W follows full view direction) ---
+        engine::Vec3 move(0.0f, 0.0f, 0.0f);
+        if (in.isKeyDown(engine::Key::W)) move = move + camera.forward();
+        if (in.isKeyDown(engine::Key::S)) move = move - camera.forward();
+        if (in.isKeyDown(engine::Key::D)) move = move + camera.right();
+        if (in.isKeyDown(engine::Key::A)) move = move - camera.right();
+        if (in.isKeyDown(engine::Key::E)) move = move + engine::Vec3(0.0f, 1.0f, 0.0f);
+        if (in.isKeyDown(engine::Key::Q)) move = move - engine::Vec3(0.0f, 1.0f, 0.0f);
+        if (engine::length(move) > 0.0f) {
+            camera.setPosition(camera.position() + engine::normalize(move) * (kMoveSpeed * dt));
         }
 
         if (spinning) {
-            spinAngle += dt * 0.8f;  // radians per second
+            spinAngle += dt * 0.8f;
         }
 
-        // --- transforms (recomputed per frame so resizes keep aspect) ---
+        // --- camera projection (per frame: resize-safe aspect) ---
         int fbw = 0, fbh = 0;
         app.window().getFramebufferSize(fbw, fbh);
         const float aspect = fbh > 0 ? static_cast<float>(fbw) / static_cast<float>(fbh) : 1.0f;
-
-        const engine::Mat4 model = engine::Mat4::rotateY(spinAngle);
-        const engine::Mat4 view  = engine::Mat4::lookAt(eye, target, up);
-        const engine::Mat4 proj  = engine::Mat4::perspective(0.7854f /* 45 deg */, aspect, 0.1f, 100.0f);
-        const engine::Mat4 mvp   = proj * view * model;
+        camera.setPerspective(0.7854f /* 45 deg */, aspect, 0.1f, 100.0f);
+        const engine::Mat4 vp = camera.viewProjection();
 
         // --- draw ---
-        engine::Renderer& renderer = app.renderer();
         renderer.setViewport(0, 0, fbw, fbh);
         renderer.clear();
 
         shader.bind();
-        shader.setMat4("uMVP", mvp);
+        shader.setMat4("uMVP", vp);  // floor: identity model
+        renderer.drawIndexed(floor);
+
+        shader.setMat4("uMVP", vp * engine::Mat4::rotateY(spinAngle));  // spinning quad
         renderer.drawIndexed(quad);
     });
 
-    // shader/quad are destroyed here, BEFORE `app` (and its GL context).
+    // shader/quad/floor destroyed here, BEFORE `app` (and its GL context).
     return 0;
 }

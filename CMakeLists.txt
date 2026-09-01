@@ -32,5 +32,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glfw)
 
+# M2: registers ctest support (BUILD_TESTING option, default ON)
+include(CTest)
+
 add_subdirectory(engine)
 add_subdirectory(sandbox)
