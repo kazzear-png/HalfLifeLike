@@ -4,28 +4,35 @@ Design overview of the engine core. Covers module boundaries, key decisions,
 GL lifetime rules, the main-loop frame contract, and the public API surface
 that gameplay codes against.
 
-**Current milestone:** M3 — *PBR lighting + HDR pipeline + model import*.
+**Current milestone:** M3.3 — *Cornell Box renderer benchmark (frozen two-axis laboratory)*.
 
 ---
 
 ## Module map
 
 ```
-sandbox/                    thin client (will become gameplay / editor shell)
+benchmarks/
+└── cornell_box/            frozen cornell-box/1.0 standard (scene.json, geometry/, reference/, ledger)
+sandbox/
 ├── assets/models/          bundled OBJ props (regenerable via tools/)
-└── src/                    main.cpp (M3 PBR demo scene), shaders.h (scene GLSL)
+└── src/                    main.cpp (M3 demo + cornell benchmark scenes), shaders.h,
+                            cornell_scene_gen.h (GENERATED from the frozen standard)
 engine/
 ├── src/
 │   ├── assets/             OBJ import — loadOBJ: parse, triangulate, dedupe, normalize
 │   ├── core/               Application — boot order, main loop, frame timing, telemetry
 │   ├── platform/           Window (GLFW, GLFW_INCLUDE_NONE), Input (callbacks/edge state), KeyCodes
 │   ├── rendering/          GL (scoped loader), Shader, Mesh (VAO/VBO/EBO),
-│   │                       Renderer (frame state + HDR/tonemap pipeline), Camera,
-│   │                       Lighting.h (light + material model structs)
+│   │                       Renderer (frame state + HDR/tonemap pipeline + GPU timer
+│   │                       queries), Camera, Lighting.h (light + material model structs)
 │   └── math/               Vec3, Mat4 (column-major, transpose/inverse/normalMatrix)
-└── tests/                  math_tests.cpp, obj_tests.cpp — ctest targets
+└── tests/                  math/obj/brdf/bench tests — ctest targets
 tools/
-└── generate_models.py      deterministic asset generation (torus/sphere/rock/ship)
+├── generate_models.py      deterministic asset generation (torus/sphere/rock/ship)
+├── generate_cornell.py     emits the frozen cornell geometry + scene.json + C++ header
+├── reference_pathtracer.py ground-truth reference renders (same BRDF + display transform)
+├── benchmark_compare.py    RMSE + SSIM -> Cornell similarity (two-axis metric)
+└── brdf_reference.py       float64 re-derivation of the BRDF anchors used by brdf_tests
 ```
 
 Dependency rule: **`sandbox → engine → glfw`**. GL types do not leak into
@@ -40,20 +47,29 @@ deliberate exception — it *is* renderer infrastructure.
 | Decision                                | Rationale                                                        | Exit condition                                          |
 |-----------------------------------------|------------------------------------------------------------------|---------------------------------------------------------|
 | GLFW as the only third-party dependency | Mature, tiny, permissive; window + GL context + input in one.    | Keep.                                                   |
-| Hand-scoped GL loader (`rendering/GL.h`) | No glad/GLEW/generator dependency; GL surface stays explicit and reviewable. | Replace with glad2 when >~60 entry points or extensions are needed. **M3 count: ~55 — one milestone from the exit condition.** |
+| Hand-scoped GL loader (`rendering/GL.h`) | No glad/GLEW/generator dependency; GL surface stays explicit and reviewable. | Replace with glad2 when >~60 entry points or extensions are needed. **M3.3 count: ~60 — AT the exit condition. Timer queries were accepted as the last addition; the next extension need triggers the glad2 migration.** |
 | `GLFW_INCLUDE_NONE` before every GLFW include | The engine ships its own scoped GL loader; pulling in system GL headers is redundant and breaks builds where only the GL runtime exists. | Keep.                                                   |
 | Own `Vec3` / `Mat4`                     | M1-M3 need ~15 ops (plus inverse/transpose for normal matrices); no GLM dependency yet. | Adopt GLM (or extend) when math demands grow.           |
 | Established PBR math (Cook-Torrance GGX / Smith / Schlick, Lambert) | Research goal is innovation *above* the BRDF (lighting strategy, approximation); new shading equations are explicitly out of scope. | Revisit only when profiling shows the BRDF itself is the bottleneck. |
+| Reference-value BRDF tests (`brdf_tests` + `tools/brdf_reference.py`) | M3.2 lesson from external review: the M3.0/M3.1 visibility form deviated up to ~13-15% from the exact height-correlated Smith and nothing caught it — "looks plausible" is not a correctness argument. The shader forms are now pinned to an independent Lambda-based derivation plus float64 quadrature anchors; any edit to D or V shifts the furnace integrals immediately. | Keep for every future shading equation; extend anchors before extending shaders. |
+| Frozen Cornell Box benchmark (`cornell-box/1.0`) with a two-axis ledger | A renderer research project needs an instrument, not opinions: fixed geometry/camera/lights/exposure, a reference path trace with the same BRDF + display transform, and a deterministic benchmark mode. Every change records (similarity, FPS) — the research question IS the trade between the two axes. Scene changes are forbidden; only milestone rows are appended. | The standard never changes. Larger scenes (Sponza/San Miguel/Bistro) may JOIN the rotation later, per the same freeze-and-ledger rules. |
+| Cornell area emitter approximated by a deterministic point-light grid | The engine has no area lights yet. A 4x4 flux-preserving grid (I = A·L_e/N, derived in scene.json, pinned in bench_tests) keeps the current pipeline dependency-free. The grid-vs-area-light discrepancy is part of the measured similarity gap — an honest cost documented in the ledger. | Retire at M4/M5 when real area lights land; the grid math stays as the documented fallback. |
+| One-sided shading contract: OBJ normals AND winding face the visible side, enforced at the source (M3.3.1) | Real-hardware lesson: r1 Cornell geometry authored every room normal outward (3 of 5 quads contradicting their own vn; spheres wound inward too) and the one-sided rasterizer rendered the whole room black — 96.5% black pixels. The reference path tracer shades two-sided and masked the bug offline. Rule: no automatic two-sided normal flip in the shader (it would silently mask asset bugs in a laboratory built to expose them); instead the generator fail-loud-validates orientation on every run and bench_tests pins normals/winding on every build (100 checks). | Keep for benchmark geometry; the M4 scene loader adopts the same validation for user-authored scenes. |
+| Generated Cornell header (`cornell_scene_gen.h`) until M4 scene loading | Zero JSON-parser risk in the C++ path while still keeping scene.json the authoritative, versioned description; the generator is deterministic and the header is pinned by tests. | Replace at M4 with a real scene loader reading scene.json; delete the codegen step. |
+| GPU frame timing via GL TIME_ELAPSED timer queries (one-frame-lag readback) | The benchmark report needs a GPU axis that VSync-free wall time cannot provide. Query results are read one frame later (guaranteed complete); drivers that misbehave self-disable the feature to "n/a". | Keep. VRAM stays unreported (no core GL query); revisit if an extension telemetry line is ever justified. |
+| Ambient splits energy with the SAME rules as direct light (kD = (1-F)(1-metalness); placeholder env specular off the same gradient) | M3.2 review finding: metals received fake diffuse ambient (direct diffuse correctly vanished with metalness, ambient did not) — energy-inconsistent and the main "game-engine fake" tell on chrome. The old gradient×albedo ambient is replaced by a Fresnel/metalness-weighted split whose specular half is the explicit placeholder for M5 prefiltered IBL. | Replace the specular half wholesale when IBL lands (M5); keep the split convention. |
+| Material debug + validation views (V key, `uDebugMode`) | Valve-style practice (Dota 2): metalness is binary, dielectric albedo must not act like an emitter, metal F0 stays in a plausible band, no accidental mirrors. Cheap views bail before the light loop — never compute what is not shown. Catches material authoring mistakes visually instead of debugging shading by eye. | Extend views when textures land (per-texel validation becomes meaningful). |
 | BRDF inputs clamped to their mathematical domains; Fresnel pow5 via multiplies | Real-hardware lesson (M3.1): a camera-mounted light makes `VoH` hug 1.0 within rounding noise; unclamped `pow(negative)` is undefined GLSL and produced NaN speckle + driver-pow banding rings. Clamps and explicit multiplies are the UE4/Filament form of the SAME established math. | Keep; extend to any new term that divides or takes `pow` of a dot product. |
-| Triangular-PDF dither (±1 LSB) in the tonemap pass | 8-bit presentation quantizes smooth HDR gradients into concentric bands once sRGB stretches the darks; two-hash dither trades bands for imperceptible grain — a perceptual shortcut, not a format change. | Drop if the backbuffer ever goes 10-bit+; revisit with temporal accumulation (needs blue noise). |
+| Triangular-PDF dither (3 LSB peak-to-peak, ±1.5 LSB tails) in the tonemap pass | 8-bit presentation quantizes smooth HDR gradients into concentric bands once sRGB stretches the darks; two-hash dither trades bands for imperceptible grain — a perceptual shortcut, not a format change. (Amplitude/corrected comment in M3.2: the triangular sum's tails reach ±1.5 LSB by design, slightly beyond ±1 LSB, so the heavy low-end steps stay decorrelated.) | Drop if the backbuffer ever goes 10-bit+; revisit with temporal accumulation (needs blue noise). |
 | HDR pipeline engine-side (RGBA16F + MSAA4 + ACES tonemap in `Renderer`) | The scene → HDR → exposure → tonemap chain is renderer infrastructure, not scene content; apps get it for free and tune exposure only. | Split into a pass system when more post effects land.   |
 | MSAA 4x with graceful fallback (4x → 1x FBO → direct mode) | Wide driver compatibility without a settings UI; every fallback is logged. | Revisit when a render-settings surface exists.          |
 | Hand-rolled OBJ importer (`assets/OBJ.h`) | Minimal-dependency philosophy; OBJ is text, well-specified, and covers prop geometry. Degeneracy rejection + flat-normal fallback make arbitrary exports load safely. | Adopt a full asset library (e.g. Assimp) when glTF/FBX/animations are actually needed. |
 | Hemispheric ambient as IBL stand-in | Cheap, looks decent, and occupies the exact interface slot where probe/IBL research lands later. | Replace when image-based lighting lands (research track). |
+| Forward renderer, lights enumerated per fragment (uniform loop, kMaxPointLights = 16) | A handful of lights and objects; simplest correct thing. The renderer still only knows "draw this mesh" — scene/material abstraction (M4) is the prerequisite for renderer-owned decisions. | Clustered light assignment when light counts grow (M7); renderer-known scene graph at M4. |
 | Immediate bind-and-draw submission      | A handful of objects on screen.                                  | Batched submission when object counts grow (M4).        |
 | Variable-delta loop, `dt` clamped to 0.1 s | No fixed-step simulation yet.                                  | Fixed timestep with the physics milestone.              |
 | State-snapshot input (not an event queue) | Sufficient for camera controls; press/release edges captured per frame. | Event queue when text input / rebinding / fast-tap fidelity is needed. |
-| Minimal test harnesses (math + obj)     | Project rule: minimize dependencies.                             | Switch to doctest/Catch2 when test surface grows.       |
+| Minimal test harnesses (math + obj + brdf + bench) | Project rule: minimize dependencies.                             | Switch to doctest/Catch2 when test surface grows.       |
 | `Key` enum lives in `platform/KeyCodes.h` (single source of truth) | Avoids MSVC C2011 redefinition; one place to edit when adding keys. | Keep.                                                   |
 
 ---
@@ -208,6 +224,11 @@ public:
     void setExposure(float linearExposure);       // scroll-driven in sandbox
     float exposure() const;
 
+    // GPU frame timing (M3.3, benchmark telemetry).
+    void enableGpuTiming(bool enable);            // TIME_ELAPSED, one-frame lag
+    float lastGpuFrameMs() const;                 // < 0 == "n/a"
+    bool gpuTimingActive() const;
+
     void setViewport(int x, int y, int width, int height);
     void setClearColor(float r, float g, float b, float a);
     void beginFrame();                   // binds+clears target; resets stats
@@ -234,7 +255,7 @@ public:
 };
 
 // rendering/Lighting.h — plain structs; upload via Shader setters
-inline constexpr int kMaxPointLights = 8;
+inline constexpr int kMaxPointLights = 16;   // M3.3: 8 -> 16 (Cornell emitter grid)
 struct DirectionalLight { Vec3 direction; Vec3 color; float intensity; };
 struct PointLight      { Vec3 position;  Vec3 color; float intensity; };
 struct SpotLight       { Vec3 position, direction; Vec3 color; float intensity;
@@ -322,6 +343,8 @@ Currently loaded groups:
   `RenderbufferStorageMultisample`, `FramebufferRenderbuffer`,
   `CheckFramebufferStatus`, `BlitFramebuffer`
 - **Readback (M3):** `ReadPixels` (verification screenshots)
+- **Timer queries (M3.3):** `GenQueries`, `DeleteQueries`, `BeginQuery`,
+  `EndQuery`, `GetQueryObjectui64v` (benchmark GPU frame time)
 
 On Windows, the loader falls back to `opengl32.dll` (via `GetProcAddress`) for
 any entry point `glfwGetProcAddress` does not return — some Windows drivers

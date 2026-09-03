@@ -26,6 +26,7 @@ int toGlfwKey(Key key) {
         case Key::S:           return GLFW_KEY_S;
         case Key::D:           return GLFW_KEY_D;
         case Key::F:           return GLFW_KEY_F;
+        case Key::V:           return GLFW_KEY_V;
         case Key::Digit1:      return GLFW_KEY_1;
         case Key::Digit2:      return GLFW_KEY_2;
         case Key::Digit3:      return GLFW_KEY_3;

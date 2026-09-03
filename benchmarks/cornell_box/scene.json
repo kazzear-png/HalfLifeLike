@@ -1,0 +1,296 @@
+{
+  "standard": "cornell-box/1.0",
+  "frozen": "M3.3 -- never modify geometry, camera, lights, materials, or exposure; renderer changes are measured against this scene",
+  "units": "meters, Y-up, engine convention (yaw 0 looks -Z)",
+  "provenance": "synthetic Cornell Box variant, meter scale; reflectances from the pbrt book cornell_box scene (white 0.725/0.71/0.68, red 0.63/0.065/0.05, green 0.14/0.45/0.091); layout inspired by the classic open-front box",
+  "geometry_revision": "r2 (M3.3.1): room quads' normals/winding face the room interior; r1 authored them outward and the one-sided rasterizer rendered the room black. Positions/sizes/materials unchanged.",
+  "box": {
+    "half_x": 2.75,
+    "y_max": 5.5,
+    "half_z": 2.75,
+    "front": "open (+Z)"
+  },
+  "camera": {
+    "position": [
+      0.0,
+      2.75,
+      8.35
+    ],
+    "yaw": 0.0,
+    "pitch": 0.0,
+    "fovY_degrees": 39.3,
+    "near": 0.1,
+    "far": 100.0
+  },
+  "exposure": 1.0,
+  "ambient": {
+    "sky": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "ground": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "why": "the box is a closed light-transport system; fake ambient would disguise the GI gap the benchmark exists to measure"
+  },
+  "emitter": {
+    "min": [
+      -0.65,
+      5.49,
+      -0.525
+    ],
+    "max": [
+      0.65,
+      5.49,
+      0.525
+    ],
+    "one_sided": "-Y",
+    "radiance": 12.0,
+    "color": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "light_grid_rasterizer_approximation": {
+    "count": 16,
+    "intensity": 1.0237500000000002,
+    "positions": [
+      [
+        -0.48750000000000004,
+        5.44,
+        -0.39375000000000004
+      ],
+      [
+        -0.48750000000000004,
+        5.44,
+        -0.13124999999999998
+      ],
+      [
+        -0.48750000000000004,
+        5.44,
+        0.13124999999999998
+      ],
+      [
+        -0.48750000000000004,
+        5.44,
+        0.39375000000000004
+      ],
+      [
+        -0.16249999999999998,
+        5.44,
+        -0.39375000000000004
+      ],
+      [
+        -0.16249999999999998,
+        5.44,
+        -0.13124999999999998
+      ],
+      [
+        -0.16249999999999998,
+        5.44,
+        0.13124999999999998
+      ],
+      [
+        -0.16249999999999998,
+        5.44,
+        0.39375000000000004
+      ],
+      [
+        0.16249999999999998,
+        5.44,
+        -0.39375000000000004
+      ],
+      [
+        0.16249999999999998,
+        5.44,
+        -0.13124999999999998
+      ],
+      [
+        0.16249999999999998,
+        5.44,
+        0.13124999999999998
+      ],
+      [
+        0.16249999999999998,
+        5.44,
+        0.39375000000000004
+      ],
+      [
+        0.48749999999999993,
+        5.44,
+        -0.39375000000000004
+      ],
+      [
+        0.48749999999999993,
+        5.44,
+        -0.13124999999999998
+      ],
+      [
+        0.48749999999999993,
+        5.44,
+        0.13124999999999998
+      ],
+      [
+        0.48749999999999993,
+        5.44,
+        0.39375000000000004
+      ]
+    ],
+    "flux_model": "Phi = pi * A * L_e; I_per_light = A * L_e / N (engine point light: E = I / d^2, isotropic)"
+  },
+  "materials": {
+    "wall_left": {
+      "albedo": [
+        0.63,
+        0.065,
+        0.05
+      ],
+      "roughness": 0.9,
+      "metalness": 0.0
+    },
+    "wall_right": {
+      "albedo": [
+        0.14,
+        0.45,
+        0.091
+      ],
+      "roughness": 0.9,
+      "metalness": 0.0
+    },
+    "wall_back": {
+      "albedo": [
+        0.725,
+        0.71,
+        0.68
+      ],
+      "roughness": 0.9,
+      "metalness": 0.0
+    },
+    "floor": {
+      "albedo": [
+        0.725,
+        0.71,
+        0.68
+      ],
+      "roughness": 0.9,
+      "metalness": 0.0
+    },
+    "ceiling": {
+      "albedo": [
+        0.725,
+        0.71,
+        0.68
+      ],
+      "roughness": 0.9,
+      "metalness": 0.0
+    },
+    "block_tall": {
+      "albedo": [
+        0.725,
+        0.71,
+        0.68
+      ],
+      "roughness": 0.9,
+      "metalness": 0.0
+    },
+    "block_short": {
+      "albedo": [
+        0.725,
+        0.71,
+        0.68
+      ],
+      "roughness": 0.9,
+      "metalness": 0.0
+    },
+    "baffle": {
+      "albedo": [
+        0.725,
+        0.71,
+        0.68
+      ],
+      "roughness": 0.9,
+      "metalness": 0.0
+    },
+    "sphere_mirror": {
+      "albedo": [
+        0.95,
+        0.96,
+        0.98
+      ],
+      "roughness": 0.02,
+      "metalness": 1.0
+    },
+    "sphere_gold": {
+      "albedo": [
+        1.0,
+        0.77,
+        0.34
+      ],
+      "roughness": 0.45,
+      "metalness": 1.0
+    },
+    "sphere_dielectric": {
+      "albedo": [
+        0.75,
+        0.75,
+        0.75
+      ],
+      "roughness": 0.18,
+      "metalness": 0.0
+    }
+  },
+  "geometry_dir": "benchmarks/cornell_box/geometry",
+  "reference": "tools/reference_pathtracer.py renders this scene with the SAME BRDF (Lambert + Cook-Torrance GGX/Smith/Schlick) plus true area-light sampling and full bounces; output goes through the SAME exposure/ACES/sRGB transform. It is the 'trusted reference' of the two-axis benchmark.",
+  "variants": {
+    "cornell01": {
+      "title": "CBox-01 baseline",
+      "tests": "direct lighting, diffuse response, color balance, falloff, tonemap (shadowing is measured as a GAP until the shadows milestone lands)",
+      "meshes": [
+        "floor",
+        "ceiling",
+        "wall_left",
+        "wall_right",
+        "wall_back",
+        "block_tall",
+        "block_short",
+        "ceiling_emitter"
+      ]
+    },
+    "cornell02": {
+      "title": "CBox-02 reflective materials",
+      "tests": "GGX, Fresnel, roughness, specular environment (placeholder quality gap expected: no IBL yet -- the mirror shows lights, the reference shows the room)",
+      "meshes": [
+        "floor",
+        "ceiling",
+        "wall_left",
+        "wall_right",
+        "wall_back",
+        "block_tall",
+        "block_short",
+        "sphere_mirror",
+        "sphere_gold",
+        "sphere_dielectric",
+        "ceiling_emitter"
+      ]
+    },
+    "cornell03": {
+      "title": "CBox-03 indirect illumination",
+      "tests": "color bleeding / interreflection (the baffle blocks the direct view of the emitter; the rasterizer has no shadows or GI yet, so it leaks direct light -- the reference shows bounce-only light)",
+      "meshes": [
+        "floor",
+        "ceiling",
+        "wall_left",
+        "wall_right",
+        "wall_back",
+        "block_tall",
+        "block_short",
+        "baffle",
+        "ceiling_emitter"
+      ]
+    }
+  }
+}

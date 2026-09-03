@@ -106,6 +106,11 @@ bool load(ProcAddressFn getProcAddress) {
     ENGINE_GL_LOAD(CheckFramebufferStatus);
     ENGINE_GL_LOAD(BlitFramebuffer);
     ENGINE_GL_LOAD(ReadPixels);
+    ENGINE_GL_LOAD(GenQueries);
+    ENGINE_GL_LOAD(DeleteQueries);
+    ENGINE_GL_LOAD(BeginQuery);
+    ENGINE_GL_LOAD(EndQuery);
+    ENGINE_GL_LOAD(GetQueryObjectui64v);
 
 #undef ENGINE_GL_LOAD
 

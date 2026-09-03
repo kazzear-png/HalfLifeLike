@@ -72,11 +72,14 @@ void main()
     vec3 hdr = texture(uHDR, vUV).rgb * uExposure;
     vec3 srgb = linearToSRGB(acesFilm(hdr));
 
-    // Triangular-PDF dither (+-1 LSB): smooth HDR gradients (flashlight pools,
-    // ambient falloffs) quantize into visible concentric bands on an 8-bit
-    // backbuffer once sRGB stretches the darks by 12.92x. Adding two uniform
-    // hashes (sum centered at 0) trades banding for imperceptible noise -- the
-    // classic perceptual shortcut: buy smoothness with randomness, not bits.
+    // Triangular-PDF dither (3 LSB peak-to-peak, i.e. +-1.5 LSB): smooth HDR
+    // gradients (flashlight pools, ambient falloffs) quantize into visible
+    // concentric bands on an 8-bit backbuffer once sRGB stretches the darks
+    // by 12.92x. Summing two uniform hashes centers the noise at zero with a
+    // triangular distribution whose tails reach +-1.5 LSB -- slightly beyond
+    // +-1 LSB on purpose, so even the heavier low-end quantization steps are
+    // fully decorrelated. The classic perceptual shortcut: buy smoothness
+    // with imperceptible noise, not bits.
     float n1 = hash12(gl_FragCoord.xy);
     float n2 = hash12(gl_FragCoord.xy + vec2(0.137, -7.913));
     srgb += (n1 + n2 - 1.0) * (1.5 / 255.0);
@@ -96,11 +99,32 @@ Renderer::~Renderer() {
     // Application member destruction order guarantees the GL context is still
     // alive here (m_renderer is destroyed before m_window).
     destroyHDRTargets();
+    if (m_timerQuery != 0) {
+        gl::DeleteQueries(1, &m_timerQuery);
+        m_timerQuery = 0;
+    }
     if (m_emptyVao != 0) {
         gl::DeleteVertexArrays(1, &m_emptyVao);
         m_emptyVao = 0;
     }
     // m_tonemapShader releases its program through its own destructor.
+}
+
+void Renderer::enableGpuTiming(bool enable) {
+    if (enable == m_gpuTimingWanted) {
+        return;
+    }
+    m_gpuTimingWanted = enable;
+    m_gpuTimingOn = enable;
+    m_gpuFrameMs = -1.0f;
+    m_gpuQueryPending = false;
+    if (enable && m_timerQuery == 0) {
+        gl::GenQueries(1, &m_timerQuery);
+    }
+    if (!enable && m_timerQuery != 0) {
+        gl::DeleteQueries(1, &m_timerQuery);
+        m_timerQuery = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +290,23 @@ void Renderer::setClearColor(float r, float g, float b, float a) {
 void Renderer::beginFrame() {
     m_stats.reset();  // frame starts here
 
+    if (m_gpuTimingOn) {
+        // Read last frame's completed query before re-arming (standard
+        // one-frame-lag pattern; the result is guaranteed available).
+        if (m_gpuQueryPending) {
+            gl::GLuint64 ns = 0;
+            gl::GetQueryObjectui64v(m_timerQuery, gl::QueryResult, &ns);
+            if (gl::GetError() == gl::NoError && ns > 0) {
+                m_gpuFrameMs = static_cast<float>(static_cast<double>(ns) / 1e6);
+            } else {
+                m_gpuTimingOn = false;   // driver misbehaved; report n/a
+                std::fprintf(stderr, "[Renderer] GPU timer query failed; timing disabled.\n");
+            }
+            m_gpuQueryPending = false;
+        }
+        gl::BeginQuery(gl::TimeElapsed, m_timerQuery);
+    }
+
     if (m_hdrActive) {
         gl::BindFramebuffer(gl::Framebuffer, m_msaaFbo);
     }
@@ -301,6 +342,10 @@ void Renderer::drawTonemapPass() {
 void Renderer::endFrame() {
     if (m_hdrActive) {
         drawTonemapPass();
+    }
+    if (m_gpuTimingOn) {
+        gl::EndQuery(gl::TimeElapsed);
+        m_gpuQueryPending = true;
     }
 }
 

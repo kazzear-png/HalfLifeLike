@@ -26,8 +26,9 @@
 namespace engine {
 
 // Upper bound for point lights per frame. Uniform arrays are sized to this;
-// uPointLightCount selects how many are evaluated.
-inline constexpr int kMaxPointLights = 8;
+// uPointLightCount selects how many are evaluated. Raised 8 -> 16 in M3.3 so
+// the Cornell benchmark's area-emitter grid fits (4x4 deterministic samples).
+inline constexpr int kMaxPointLights = 16;
 
 struct DirectionalLight {
     Vec3 direction{0.0f, -1.0f, 0.0f};  // unit vector, points FROM surface TOWARD the light

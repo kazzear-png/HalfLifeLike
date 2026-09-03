@@ -73,6 +73,15 @@ public:
     // backbuffer (post-tonemap) as RGBA8, bottom-up rows.
     bool readBackbufferPixels(int width, int height, unsigned char* outRgba);
 
+    // --- benchmark GPU timing (M3.3) ---
+    // Wraps each frame in a GL_TIME_ELAPSED timer query. Results are read one
+    // frame later (the standard pattern -- the query must complete before its
+    // result is fetched). If a driver misbehaves, timing disables itself and
+    // lastGpuFrameMs() keeps reporting a negative value ("n/a").
+    void enableGpuTiming(bool enable);
+    float lastGpuFrameMs() const { return m_gpuFrameMs; }
+    bool gpuTimingActive() const { return m_gpuTimingOn; }
+
 private:
     // --- GL object handles (kept internal; never exposed through the API) ---
     gl::GLuint m_msaaFbo        = 0;  // multisample scene target
@@ -94,6 +103,13 @@ private:
     float m_clearColor[4] = { 0.10f, 0.12f, 0.15f, 1.0f };
 
     RenderStats m_stats;
+
+    // M3.3: GPU frame timing (timer query, one-frame-lag readback).
+    bool m_gpuTimingWanted = false;   // caller asked for timing
+    bool m_gpuTimingOn    = false;    // driver accepted it
+    bool m_gpuQueryPending = false;
+    gl::GLuint m_timerQuery = 0;
+    float m_gpuFrameMs = -1.0f;       // < 0 == "n/a"
 
     // Internal helpers (require a current GL context).
     void destroyHDRTargets();

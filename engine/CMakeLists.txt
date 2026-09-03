@@ -37,4 +37,28 @@ if(BUILD_TESTING)
     else()
         message(STATUS "Skipping engine_obj_tests: ${engine_obj_tests_src} not found")
     endif()
+
+    # M3.2: reference-value tests for the PBR shader math (see tests/brdf_tests.cpp).
+    set(engine_brdf_tests_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/brdf_tests.cpp")
+    if(EXISTS "${engine_brdf_tests_src}")
+        add_executable(engine_brdf_tests "${engine_brdf_tests_src}")
+        target_link_libraries(engine_brdf_tests PRIVATE engine)
+        add_test(NAME brdf_tests COMMAND engine_brdf_tests)
+    else()
+        message(STATUS "Skipping engine_brdf_tests: ${engine_brdf_tests_src} not found")
+    endif()
+
+    # M3.3: frozen cornell-box/1.0 benchmark pins (see tests/bench_tests.cpp).
+    set(engine_bench_tests_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/bench_tests.cpp")
+    if(EXISTS "${engine_bench_tests_src}")
+        add_executable(engine_bench_tests "${engine_bench_tests_src}")
+        target_link_libraries(engine_bench_tests PRIVATE engine)
+        target_include_directories(engine_bench_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../sandbox/src")
+        target_compile_definitions(engine_bench_tests PRIVATE
+            CORNELL_GEOMETRY_DIR="${CMAKE_SOURCE_DIR}/benchmarks/cornell_box/geometry")
+        add_test(NAME bench_tests COMMAND engine_bench_tests)
+    else()
+        message(STATUS "Skipping engine_bench_tests: ${engine_bench_tests_src} not found")
+    endif()
 endif()

@@ -8,6 +8,7 @@
 // Upgrade path: replace with glad2 when coverage grows (docs/ARCHITECTURE.md).
 
 #include <cstddef>
+#include <cstdint>
 
 namespace engine {
 namespace gl {
@@ -22,6 +23,7 @@ using GLuint     = unsigned int;
 using GLchar     = char;
 using GLubyte    = unsigned char;
 using GLfloat    = float;
+using GLuint64   = std::uint64_t;
 using GLsizeiptr = std::ptrdiff_t;
 
 // GL entry points use stdcall on 32-bit Windows; default convention elsewhere.
@@ -75,6 +77,10 @@ enum : GLenum {
     DepthAttachment       = 0x8D00,
     DepthComponent24      = 0x81A6,
     FramebufferComplete   = 0x8CD5,
+
+    // M3.3: timer queries (benchmark GPU frame time)
+    TimeElapsed          = 0x88BF,
+    QueryResult          = 0x8866,
 };
 
 // ---- Entry points (null until load() succeeds) ----
@@ -157,6 +163,13 @@ inline void (ENGINE_GL_CALL* BlitFramebuffer)(GLint srcX0, GLint srcY0, GLint sr
 
 // M3: readback (verification screenshots)
 inline void (ENGINE_GL_CALL* ReadPixels)(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* data) = nullptr;
+
+// M3.3: timer queries (benchmark GPU frame timing; one-frame-lag readback)
+inline void (ENGINE_GL_CALL* GenQueries)(GLsizei n, GLuint* ids) = nullptr;
+inline void (ENGINE_GL_CALL* DeleteQueries)(GLsizei n, const GLuint* ids) = nullptr;
+inline void (ENGINE_GL_CALL* BeginQuery)(GLenum target, GLuint id) = nullptr;
+inline void (ENGINE_GL_CALL* EndQuery)(GLenum target) = nullptr;
+inline void (ENGINE_GL_CALL* GetQueryObjectui64v)(GLuint id, GLenum pname, GLuint64* params) = nullptr;
 
 // Resolves every entry point above via getProcAddress (the platform layer
 // supplies this, typically wrapping glfwGetProcAddress). Returns false if any
