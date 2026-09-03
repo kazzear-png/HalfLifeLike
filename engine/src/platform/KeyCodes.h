@@ -12,8 +12,8 @@ namespace engine {
 enum class Key {
     Escape, Space, Enter, Tab,
     LeftShift, LeftControl,
-    Q, W, E, A, S, D,
-    Digit1, Digit2, Digit3,
+    Q, W, E, A, S, D, F,
+    Digit1, Digit2, Digit3, Digit4,
 };
 
 } // namespace engine

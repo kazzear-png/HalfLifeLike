@@ -20,9 +20,16 @@ struct Mat4 {
     static Mat4 lookAt(Vec3 eye, Vec3 target, Vec3 up);
     static Mat4 translate(const Vec3& t);
     static Mat4 scale(float s);
+    static Mat4 scale(const Vec3& s);            // non-uniform (M3)
     static Mat4 rotateX(float radians);
     static Mat4 rotateY(float radians);
     static Mat4 rotateZ(float radians);
+
+    Mat4 transpose() const;                       // M3
+    Mat4 inverse() const;                         // M3: general 4x4 inverse
+    // M3: normal matrix for shading -- inverse-transpose of the model matrix.
+    // Upload as a mat4, slice with mat3() in the shader.
+    Mat4 normalMatrix() const { return inverse().transpose(); }
 };
 
 // Column-major multiply: out = a * b.

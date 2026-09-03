@@ -1,8 +1,9 @@
 #pragma once
 //
-// Static indexed mesh: VAO + VBO + EBO. Fixed vertex layout for M1:
+// Static indexed mesh: VAO + VBO + EBO. Vertex layout since M3 (lit pipeline):
 //   location 0 = vec3 position
-//   location 1 = vec3 color
+//   location 1 = vec3 normal
+//   location 2 = vec3 color (albedo multiplier; OBJ import emits white)
 // Flexible layouts and dynamic buffers land with the mesh/material systems.
 
 #include "rendering/GL.h"
@@ -12,8 +13,9 @@
 namespace engine {
 
 struct Vertex {
-    float x, y, z;   // position
-    float r, g, b;   // color
+    float x, y, z;    // position
+    float nx, ny, nz; // normal (unit length)
+    float r, g, b;    // color (albedo multiplier)
 };
 
 class Mesh {

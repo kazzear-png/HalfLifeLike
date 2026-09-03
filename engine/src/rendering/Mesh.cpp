@@ -56,12 +56,16 @@ bool Mesh::create(const Vertex* vertices, std::uint32_t vertexCount,
                    gl::GLsizeiptr(indexCount) * gl::GLsizeiptr(sizeof(std::uint32_t)),
                    indices, gl::StaticDraw);
 
-    // Layout: location 0 = vec3 position, location 1 = vec3 color.
+    // Layout: location 0 = vec3 position, location 1 = vec3 normal,
+    //         location 2 = vec3 color.
     gl::EnableVertexAttribArray(0);
     gl::VertexAttribPointer(0, 3, gl::Float, gl::GLboolean(0), sizeof(Vertex),
                             reinterpret_cast<const void*>(offsetof(Vertex, x)));
     gl::EnableVertexAttribArray(1);
     gl::VertexAttribPointer(1, 3, gl::Float, gl::GLboolean(0), sizeof(Vertex),
+                            reinterpret_cast<const void*>(offsetof(Vertex, nx)));
+    gl::EnableVertexAttribArray(2);
+    gl::VertexAttribPointer(2, 3, gl::Float, gl::GLboolean(0), sizeof(Vertex),
                             reinterpret_cast<const void*>(offsetof(Vertex, r)));
 
     // Unbind the VAO first: the element-buffer binding is VAO state and must

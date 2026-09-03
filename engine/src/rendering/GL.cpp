@@ -72,6 +72,10 @@ bool load(ProcAddressFn getProcAddress) {
     ENGINE_GL_LOAD(GetUniformLocation);
     ENGINE_GL_LOAD(UniformMatrix4fv);
     ENGINE_GL_LOAD(Uniform4f);
+    ENGINE_GL_LOAD(Uniform1f);
+    ENGINE_GL_LOAD(Uniform1i);
+    ENGINE_GL_LOAD(Uniform3f);
+    ENGINE_GL_LOAD(Uniform3fv);
     ENGINE_GL_LOAD(GenVertexArrays);
     ENGINE_GL_LOAD(BindVertexArray);
     ENGINE_GL_LOAD(DeleteVertexArrays);
@@ -81,6 +85,27 @@ bool load(ProcAddressFn getProcAddress) {
     ENGINE_GL_LOAD(DeleteBuffers);
     ENGINE_GL_LOAD(EnableVertexAttribArray);
     ENGINE_GL_LOAD(VertexAttribPointer);
+    ENGINE_GL_LOAD(DrawArrays);
+    ENGINE_GL_LOAD(Disable);
+    ENGINE_GL_LOAD(GenTextures);
+    ENGINE_GL_LOAD(DeleteTextures);
+    ENGINE_GL_LOAD(BindTexture);
+    ENGINE_GL_LOAD(ActiveTexture);
+    ENGINE_GL_LOAD(TexImage2D);
+    ENGINE_GL_LOAD(TexParameteri);
+    ENGINE_GL_LOAD(GenFramebuffers);
+    ENGINE_GL_LOAD(DeleteFramebuffers);
+    ENGINE_GL_LOAD(BindFramebuffer);
+    ENGINE_GL_LOAD(FramebufferTexture2D);
+    ENGINE_GL_LOAD(GenRenderbuffers);
+    ENGINE_GL_LOAD(DeleteRenderbuffers);
+    ENGINE_GL_LOAD(BindRenderbuffer);
+    ENGINE_GL_LOAD(RenderbufferStorage);
+    ENGINE_GL_LOAD(RenderbufferStorageMultisample);
+    ENGINE_GL_LOAD(FramebufferRenderbuffer);
+    ENGINE_GL_LOAD(CheckFramebufferStatus);
+    ENGINE_GL_LOAD(BlitFramebuffer);
+    ENGINE_GL_LOAD(ReadPixels);
 
 #undef ENGINE_GL_LOAD
 

@@ -10,10 +10,26 @@
 #include <cmath>
 #include <cstdio>
 
+#ifdef _WIN32
+#include <io.h>   // _isatty: detect a double-clicked console run
+#endif
+
 namespace {
 
 int g_checks   = 0;
 int g_failures = 0;
+
+// Windows convenience: hold the console open when double-clicked so results
+// are readable; ctest/CI runs (piped stdio) pass through with no pause.
+void pauseIfInteractive() {
+#ifdef _WIN32
+    if (_isatty(_fileno(stdin))) {
+        std::printf("\nPress Enter to close...");
+        std::fflush(stdout);
+        std::fgetc(stdin);
+    }
+#endif
+}
 
 void expectTrue(bool condition, const char* what) {
     ++g_checks;
@@ -148,6 +164,80 @@ void testCamera() {
     expectNear(cam.pitch(), -engine::Camera::kMaxPitch, 1e-6f, "pitch clamped low");
 }
 
+// M3 additions -- verified before the lit pipeline relies on them.
+
+void testTranspose() {
+    std::printf("[math] transpose\n");
+    const engine::Mat4 T = engine::Mat4::translate(engine::Vec3(1, 2, 3));
+    const engine::Mat4 TT = T.transpose().transpose();
+    expectTrue(matricesEqual(T, TT, 1e-6f), "double transpose is identity");
+
+    // Diagonal and symmetric matrices are their own transpose.
+    const engine::Mat4 S = engine::Mat4::scale(engine::Vec3(2.0f, 3.0f, 4.0f));
+    expectTrue(matricesEqual(S, S.transpose(), 1e-6f), "diagonal matrix == its transpose");
+
+    // (A*B)^T == B^T * A^T on rigid transforms.
+    const engine::Mat4 A = engine::Mat4::translate(engine::Vec3(1, -2, 0.5f)) * engine::Mat4::rotateY(0.3f);
+    const engine::Mat4 B = engine::Mat4::rotateZ(-0.8f) * engine::Mat4::scale(engine::Vec3(1.0f, 2.0f, 3.0f));
+    const engine::Mat4 lhs = (A * B).transpose();
+    const engine::Mat4 rhs = B.transpose() * A.transpose();
+    expectTrue(matricesEqual(lhs, rhs, 1e-4f), "(A*B)^T == B^T*A^T");
+}
+
+void testInverse() {
+    std::printf("[math] inverse\n");
+    const float eps = 1e-4f;
+
+    // TRS model matrix -- the exact shape used by the lit pipeline's normal
+    // matrix (inverse().transpose()).
+    const engine::Mat4 model = engine::Mat4::translate(engine::Vec3(0.5f, -1.2f, 2.0f))
+                             * engine::Mat4::rotateY(0.9f)
+                             * engine::Mat4::rotateX(-0.4f)
+                             * engine::Mat4::scale(engine::Vec3(1.5f, 1.0f, 0.75f));
+    const engine::Mat4 inv = model.inverse();
+
+    expectTrue(matricesEqual(model * inv, engine::Mat4::identity(), eps), "M * M^-1 == I");
+    expectTrue(matricesEqual(inv * model, engine::Mat4::identity(), eps), "M^-1 * M == I");
+
+    // Inverse round-trips points AND directions.
+    const engine::Vec3 p = transform(inv, 0.3f, -0.7f, 1.1f, 1.0f);
+    expectVec3Near(transform(model, p.x, p.y, p.z, 1.0f), engine::Vec3(0.3f, -0.7f, 1.1f), eps,
+                   "point survives inverse round-trip");
+
+    // inverse == transpose for pure rotations (orthogonal matrix).
+    const engine::Mat4 R = engine::Mat4::rotateY(1.1f) * engine::Mat4::rotateX(0.5f);
+    expectTrue(matricesEqual(R.inverse(), R.transpose(), 1e-4f), "rotation inverse == transpose");
+
+    // Normal matrix: inverse().transpose() strips translation + uniform scale
+    // and keeps only the rotation, so object-space normals rotate with the
+    // surface instead of shearing.
+    // rigid = T(1,2,3) * Rz(0.7) * S(2)  ->  normalMatrix rotation = Rz(0.7)
+    const engine::Mat4 rigid = engine::Mat4::translate(engine::Vec3(1, 2, 3))
+                             * engine::Mat4::rotateZ(0.7f)
+                             * engine::Mat4::scale(2.0f);
+    const engine::Mat4 n = rigid.normalMatrix();
+    const engine::Vec3 nWorld = transform(n, 0.0f, 1.0f, 0.0f, 0.0f);  // +Y object-space normal, w=0
+    expectVec3Near(engine::normalize(nWorld),
+                   engine::Vec3(-std::sin(0.7f), std::cos(0.7f), 0.0f), 1e-5f,
+                   "normal matrix strips scale/translation, keeps rotation");
+
+    // Perpendicularity is preserved: rotated tangent and rotated normal stay 90 deg apart.
+    const engine::Vec3 tangentWorld = transform(n, 1.0f, 0.0f, 0.0f, 0.0f);
+    expectNear(engine::dot(engine::normalize(nWorld), engine::normalize(tangentWorld)), 0.0f, 1e-5f,
+               "normal stays perpendicular to surface tangent");
+
+    // Singular matrix (zero column -> det 0) falls back to identity, no NaNs.
+    engine::Mat4 singular;
+    singular.m[5] = 0.0f;   // identity with a zeroed column -> singular
+    const engine::Mat4 singInv = singular.inverse();
+    expectTrue(matricesEqual(singInv, engine::Mat4::identity(), 1e-6f), "singular inverse falls back to identity");
+    bool allFinite = true;
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(singInv.data()[i])) allFinite = false;
+    }
+    expectTrue(allFinite, "singular inverse contains no NaN/Inf");
+}
+
 } // namespace
 
 int main() {
@@ -158,7 +248,10 @@ int main() {
     testPerspective();
     testLookAt();
     testCamera();
+    testTranspose();
+    testInverse();
 
     std::printf("[math] %d checks, %d failure(s)\n", g_checks, g_failures);
+    pauseIfInteractive();
     return g_failures == 0 ? 0 : 1;
 }

@@ -115,4 +115,39 @@ void Shader::setFloat4(const char* name, float x, float y, float z, float w) {
     }
 }
 
+void Shader::setFloat(const char* name, float value) {
+    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    if (location >= 0) {
+        gl::Uniform1f(location, value);
+    }
+}
+
+void Shader::setInt(const char* name, int value) {
+    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    if (location >= 0) {
+        gl::Uniform1i(location, value);
+    }
+}
+
+void Shader::setFloat3(const char* name, float x, float y, float z) {
+    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    if (location >= 0) {
+        gl::Uniform3f(location, x, y, z);
+    }
+}
+
+void Shader::setFloat3(const char* name, const Vec3& v) {
+    setFloat3(name, v.x, v.y, v.z);
+}
+
+void Shader::setFloat3Array(const char* name, const float* xyz, int count) {
+    if (xyz == nullptr || count <= 0) {
+        return;
+    }
+    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    if (location >= 0) {
+        gl::Uniform3fv(location, gl::GLsizei(count), xyz);
+    }
+}
+
 } // namespace engine

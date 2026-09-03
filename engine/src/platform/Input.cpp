@@ -2,6 +2,7 @@
 
 #include "platform/Window.h"
 
+#define GLFW_INCLUDE_NONE  // engine ships its own scoped GL loader (rendering/GL.h)
 #include <GLFW/glfw3.h>
 
 #include <cstdio>
@@ -24,9 +25,11 @@ int toGlfwKey(Key key) {
         case Key::A:           return GLFW_KEY_A;
         case Key::S:           return GLFW_KEY_S;
         case Key::D:           return GLFW_KEY_D;
+        case Key::F:           return GLFW_KEY_F;
         case Key::Digit1:      return GLFW_KEY_1;
         case Key::Digit2:      return GLFW_KEY_2;
         case Key::Digit3:      return GLFW_KEY_3;
+        case Key::Digit4:      return GLFW_KEY_4;
         default:               return GLFW_KEY_UNKNOWN;
     }
 }

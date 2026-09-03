@@ -1,5 +1,6 @@
 #include "platform/Window.h"
 
+#define GLFW_INCLUDE_NONE  // engine ships its own scoped GL loader (rendering/GL.h)
 #include <GLFW/glfw3.h>
 #include <cstdio>
 
