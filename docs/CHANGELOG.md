@@ -6,6 +6,434 @@ sections Added / Changed / Removed / Deprecated / Fixed as needed.
 
 ---
 
+## 0.4.8 — M4.0.8: bracket refinement (the reference-standard second phase of the march)
+
+User verdict after the first lit march: "no other engine has blocky
+penumbra — look up how it's done in other code." The research verdict
+(docs/SHADOW_EDGE_REFERENCES.md): the user is right. Every shipped
+heightfield-ray solver is two-phase — a coarse linear search brackets the
+feature, a refinement phase resolves it — and GPU Gems 3 ch. 18 names our
+exact defect ("the linear search ... is prone to aliasing"). Our marcher had
+phase 1 (M4.0.5) and the filtered visibility signal (M4.0.7, iq's terrain
+soft-shadow trick) but no refinement phase: the graded edge was computed
+from the SAMPLED minimum clearance, so it inherited the march cadence as
+staircase noise near silhouettes.
+
+### Added
+
+- **Bracket refinement in `shadowVisibility()`** (POM / relief-mapping
+  family): the argmin sample's `t` is tracked, and two extra fetch pairs at
+  `t_best ± half-step` re-evaluate the interval clearance against the same
+  window at half-step resolution. Engaged ONLY where the window actually
+  fired (`vis < 1`) — fully lit and hard-blocked pixels pay nothing. A
+  refined fetch landing inside the interval returns the hard 0 (a crossing
+  the cadence jumped over is a real crossing). Cost on the ledger rows:
+  M4.0.5/M4.0.6 tap counts unchanged; penumbra-band pixels pay 2 fetch
+  pairs per light.
+- **`--shadow-refine 0|1`** (default 1 = ON; `0` = the exact M4.0.7 soft
+  march, byte-for-byte). Telemetry line now reports
+  `refine: on (M4.0.8) / off (exact M4.0.7)`.
+- **Reference ledger**: docs/SHADOW_EDGE_REFERENCES.md — the research
+  verdict with citations (GPU Gems 3 ch. 18 relaxed cone stepping;
+  Tatarchuk POM + approximate soft shadows; iq terrain marching /
+  SDF soft shadows; PCSS blocker→penumbra estimation; VSM moments and why
+  we did NOT adopt them for a 16-light rig), the component mapping table,
+  and the documented residual limits (window narrower than the cadence
+  cannot fire the refinement; sub-half-step lobes need the mip/cone
+  hierarchy, M4.1+ candidate).
+- **`testBracketRefinement()`** (bench 163 -> 173 checks): ridge fixture
+  proves the refinement strictly sharpens a sub-step clearance dip the
+  0.08 m cadence sampled past; flat-bottom fixture proves the exit-edge
+  sharpening when the window grows over constant clearance; binary
+  neutrality pins (penumbra = 0: refine 0 vs 1 identical on umbra and lit
+  rays); hard outcomes stay exact; monotone-safety pins (refinement never
+  raises visibility, stays in [0, 1]).
+
+### Changed
+
+- `bench_tests` count 163 -> 173; VERIFICATION updated.
+- The M4.0.7 A/B matrix rows in BASELINE.md now measure WITH refinement on
+  by default; `--shadow-refine 0` reproduces the pure M4.0.7 soft rows.
+
+### Preserved (regression surface untouched)
+
+- `--shadow-penumbra 0` still byte-reproduces the M4.0.6 binary march and
+  the M4.0.5 shot (`e830e543f6be06b9a2b58e6103fcd827`): the refinement is
+  unreachable at penumbra 0 (structural, port-pinned).
+- BRDF, light rig, bias, Cornell geometry, capture: all frozen.
+- Local: sandbox + all suites build 0 errors / 0 warnings; bench 173/173,
+  math 73/73, brdf 38/38, obj 24/24.
+
+---
+
+## 0.4.7 — M4.0.7: soft penumbra extracted from the march (smooth edges, zero extra taps)
+
+M4.0.5's first lit march put shadows on screen but quantized: the boundary
+staircase tracked the 0.16 m march cadence (7.4 field texels per sample).
+M4.0.6 halved the step (0.16 -> 0.08 m) and the bands halved with it — but
+the cost curve is linear in samples (GPU 0.583 -> 0.881 ms at 960x540), and
+sampling density is not the only information in the march. Each sample
+already computes HOW FAR the ray clears the occluder column; the binary
+march threw that number away.
+
+### Added
+
+- **Soft penumbra in `shadowVisibility()`** (horizon-style accumulation):
+  each sample reports its signed clearance `d` to the column interval
+  `[hMin + bias, hMax - bias]`; the march returns the minimum of `d` against
+  a penumbra window `penumbra * traveled` that grows with distance along the
+  ray. A ray that merely GRAZES the interval shades partially instead of
+  flipping hard — the staircase boundary becomes a graded edge with zero
+  extra texture taps (a few ALU per sample). Deep umbra stays hard
+  (`d < 0` returns 0 exactly as before), and a `2 * step` start zone keeps
+  the receiver's own neighborhood binary: contact shadows stay crisp and
+  top-surface receivers cannot self-shade.
+- **Derived, not tuned:** the default scale is `kShadowPenumbra =
+  0.5 * kLightPitch / kLightHeight = 0.5 * 0.325 / 5.44 ~= 0.0299` — half
+  the frozen 4x4 grid pitch over the grid height, i.e. the reconstruction
+  blur of the point-light quadrature of the area emitter. The 16 hard edges
+  were always a quadrature; this restores the continuum the rig approximates.
+- **`--shadow-penumbra <scale>`** and **`--shadow-step <meters>`** CLI
+  overrides (both default to the derived constants; overrides exist so the
+  ledger's A/B matrix runs without rebuilds). `--shadow-penumbra 0` disables
+  the soft path and must reproduce the M4.0.6 binary image byte-for-byte
+  (regression + A/B pin; the binary decision and the early-out are provably
+  unchanged — `max(a, b) < 0` iff both old inequalities held). Telemetry
+  gains a `shadow penumbra:` line with the active scale and march step
+  (report `lines[]` 13 -> 14).
+
+### Changed
+
+- The march's early-out is penumbra-aware: it breaks once the ray's global
+  clearance bound `rayY - (maxHeight - bias)` exceeds the largest window the
+  ray can ever have (`penumbra * segLen`). With penumbra = 0 this breaks one
+  bias earlier than M4.0.6 — strictly on samples whose interval test could
+  never fire — so the binary image is unchanged.
+- `bench_tests` march port mirrors the soft path: **156 -> 163 checks**
+  (deep-umbra hardness, exact-1 clear rays, top-receiver acne guard, a 1 m
+  box graze fixture landing strictly inside (0, 1), monotonicity in the
+  window scale, and the binary-reference equivalence pin).
+
+### Evidence
+
+- Local: bench 163/163, math 73/73, brdf 38/38, obj 24/24; build 0 errors /
+  0 warnings. On-hardware: run the M4.0.7 A/B matrix in
+  `benchmarks/cornell_box/BASELINE.md` (soft@0.08 default, soft@0.16 via
+  `--shadow-step`-style constant override or binary replay via
+  `--shadow-penumbra 0`); expected: edge/shadow RMSE down from 80.0 at
+  M4.0.5, GPU within ~0.05 ms of the binary run at the same cadence.
+
+---
+
+## 0.4.6 — M4.0.6: march step halved (0.16 -> 0.08 m) — the boundary quantizer fix
+
+The first lit march (M4.0.5, ledger ACCEPTED at similarity 52.62) exposed
+the march cadence as the shadow boundary's dominant quantizer: the field is
+21.5 mm/texel and both samplers are already GL_LINEAR, so the staircase
+band pitch tracked the 0.16 m sample spacing (7.4 texels per step), not the
+capture and not the filter.
+
+### Changed
+
+- `kMarchStep` 0.16 -> 0.08 m in the sandbox (single change; the
+  `static_assert` against the cbox03 baffle's 0.2 m thickness still holds
+  with 2.5x margin, so the no-leak invariant is intact). `bench_tests`
+  `MarchParams::step` default and the literal invariant pin mirrored.
+- Documented refinement floor: ~0.04 m (~1.9 texels) — steps finer than the
+  field's texel pitch buy no information the capture can represent.
+
+### Evidence
+
+- Local: bench 156/156 at the new cadence. On-hardware (M4.0.6 run):
+  GPU 0.583 -> 0.881 ms at 960x540 (805.8 FPS) — the marcher is ~0.3 ms of
+  the frame at 0.16 m and scales linearly with sample count, which is
+  precisely why M4.0.7 extracts quality from the existing taps instead.
+
+---
+
+## 0.4.5 — M4.0.5: shadow-march uv swizzle fix (the inert-march root cause) + GPU-side debug panel
+
+M4.0.4's instruments cleared everything they could see: registration probes
+7/7 (the field is in the correct world-space location and orientation), the
+heightfield dump showed both block footprints in place through the march's
+sampler wiring, telemetry said `shadows: on`, and GPU time rose by the cost
+of real texture fetches (0.627 → 0.652 ms) — while the rendered image stayed
+byte-identical to `--no-shadows` for the fourth consecutive run (umbra and
+penumbra probes at their unshadowed values, shot md5
+`5e549b5417311b93fe729e7989184aeb`). That combination — perfect field, live
+sampler path, executing march, zero occlusion — left exactly one untested
+surface: **how the march interprets the footprint uniforms**. The uniforms
+pack (worldX, worldZ, pad) into a vec3 (no Uniform2f loader entry), but
+`shadowVisibility()` unpacked the footprint with `.xz` — which reads
+(worldX, pad) — instead of `.xy`. Deterministic consequences on every
+driver: footprint span computed as (5.5, 0.0), `invSpan.z = 1/0 = +inf`,
+`uv.y = worldZ * inf` clamped to the field's edge rows, where the capture is
+floor (hMax = 0) — so `rayY < hMax - bias` could never fire, and the march
+executed every fetch while returning 1.0 forever. The dump could not see it
+(it computes uv from gl_FragCoord and never touches the footprint uniforms);
+the registration probes could not see it (they test the CPU-side mapping
+against the captured field — both correct); the bench_tests C++ port could
+not see it (it implements the intended mapping, not the shader's swizzle).
+Root-cause class: **a GLSL-only divergence between the shader and its CPU
+port** — from now on, instruments must also look from inside the shader.
+
+### Fixed
+- `shadowVisibility()` unpacks the packed footprint uniforms with `.xy`
+  (was `.xz`): `vec2 invSpan = 1.0 / (uShadowFootprintMax.xy -
+  uShadowFootprintMin.xy)` and `uv = (mix(p0, p1, t) -
+  uShadowFootprintMin.xy) * invSpan`. Two tokens; no march constant, bias,
+  BRDF, light position, or Cornell geometry changed. The pack convention
+  (worldX, worldZ, pad) is now documented at the uniform block itself.
+
+### Added
+- Sandbox `--shadow-debug vis|field|uv` (M4.0.5, temporary GPU-side
+  instrument, default OFF): a `uShadowDebug` uniform drives three blatant
+  views computed inside the PBR shader, so the next "every instrument
+  passes but the image is inert" failure splits in one run without leaving
+  the GPU. `vis` — black where any point light is blocked, bright where
+  none (the march's verdict made blatant, independent of the BRDF; the
+  M4.0.5 request). `field` — R: hMax fetched at the fragment's own
+  footprint uv through the march's formula; G: march calls / 16 (did
+  `shadowVisibility` run at all); B: uShadowMaxHeight / 6 (did the
+  early-out uniform land). `uv` — the march's uv formula shown directly:
+  smooth 0→1 red/green gradients when correct; a hard binary green seam at
+  z = 0 is the signature of the ±inf uv.y this build fixes. Debug views
+  REPLACE the shaded image — never ledger images; telemetry prints a
+  `shadow-debug:` line whenever one is active.
+
+### Evidence
+- Local: rebuild clean, 0 warnings; bench 156/156, math 73/73, obj 24/24,
+  brdf 38/38. The fix is a GLSL source change, so the confirming run is the
+  user's re-measurement of the BASELINE.md protocol (CBox-01/02/03): the
+  shadow probes must read shadowed for the first time and similarity must
+  clear 51.32. The debug modes exist as independent confirmation and as the
+  standing instrument if anything in the march is still inert.
+
+## 0.4.4 — M4.0.4: field registration probes + sampler-path dump (spatial instrument)
+
+M4.0.3 hardware run: the propagation fix worked (field verify OK, telemetry
+`shadows: on (heightfield march, field verified)`) — and the image was STILL
+byte-identical to M4.0.1 (same md5, umbra 50/6/5, penumbra 105/103/100). The
+march is now provably enabled and provably returns 1.0 for every sample of
+every pixel. Byte-identical output rules out a merely DISPLACED field (a
+mirrored/transposed field would still occlude some ray somewhere and move
+some pixel); the surviving worlds are (A) the captured field is spatially
+misregistered in a way aggregate statistics cannot see, (B) the sampler read
+path at draw time returns ~0 (wrong texture actually bound, wrong
+coordinates), or (C) the march's uniforms/logic never test a real value.
+M4.0.2's verifyField() proves coverage %, top, and interval validity — but a
+square room makes a mirrored or X↔Z-transposed field INVISIBLE to those
+statistics: same area, same top. Two instruments close that hole.
+
+### Added
+- `engine::ShadowHeightfield::readbackHeights()` (M4.0.4): raw readback of
+  both captured fields (R channel as float, row 0 = minZ edge — the layout
+  the sampler sees). Scene-side code can now check WHERE the content sits,
+  not just how much of it there is. ReadPixels is still the only new GL
+  surface.
+- `engine::ShadowHeightfield::worldToTexel()` (M4.0.4, static, pure math):
+  the CPU form of the GLSL march's `uv = (world.xz - footprintMin) / span`
+  mapping. Shared by every diagnostic that must agree with the march;
+  pinned headlessly by bench_tests (corners, center, tall-block probe
+  point, outside-refusal, texel-center round trip; 133 → 156 checks).
+- Sandbox REGISTRATION PROBES (M4.0.4, frozen table): after verifyField
+  passes, both fields are read back and probed at frozen world points —
+  tall block center (expect 3.30/0.00), short block center (1.65/0.00),
+  gold sphere center for cbox02 (1.10/0.00), baffle center for cbox03
+  (5.40/3.40 — the one probe whose underside is not the floor, so it
+  validates the MIN capture), plus five sentinels/empties: mirror-X,
+  mirror-Z, transpose, and two empty corners. The sentinels sit OUTSIDE
+  every real footprint but INSIDE the footprint a flipped/swapped capture
+  would have — any mirroring failure mode flips exactly one sentinel to
+  occluder. One loud line per probe; any FAIL disables shadows (the same
+  never-render-a-lie rule as verifyField) and telemetry says so.
+- Sandbox `--dump-heightfield <prefix>` (M4.0.4, temporary diagnostic):
+  renders the captured fields DIRECTLY through the march's sampler wiring —
+  `bindTextures(0, 1)` + `setInt("uShadowHeightsMax"/"Min")` with the SAME
+  uniform names — one texel per pixel, raw linear gray, NO tonemap, via the
+  floor quad drawn with the capture's own ortho through
+  `renderer.drawIndexed` (so it exercises the same GL state sequence as the
+  PBR draw). Writes `<prefix>_hmax.ppm` / `<prefix>_hmin.ppm`. Reading:
+  dump shows footprints in place → field + sampler path fine, the bug is in
+  the march's uniforms/logic; dump black/displaced → field or sampler path.
+
+### Evidence
+- Local: rebuild clean, 0 warnings; bench 156/156, math 73/73, obj 24/24,
+  brdf 38/38. The registration probes and dump are hardware-GL instruments;
+  the discriminating run happens on user hardware.
+
+---
+
+## 0.4.3 — M4.0.3: shadow-verdict propagation bugfix (verified field never enabled the march)
+
+The M4.0.2 instrument worked exactly as designed — and then the verdict was
+thrown away. On the first M4.0.2 hardware run, `captureCornellHeightfield()`
+computed `hf.verifyField(...)` and returned it, but the function's contract
+is 3-state: the return value only means "a capture was made"; the
+verification verdict must travel through the `bool* verifiedOut` out-param.
+`*verifiedOut` was initialized `false` and never written, so a PASSING
+hardware field (console proof: coverage 15.65 % ∈ [10.87, 20.87], top
+3.299 m vs 3.30 expected, intervals valid) still left `shadowsActive ==
+false`, the caller printed `shadow field verification FAILED`, and the
+march stayed off — reproducing the M4.0.1 image bit-for-bit while the
+telemetry told the truth about a condition the code itself had created.
+Software bug, not a rendering/math bug: no shader, scene, capture, or test
+change.
+
+### Fixed
+- `sandbox/src/main.cpp` `captureCornellHeightfield()`: the `verifyField()`
+  verdict is now stored to `*verifiedOut` before returning `true`. The
+  3-state contract (documented on the function) is finally in force:
+  return `false` = capture unavailable; `true` + `*verifiedOut == false` =
+  field failed acceptance; `true` + `*verifiedOut == true` = valid, verified
+  shadow field.
+
+### Evidence
+- M4.0.2 hardware run (same inert-march image as M4.0.1, as the bug
+  predicts): SSIM 0.51318, RMSE 71.875, edge RMSE 80.030 — recorded in the
+  ledger as the M4.0.2 row alongside the field-verify-OK log, which is the
+  first hardware proof that the capture itself works (M4.0.1 could not
+  distinguish empty field from software-off).
+- Local: engine + sandbox rebuild clean; `bench_tests` 133/133 (contract
+  pins unaffected — the bug was in sandbox state plumbing, below the
+  tested layer).
+
+---
+
+## 0.4.2 — M4.0.2: shadow-field verification (the inert-march instrument)
+
+First on-hardware M4 acceptance run: 17/19 probes pass, both new shadow
+probes FAIL, similarity 51.32. Local float64 diagnosis with the harness's
+own frozen model: the two failing probes read byte-identical to the
+UNSHADOWED model (umbra measured 50/6/5 vs unshadowed 51/4/2; penumbra
+105/103/100 vs 105/103/101) — **the shadow march never blocked a single
+light in that run**. Empty capture field, shadows-off mode, and black
+sampler reads are byte-indistinguishable in the image, so the pipeline now
+proves itself at runtime instead of claiming.
+
+### Added
+- `engine::ShadowHeightfield::verifyField()` (M4.0.2): reads back both R16F
+  capture targets after the one-time capture and verifies them against the
+  frozen scene (occluder coverage band from the pinned footprints, tallest
+  surface 3.30/5.40 m, per-texel interval validity min ≤ max). Zero new GL
+  loader entry points (ReadPixels is already engine surface; R16F content is
+  read as RGBA/FLOAT). Prints one loud line either way. An inert field now
+  FAILS LOUDLY at startup instead of rendering as silent light leak.
+- Sandbox: `shadowsActive` now carries the field-verification verdict — a
+  failed verification disables shadows rather than rendering a lie, and the
+  benchmark telemetry distinguishes all four states: `off (--no-shadows)`,
+  `on (heightfield march, field verified)`,
+  `off (capture failed or field verify FAILED)`, demo `n/a`.
+- Acceptance harness (`verify_cornell_shot.py`): failing shadow probes now
+  carry a DIAGNOSIS — the unshadowed float64 model is computed at the probe
+  point with its PHYSICAL albedo (the red wall for the umbra probe) and the
+  failure is classified as "matches UNSHADOWED (march inert)", "partial
+  leak (between models)", or "darker than shadowed (over-blocking)".
+- `bench_tests`: verifyField must refuse a context-less instance (the
+  check can never silently pass on an un-captured field); 132 → 133 checks.
+
+### Fixed
+- Ledger: M4.0.1 hardware row recorded honestly (similarity 51.32, REJECTED,
+  diagnosis attached) — kept as the pre-instrumentation measurement.
+
+---
+
+## 0.4.1 — M4.0.1: MSVC build hotfix (missing `<utility>`)
+
+First on-hardware MSVC build of the M4 tree failed to compile:
+`ShadowHeightfield.cpp(64): error C2039: 'move': is not a member of 'std'`.
+libstdc++ leaks `std::move` through the transitive header chain; MSVC's STL
+does not, and the file included only `<cstdio>`. Portability bug, not a math
+or rendering bug — no shader, scene, or test change.
+
+### Fixed
+- `engine/src/rendering/ShadowHeightfield.cpp`: added the missing
+  `#include <utility>` for `std::move` (the MSVC build blocker).
+- `engine/src/assets/OBJ.cpp`: added `#include <utility>` too — it used
+  `std::move` while relying on `<algorithm>` leaking it (compiled on MSVC
+  today, but the same latent bug class).
+- Root `CMakeLists.txt`: `DOWNLOAD_EXTRACT_TIMESTAMP TRUE` on the GLFW
+  FetchContent declaration, silencing the CMP0135 dev warning seen during
+  configure on CMake 4.x.
+
+---
+
+## 0.4.0 — M4: heightfield shadows for the Cornell rig + clean-reference methodology
+
+The second on-hardware Cornell render was structurally valid (acceptance
+gate passed) but exposed the expected direct-lighting gap: hard shadows
+nowhere, everything else quantified by the ledger. This milestone attacks
+the two highest-leverage items from that review — **real shadowing** and a
+**trustworthy measurement target** — without touching the PBR BRDF math.
+
+### Added
+- **Heightfield shadow capture** (`engine::ShadowHeightfield`, new engine
+  module): TWO one-time ortho captures of the scene's occluders into R16F
+  targets — the highest surface per footprint texel (camera above) and the
+  lowest (camera below). Together they store each texel's vertical occluder
+  INTERVAL. GL surface area unchanged: zero new loader entry points
+  (TexImage2D covers R16F; the default LESS depth test is exactly the right
+  keep rule for both cameras).
+- **Per-light shadow march** in the PBR shader (`shadowVisibility`): the
+  receiver→light segment is marched in XZ with a fixed 0.16 m world step;
+  a light is blocked where the ray height falls inside the local column
+  interval. EXACT for convex occluders — the entire frozen Cornell set
+  (blocks, baffle, spheres), because a convex solid's column interval IS
+  its full vertical extent. The hanging cbox03 baffle (y 3.4..5.4) is the
+  payoff of the interval representation: rays beneath it pass, rays through
+  it block — a max-only heightfield would falsely shadow the under-pass.
+- **16-light superposition penumbra**: each grid light gets its own correct
+  hard shadow; their superposition forms a 16-level penumbra for free.
+- `--no-shadows` CLI flag: restores the exact M3.3 direct-only behavior for
+  A/B ledger comparisons. Shadows are ON by default for cornell scenes and
+  reported in the benchmark telemetry ("shadows: on/off").
+- **Clean reference set** `reference/cbox0*_clean.ppm`: 320 spp path traces
+  (per-spp sample streams, byte-exact resumable accumulation in
+  `reference_pathtracer.py`). The MC noise in the raw 64/80-spp renders
+  measurably depressed SSIM (raw-vs-clean self-check: similarity 54.32);
+  the clean set is the measurement target from M4 on. Raw renders stay
+  archived as provenance. All six reference md5s pinned in BASELINE.md.
+- **Metric suite** in `tools/benchmark_compare.py`: MAE (L1), perceptual
+  ΔE2000 (CIELAB, Sharma 2005 formulation, validated against 7 published
+  reference pairs), and edge/shadow RMSE (Sobel gradient-magnitude error —
+  sensitive exactly where shadow placement/penumbra differ), alongside the
+  existing RMSE/SSIM. `--self-test` runs the reference-value checks.
+- **Positive shadow acceptance checks** in `tools/verify_cornell_shot.py`:
+  the frozen lighting model now includes the exact shadow march (float64),
+  and two new probes pin it on hardware — a full-umbra point (all 16 grid
+  lights provably blocked, expected ≈ 0, ceiling 14) and a penumbra point
+  (4/16 lights lit, exact expected value 36 ± band). The "shadows GAP" row
+  is retired; gaps are now indirect (M7+) and penumbra quality (M5).
+
+### Changed
+- `bench_tests` 100 → 132 checks: the shadow march's C++ port pinned against
+  analytic column-interval fields (tall/short blocks, hanging baffle,
+  sphere, empty room), the 16-light lit/blocked census for the acceptance
+  probes, the march-step-vs-thinnest-occluder safety invariant, and both
+  capture matrices' corner mappings + depth orderings.
+- `reference_pathtracer.py` gained resumable accumulation (`--spp-start/
+  --spp-end/--acc-in/--acc-out/--finish`) with per-spp sample streams
+  (documented in BASELINE.md; chunked runs verified byte-identical to
+  single runs).
+- Roadmap re-anchored to the Cornell experiment ladder (README): M5
+  area-light approximation → M6 probes/irradiance (IBL folds in) → M7
+  GI (screen-space/voxel/probe) → M8 hybrid renderer; scene/material
+  abstraction lands alongside M5 (the `Light`/`AreaLight` objects it
+  needs are the same work).
+
+### Deliberately NOT done
+- No BRDF change of any kind (directive: fix the scene/solver layer, never
+  tune the math against a broken benchmark).
+- No classic shadow maps / cube maps: one centroid map would misplace each
+  light's shadow by up to ~0.4 m and 16 cube maps is not an incremental
+  milestone. Heightfield coverage (exact for convex solids, conservative
+  for non-convex columns) is documented as the M4 contract; general
+  omnidirectional shadowing lands with the scene-abstraction work.
+- No denoiser on the reference: "clean" = 5× the samples of the same
+  trusted estimator, no invented post-processing.
+
+---
+
 ## 0.3.4 — M3.3.1: Cornell hotfix — the box renders black no more (geometry r2)
 
 The first on-hardware Cornell render came back **96.5% black pixels**: only

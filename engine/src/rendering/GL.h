@@ -59,6 +59,11 @@ enum : GLenum {
     RGBA               = 0x1908,
     RGBA8              = 0x8058,
     RGBA16F            = 0x881A,   // half-float HDR color target (renderable in core GL 3.0+)
+
+    // M4: heightfield shadow capture (single-channel half-float target;
+    // filterable in core GL 3.3, unlike R32F)
+    Red                = 0x1903,
+    R16F               = 0x822D,
     TextureMinFilter   = 0x2801,
     TextureMagFilter   = 0x2800,
     TextureWrapS       = 0x2802,

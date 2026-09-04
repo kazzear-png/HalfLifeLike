@@ -10,6 +10,7 @@ add_library(engine STATIC
     src/rendering/Mesh.cpp
     src/rendering/Renderer.cpp
     src/rendering/Shader.cpp
+    src/rendering/ShadowHeightfield.cpp
 )
 
 # Includes are namespaced from src/, e.g. #include "rendering/Shader.h"

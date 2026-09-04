@@ -29,6 +29,7 @@ set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     glfw
     URL https://github.com/glfw/glfw/archive/refs/tags/3.4.zip
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE   # CMP0135: new behavior (silences the dev warning)
 )
 FetchContent_MakeAvailable(glfw)
 

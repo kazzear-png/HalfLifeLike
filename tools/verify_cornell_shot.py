@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """
-M3.3.1 Cornell Box ACCEPTANCE harness -- the M3.3 checklist as code.
+M4 Cornell Box ACCEPTANCE harness -- the M3.3 checklist as code.
 
 The first on-hardware Cornell render came back 96.5% black (M3.3.1: the r1
 geometry authored every room normal outward; the one-sided rasterizer shaded
 the whole room to zero). This script exists so that failure class can never
 pass silently again: run it on the DETERMINISTIC screenshot produced by the
 sandbox and it judges every acceptance criterion from the benchmark charter.
+
+M4 addition: the frozen lighting model now includes the HEIGHTFIELD SHADOW
+MARCH (the exact algorithm the PBR shader runs, in float64), so probe
+expectations account for occlusion and the harness makes its first POSITIVE
+shadow checks: a full-umbra probe (all 16 grid lights provably blocked) and
+a penumbra probe (partially blocked, expected value computed exactly).
 
 Usage (on hardware, after building):
   ./build/bin/sandbox --scene cornell01 --frames 2 --width 1280 --height 720 \
@@ -20,21 +26,24 @@ How it judges without eyes:
   - It re-implements the FROZEN camera (pinhole, yaw 0 / pitch 0, fovY
     39.3 deg) to project known world-space probe points into the image.
   - It re-implements the FROZEN direct-lighting model (the 4x4 flux-
-    preserving point-light grid, Lambert exitance) in float64 to compute
-    what each probe SHOULD measure, then converts through the engine's
-    display transform (exposure 1.0 -> Narkowicz ACES -> exact sRGB),
-    allowing a generous band for specular add, MSAA, and dither.
+    preserving point-light grid, Lambert exitance) + the heightfield shadow
+    march in float64 to compute what each probe SHOULD measure, then
+    converts through the engine's display transform (exposure 1.0 ->
+    Narkowicz ACES -> exact sRGB), allowing a generous band for specular
+    add, MSAA, and dither.
   - It re-implements the box silhouette (projected hull) so the "no
     unexplained black regions" criterion is judged INSIDE the room, not on
     the void border the open front necessarily exposes.
 
-Documented gaps are marked [GAP], not [FAIL]: the rasterizer has no shadows
-(M6), no indirect/GI (M8), no IBL (M5). The ceiling check PINS its dark
-direct-lighting state so a fake ambient can never silently slip in; when the
-real milestones land, those checks flip to positive visibility requirements.
+Documented gaps are marked [GAP], not [FAIL]: the rasterizer still has no
+indirect/GI (M8) and no IBL (M5). The ceiling check PINS its dark
+direct-lighting state so a fake ambient can never silently slip in; when
+the real milestones land, those checks flip to positive visibility
+requirements.
 
 This tool mirrors constants from the generated header
-(sandbox/src/cornell_scene_gen.h); bench_tests pins the C++ side.
+(sandbox/src/cornell_scene_gen.h) and tools/generate_cornell.py; bench_tests
+pins the C++ side.
 """
 
 import argparse
@@ -61,6 +70,66 @@ GRID_ZS = [EMITTER_MIN[2] + (j + 0.5) / 4 * (EMITTER_MAX[2] - EMITTER_MIN[2]) fo
 ALBEDO_WHITE = (0.725, 0.71, 0.68)
 ALBEDO_RED = (0.63, 0.065, 0.05)
 ALBEDO_GREEN = (0.14, 0.45, 0.091)
+
+# ---------------------------------------------------------------------------
+# Occluder geometry (mirrors tools/generate_cornell.py r2) + the heightfield
+# shadow march (mirrors sandbox/src/shaders.h shadowVisibility / engine
+# constants in sandbox/src/main.cpp).
+# ---------------------------------------------------------------------------
+TALL_BLOCK = ((-1.55, -0.55), (-2.05, 0.35), 0.0, 3.30)    # (x0,x1), (z0,z1), ymin, ymax
+SHORT_BLOCK = ((0.40, 1.40), (-0.70, 1.70), 0.0, 1.65)
+BAFFLE = ((-1.00, 1.00), (-0.10, 0.10), 3.40, 5.40)        # hanging plate
+SPHERES = (  # (cx, cz, r, floor_y) -- column interval is exact for convex solids
+    (-1.70, 1.55, 0.55, 0.0),   # mirror
+    (0.00, 0.90, 0.55, 0.0),    # gold
+    (1.70, 1.55, 0.55, 0.0),    # dielectric
+)
+MARCH_STEP = 0.16
+MARCH_BIAS = 0.01
+MAXH_BOXES = 3.30
+MAXH_BAFFLE = 5.40
+
+
+def solid_intervals(variant):
+    """Occluder column intervals [(ymin_fn, ymax_fn), ...] per variant."""
+    def box_interval(xr, zr, y0, y1):
+        return ((lambda x, z, a=xr, b=zr, lo=y0: lo if a[0] <= x <= a[1] and b[0] <= z <= b[1] else 1.0),
+                (lambda x, z, a=xr, b=zr, hi=y1: hi if a[0] <= x <= a[1] and b[0] <= z <= b[1] else 0.0))
+    def sphere_interval(cx, cz, r, floor_y):
+        def lo(x, z):
+            d2 = (x - cx) ** 2 + (z - cz) ** 2
+            return (floor_y + r - math.sqrt(r * r - d2)) if d2 < r * r else 1.0
+        def hi(x, z):
+            d2 = (x - cx) ** 2 + (z - cz) ** 2
+            return (floor_y + r + math.sqrt(r * r - d2)) if d2 < r * r else 0.0
+        return (lo, hi)
+    solids = [box_interval(*TALL_BLOCK), box_interval(*SHORT_BLOCK)]
+    if variant == "cornell02":
+        solids += [sphere_interval(*s) for s in SPHERES]
+    if variant == "cornell03":
+        solids += [box_interval(*BAFFLE)]
+    return solids
+
+
+def march_visibility(px, py, pz, lx, ly, lz, solids, max_h,
+                     step=MARCH_STEP, bias=MARCH_BIAS):
+    """float64 port of the shader's shadowVisibility (same sample schedule)."""
+    dx, dz = lx - px, lz - pz
+    horiz = math.sqrt(dx * dx + dz * dz)
+    if horiz < 1e-4:
+        return 1.0
+    steps = int(horiz / step) + 1
+    for s in range(1, steps + 1):
+        t = s / steps
+        ray_y = py + (ly - py) * t
+        if ray_y > max_h:
+            break
+        x, z = px + dx * t, pz + dz * t
+        for lo_fn, hi_fn in solids:
+            h_max, h_min = hi_fn(x, z), lo_fn(x, z)
+            if ray_y < h_max - bias and ray_y > h_min + bias:
+                return 0.0
+    return 1.0
 
 BLACK_LUM = 8          # <= this (0..255) counts as "essentially black"
 DITHER_LSB = 2.0       # triangular dither tails reach +-1.5 LSB
@@ -118,7 +187,7 @@ def project_all(points, w, h):
 # Specular is intentionally omitted: walls are roughness 0.90 dielectrics,
 # the add is small, and the acceptance band absorbs it (documented above).
 # ---------------------------------------------------------------------------
-def expected_byte(p, n, albedo):
+def expected_byte(p, n, albedo, solids=(), max_h=MAXH_BOXES):
     er, eg, eb = 0.0, 0.0, 0.0
     for gx in GRID_XS:
         for gz in GRID_ZS:
@@ -126,6 +195,10 @@ def expected_byte(p, n, albedo):
             dist = math.sqrt(lx * lx + ly * ly + lz * lz)
             ndotl = (n[0] * lx + n[1] * ly + n[2] * lz) / dist
             if ndotl <= 0.0:
+                continue
+            vis = march_visibility(p[0], p[1], p[2], gx, GRID_Y, gz,
+                                   solids, max_h)
+            if vis <= 0.0:
                 continue
             e = GRID_I * ndotl / (dist * dist)
             er += e * albedo[0]
@@ -247,42 +320,66 @@ class Report:
         fails = sum(1 for s, _, _ in self.rows if s == "FAIL")
         gaps = sum(1 for s, _, _ in self.rows if s == "GAP")
         print("---")
-        print("%d checks: %d passed, %d failed, %d documented gaps (M5/M6/M8)"
+        print("%d checks: %d passed, %d failed, %d documented gaps (M5/M8)"
               % (len(self.rows), len(self.rows) - fails - gaps, fails, gaps))
         return fails
 
 
-def check_probes(rep, img, w, h):
-    """World-space probes: expected value from the frozen lighting model."""
+def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES):
+    """World-space probes: expected value from the frozen lighting model
+    (direct grid + heightfield shadow march)."""
+    # Physical albedo per shadow probe, used ONLY by the failure diagnosis
+    # (the unshadowed comparison). The umbra row's expectation is ~0, so its
+    # table albedo (white) is verdict-neutral; but the wall itself is RED and
+    # an inert-march classification must compare against the red-wall model.
+    diagnosis_albedo = {
+        "tall block umbra (left wall)": ALBEDO_RED,
+        "tall block penumbra (floor)": ALBEDO_WHITE,
+    }
     probes = [
-        # label, point, normal, albedo, half_frac, lo_scale, hi_scale, floor
+        # label, point, normal, albedo, half_frac, lo_scale, hi_scale, floor, abs_hi
         ("emitter (unlit L_e=12)", (0.0, EMITTER_MIN[1], 0.0), (0.0, -1.0, 0.0),
-         (1.0, 1.0, 1.0), 0.010, 0.90, 1.10, 225),
+         (1.0, 1.0, 1.0), 0.010, 0.90, 1.10, 225, None),
         ("back wall white", (0.0, 2.75, BOX[2] * -1 + 0.01), (0.0, 0.0, 1.0),
-         ALBEDO_WHITE, 0.012, 0.55, 1.90, 40),
+         ALBEDO_WHITE, 0.012, 0.55, 1.90, 40, None),
         ("left wall red", (BOX[0] * -1 + 0.01, 2.75, -0.6), (1.0, 0.0, 0.0),
-         ALBEDO_RED, 0.012, 0.50, 2.00, 35),
+         ALBEDO_RED, 0.012, 0.50, 2.00, 35, None),
         ("right wall green", (BOX[0] - 0.01, 2.75, -0.6), (-1.0, 0.0, 0.0),
-         ALBEDO_GREEN, 0.012, 0.50, 2.00, 30),
+         ALBEDO_GREEN, 0.012, 0.50, 2.00, 30, None),
         ("floor (gap between blocks)", (0.0, 0.001, -1.6), (0.0, 1.0, 0.0),
-         ALBEDO_WHITE, 0.010, 0.50, 2.00, 30),
+         ALBEDO_WHITE, 0.010, 0.50, 2.00, 30, None),
         ("short block top", (0.9, 1.651, 0.5), (0.0, 1.0, 0.0),
-         ALBEDO_WHITE, 0.008, 0.50, 2.00, 25),
+         ALBEDO_WHITE, 0.008, 0.50, 2.00, 25, None),
         # NOTE: the tall block's TOP (y=3.3) is above the frozen camera
         # (y=2.75) and is therefore NEVER visible -- its lit signature in a
         # correct render is the thin right face (normal +x) sliver.
         ("tall block right face", (-0.549, 2.2, -0.5), (1.0, 0.0, 0.0),
-         ALBEDO_WHITE, 0.004, 0.40, 2.20, 20),
+         ALBEDO_WHITE, 0.004, 0.40, 2.20, 20, None),
+        # --- M4 positive shadow checks -------------------------------------
+        # Full umbra: low on the left wall directly beside/behind the tall
+        # block's slab -- every grid light's ray enters the block's column
+        # interval before reaching this point (verified per light by the
+        # march below); camera line of sight passes left of the block.
+        ("tall block umbra (left wall)", (BOX[0] * -1 + 0.01, 0.2, -0.85), (1.0, 0.0, 0.0),
+         ALBEDO_WHITE, 0.008, 0.0, 0.0, 0, 14),
+        # Penumbra: floor point left-front of the tall block -- the front
+        # grid row reaches it, the other three rows are blocked by the block.
+        # The expected value is the exact 16-light marched result. (The point
+        # must stay z <= ~0.45: the frozen camera's frame bottom cuts the
+        # floor at z ~ 0.65.)
+        ("tall block penumbra (floor)", (-1.7, 0.001, 0.45), (0.0, 1.0, 0.0),
+         ALBEDO_WHITE, 0.008, 0.50, 2.00, 15, None),
     ]
-    for label, p, n, alb, half_frac, lo_s, hi_s, floor in probes:
+    for label, p, n, alb, half_frac, lo_s, hi_s, floor, abs_hi in probes:
         q = project(p, w, h)
         if q is None or not (0.0 <= q[0] < 1.0 and 0.0 <= q[1] < 1.0):
             rep.add("FAIL", label, "probe projects outside the frame -- camera pin broken")
             continue
-        exp = expected_byte(p, n, alb)
+        exp = expected_byte(p, n, alb, solids, max_h)
         act = patch_median(img, w, h, q[0], q[1], half_frac)
         ok = True
         detail = []
+        act_all = []
         for ch, name in enumerate("RGB"):
             # R keeps the probe's visibility floor; G/B use a quarter of it:
             # dark albedo channels (red wall B=0.05) are PHYSICALLY near-black
@@ -290,9 +387,38 @@ def check_probes(rep, img, w, h):
             ch_floor = floor if ch == 0 else floor * 0.25
             lo = max(ch_floor, lo_s * exp[ch] - DITHER_LSB)
             hi = min(255.0, hi_s * exp[ch] + DITHER_LSB)
+            if abs_hi is not None and exp[ch] <= 2.0:
+                # Expected-dark probe (umbra): judge against an absolute
+                # ceiling instead of a band around zero.
+                hi = float(abs_hi)
             if not (lo <= act[ch] <= hi):
                 ok = False
             detail.append("%s %3d (expect %.0f..%.0f)" % (name, act[ch], lo, hi))
+            act_all.append(act[ch])
+        if not ok and label in diagnosis_albedo:
+            # M4.0.2 failure diagnosis: the two shadow probes are the only
+            # checks that can fail because the march never blocked anything
+            # (empty field / shadows-off driver behavior looks identical to
+            # --no-shadows in the image). Compare against the UNSHADOWED
+            # model with the probe's PHYSICAL albedo to classify the failure
+            # instead of leaving it unexplained.
+            unsh = expected_byte(p, n, diagnosis_albedo[label], (), max_h)
+            tol = 3.0
+            if all(abs(act_all[c] - unsh[c]) <= tol for c in range(3)):
+                kind = ("DIAGNOSIS: matches the UNSHADOWED model (~%d/%d/%d) "
+                        "-- march inert: field empty, shadows off, or "
+                        "--no-shadows; see telemetry 'shadows:' line and the "
+                        "[ShadowHeightfield] field verify console line"
+                        % (unsh[0], unsh[1], unsh[2]))
+            elif all(act_all[c] <= unsh[c] + tol for c in range(3)):
+                kind = ("DIAGNOSIS: partial leak (between shadowed and "
+                        "unshadowed models ~%d/%d/%d) -- march active but "
+                        "grazing rays leak (field erosion / probe inside the "
+                        "silhouette band)"
+                        % (unsh[0], unsh[1], unsh[2]))
+            else:
+                kind = "DIAGNOSIS: darker than the shadowed model -- over-blocking"
+            detail.append(kind)
         rep.add("PASS" if ok else "FAIL", label, "  ".join(detail))
 
 
@@ -365,7 +491,9 @@ def main():
             "direct illumination working", "interior mean luminance %.1f (expected 25..235)" % mean_in)
 
     # -- probes ---------------------------------------------------------------
-    check_probes(rep, img, w, h)
+    solids = solid_intervals(args.variant)
+    max_h = MAXH_BAFFLE if args.variant == "cornell03" else MAXH_BOXES
+    check_probes(rep, img, w, h, solids, max_h)
     # -- color dominance (redundant with probes, but stated as the criterion) --
     q_l = project((BOX[0] * -1 + 0.01, 2.75, -0.6), w, h)
     q_r = project((BOX[0] - 0.01, 2.75, -0.6), w, h)
@@ -386,12 +514,13 @@ def main():
     rep.add("PASS" if max(pc) <= 55 else "FAIL",
             "ceiling direct-dark (GI gap pin)", "ceiling median R=%d G=%d B=%d must stay <=55 until M8 "
             "indirect lands (only bounce light reaches it; a fake ambient would show here first)" % pc)
-    rep.add("GAP", "shadows (criterion)", "no shadow mapping until M6; CBox-03 baffle leak is the measured gap")
     rep.add("GAP", "indirect color bounce (criterion)", "no GI until M8; similarity axis quantifies it vs the reference")
+    rep.add("GAP", "area-light penumbra quality (criterion)", "16 superposed hard shadows approximate the penumbra; "
+            "per-pixel emitter integration is the M5 slot -- similarity axis measures the residue")
     rep.add("INFO", "cornell02/03 extras", "spheres/baffle probes intentionally via the SSIM similarity axis, not this harness")
 
     fails = rep.print()
-    print("verdict: %s" % ("ACCEPTED -- save this shot as the M3.3.1 baseline" if fails == 0 else "REJECTED"))
+    print("verdict: %s" % ("ACCEPTED -- record this shot (md5 + similarity vs the clean reference) as the M4 ledger row" if fails == 0 else "REJECTED"))
     return 0 if fails == 0 else 1
 
 

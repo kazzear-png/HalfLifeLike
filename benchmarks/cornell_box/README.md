@@ -33,6 +33,28 @@ write geometry that fails orientation validation, and `bench_tests` pins
 normals/winding on every build. No ledger rows existed for r1, so no
 re-baselining is required; the first row is measured against r2.
 
+## Reference revision r3 (M4): clean 320-spp measurement target
+
+The M3.3 reference renders (64/80 spp) carried visible Monte-Carlo noise,
+which measurably depressed SSIM: comparing the raw render against its own
+320-spp convergent answer scores similarity 54.32 — noise alone, no
+algorithmic disagreement. Since M4 the **measurement target is the clean
+set** `reference/cbox0*_clean.ppm` (320 spp, per-spp sample streams,
+byte-exact resumable generation — provenance and md5s in BASELINE.md). The
+raw renders stay archived, never regenerated. This is a formal
+re-baselining event per the ledger rules — clean, because no ledger rows
+existed yet.
+
+## M4: heightfield shadows for the rig
+
+The rasterizer now shadows the point-light rig against a captured
+**occluder interval field** (max surface from above + min surface from
+below, two one-time ortho R16F captures; the PBR shader marches each
+light's receiver→light segment in XZ). Exact for convex occluders — the
+entire frozen scene. Penumbra quality is the 16-superposition approximation
+(per-pixel emitter integration is the M5 slot). `--no-shadows` restores the
+M3.3 direct-only renderer for A/B ledger rows.
+
 ## Why the Cornell Box
 
 The box is a closed light-transport system with a tiny number of surfaces:
@@ -64,9 +86,9 @@ standard physically-based-rendering test scene since the 1980s.
 
 | Scene      | Geometry                                | What it measures |
 |------------|------------------------------------------|------------------|
-| `cornell01`| classic box + two blocks                 | direct lighting, diffuse response, color balance, falloff, tonemap. (Shadowing appears in the reference; the gap quantifies the future shadows milestone.) |
-| `cornell02`| cornell01 + mirror / rough-gold / glossy-dielectric spheres | GGX, Fresnel, roughness, specular environment. The mirror shows the lights and almost nothing else — the reference shows the room. That gap is the IBL milestone. |
-| `cornell03`| cornell01 + white baffle under the emitter | indirect illumination. The baffle blocks the direct view of the light; the reference is bounce-only. The current rasterizer leaks direct light (no shadows/GI): the largest gap in the ledger, and the target for the GI research track. |
+| `cornell01`| classic box + two blocks                 | direct lighting, diffuse response, color balance, falloff, tonemap. (Shadowing appears in the reference; the residual gap after M4 quantifies penumbra quality.) |
+| `cornell02`| cornell01 + mirror / rough-gold / glossy-dielectric spheres | GGX, Fresnel, roughness, specular environment. The mirror shows the lights and almost nothing else — the reference shows the room. That gap is the probes/IBL milestone. Sphere shadows are cast via their exact column intervals since M4. |
+| `cornell03`| cornell01 + white baffle under the emitter | indirect illumination. The baffle blocks the direct view of the light and (since M4) casts a real shadow — rays through its [3.4, 5.4] interval block, rays beneath pass. The reference is bounce-only: the largest remaining gap, target of the GI track. |
 
 ## Two-axis protocol
 

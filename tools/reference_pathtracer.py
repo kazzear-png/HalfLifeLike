@@ -520,8 +520,29 @@ def main():
     ap.add_argument("--spp", type=int, default=96)
     ap.add_argument("--bounces", type=int, default=8)
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", default=None,
+                    help="output PPM path (required unless --acc-out is used)")
     ap.add_argument("--check-obj", action="store_true")
+    # -- Resumable high-spp accumulation (M4 clean references) --
+    # Sample streams are seeded PER SPP (seed * 1000003 + spp_index), so any
+    # spp range is reproducible independently of how the run was chunked.
+    # Chunked workflow under tight time limits:
+    #   1) --spp-start A --spp-end B --acc-in prev.npy --acc-out acc.npy
+    #   2) --spp-start 0 --spp-end 0 --acc-in acc.npy --finish TOTAL --out f.ppm
+    # NOTE: the CLEAN reference set therefore uses per-spp streams, NOT the
+    # single sequential stream of the archived raw *_reference.ppm renders --
+    # a different, independently frozen sampling schedule (documented in
+    # benchmarks/cornell_box/BASELINE.md).
+    ap.add_argument("--spp-start", type=int, default=0,
+                    help="first spp index (default 0)")
+    ap.add_argument("--spp-end", type=int, default=None,
+                    help="one past the last spp index (default: --spp)")
+    ap.add_argument("--acc-in", default=None,
+                    help="float64 .npy accumulator to add into")
+    ap.add_argument("--acc-out", default=None,
+                    help="write the raw accumulator here (.npy) and skip tonemap")
+    ap.add_argument("--finish", type=int, default=None, metavar="TOTAL_SPP",
+                    help="normalize acc by TOTAL_SPP, tonemap, write --out")
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -535,25 +556,39 @@ def main():
     emitter_idx = next(i for i, p in enumerate(prims) if p.is_emitter)
     emitter = prims[emitter_idx]
 
-    rng = np.random.RandomState(args.seed)
     w, h = args.res, args.res * 9 // 16
     n = w * h
-    print("path tracing %s: %dx%d, %d spp, %d bounces, seed %d" %
-          (args.variant, w, h, args.spp, args.bounces, args.seed), flush=True)
-    acc = np.zeros((n, 3))
-    for s in range(args.spp):
+    spp_start = args.spp_start
+    spp_end = args.spp if args.spp_end is None else args.spp_end
+    acc = np.load(args.acc_in) if args.acc_in else np.zeros((n, 3))
+    assert acc.shape == (n, 3), "accumulator shape mismatch: %s vs (%d, 3)" % (acc.shape, n)
+
+    total = spp_end - spp_start
+    print("path tracing %s: %dx%d, spp [%d..%d), %d bounces, seed %d" %
+          (args.variant, w, h, spp_start, spp_end, args.bounces, args.seed), flush=True)
+    for s in range(spp_start, spp_end):
+        # Per-spp stream: deterministic per index, independent of chunking.
+        rng = np.random.RandomState(args.seed * 1000003 + s)
         jit = rng.random((n, 2)) - 0.5
         ro, rd = camera_rays(w, h, gc.CAMERA, jit)
         acc += trace(prims, emitter, ro, rd, rng, args.bounces)
-        if (s + 1) % max(1, args.spp // 8) == 0:
-            print("  spp %d/%d" % (s + 1, args.spp), flush=True)
+        if (s + 1) % 16 == 0:
+            print("  spp %d/%d" % (s + 1, spp_end), flush=True)
 
-    img = acc / args.spp
+    if args.acc_out:
+        np.save(args.acc_out, acc)
+        print("accumulator written: %s (spp %d..%d)" % (args.acc_out, spp_start, spp_end))
+        return
+
+    if args.out is None:
+        ap.error("--out is required when not writing an accumulator (--acc-out)")
+    divisor = args.finish if args.finish is not None else max(1, total)
+    img = acc / divisor
     img = linear_to_srgb(aces_film(img * gc.EXPOSURE))
     img_u8 = (np.clip(img, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 3)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     write_ppm(args.out, img_u8)
-    print("wrote %s (%dx%d PPM)" % (args.out, w, h))
+    print("wrote %s (%dx%d PPM, normalized by %d spp)" % (args.out, w, h, divisor))
 
 
 if __name__ == "__main__":

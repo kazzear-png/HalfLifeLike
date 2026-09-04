@@ -6,7 +6,7 @@ Renders a physically based, HDR-lit scene through a real 3D pipeline
 Wavefront OBJ models at runtime, and ships with an event-driven input system
 and an FPS-style fly camera.
 
-**Current milestone:** M3.3.1 — *Cornell Box benchmark hotfix: the box renders black no more (geometry r2 + acceptance harness)*.
+**Current milestone:** M4 — *heightfield shadows for the Cornell rig + clean-reference methodology (320-spp measurement target, full metric suite)*.
 
 **Research direction:** *"How far can a small renderer push perceptual realism
 through intelligent approximation rather than brute-force computation?"*
@@ -54,8 +54,10 @@ innovation slot sits above it — in how the renderer chooses to solve lighting
 - **Benchmark mode + Cornell Box laboratory** — a frozen `cornell-box/1.0`
   standard in three variants, a deterministic `--benchmark` mode (VSync off,
   fixed camera/lights/exposure, GPU timer queries, full telemetry), a
-  reference path tracer, and an SSIM-based similarity metric. Every renderer
-  change gets measured against the same room. See
+  reference path tracer, **heightfield shadows for the rig (M4,
+  `--no-shadows` for A/B)**, and a full metric suite (RMSE, MAE, SSIM,
+  ΔE2000, edge/shadow error) against a clean 320-spp reference. Every
+  renderer change gets measured against the same room. See
   `benchmarks/cornell_box/README.md`.
 - Test harnesses (`engine_math_tests`, `engine_obj_tests`,
   `engine_brdf_tests`, `engine_bench_tests`) wired into CTest.
@@ -82,8 +84,8 @@ innovation slot sits above it — in how the renderer chooses to solve lighting
 │   ├── generate_models.py  # regenerates the bundled OBJ assets (deterministic)
 │   ├── generate_cornell.py # emits the frozen cornell geometry + scene + C++ header
 │   ├── reference_pathtracer.py # ground-truth reference renders (same BRDF)
-│   ├── benchmark_compare.py    # RMSE + SSIM -> Cornell similarity
-│   ├── verify_cornell_shot.py  # M3.3 acceptance checklist as code (M3.3.1)
+│   ├── benchmark_compare.py    # metric suite (RMSE/MAE/SSIM/dE2000/edge) -> similarity
+│   ├── verify_cornell_shot.py  # acceptance checklist as code, incl. M4 shadow probes
 │   └── brdf_reference.py   # re-derives the float64 BRDF anchors for brdf_tests
 ├── engine/                 # the engine core (static lib)
 │   ├── CMakeLists.txt
@@ -162,14 +164,15 @@ ctest --test-dir build --output-on-failure
 ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 \
     --out /tmp/cbox01.ppm --report /tmp/cbox01_report.txt
 python3 tools/benchmark_compare.py /tmp/cbox01.ppm \
-    benchmarks/cornell_box/reference/cbox01_reference.ppm
+    benchmarks/cornell_box/reference/cbox01_clean.ppm
+# A/B: --no-shadows reproduces the M3.3 direct-only renderer
 ```
 
 Prints FPS / frame time / CPU time / GPU time / draw calls / triangles /
-lights, and a "Cornell similarity" score (0–100, SSIM against the reference
-path trace). Record both axes per milestone in
-`benchmarks/cornell_box/BASELINE.md`. Full protocol:
-`benchmarks/cornell_box/README.md`.
+lights / shadows, and the metric suite against the clean 320-spp reference
+path trace (SSIM stays the "Cornell similarity" headline, 0–100). Record
+both axes per milestone in `benchmarks/cornell_box/BASELINE.md`. Full
+protocol: `benchmarks/cornell_box/README.md`.
 
 **Before recording a row, the frame must pass acceptance** — the first
 on-hardware Cornell render was 96.5% black (geometry r1 authored every room
@@ -178,8 +181,13 @@ acceptance checklist is code now:
 
 ```bash
 python3 tools/verify_cornell_shot.py /tmp/cbox01.ppm
-# every criterion PASS + "verdict: ACCEPTED" (exit 0) -> save as baseline
+# every criterion PASS + "verdict: ACCEPTED" (exit 0) -> record the ledger row
 ```
+
+Since M4 the checklist includes positive shadow checks (a full-umbra probe
+and a penumbra probe whose expected values come from the exact float64
+shadow march), so a renderer that stops casting shadows fails acceptance,
+not just a renderer that stops rendering.
 
 ### Headless screenshot (verification)
 
@@ -264,24 +272,30 @@ the BRDF). Nothing shading-related ships before its reference exists.
   (96.5%-black first render); r2 corrects orientation, generator validates,
   bench_tests pins it, acceptance checklist is code
   (`tools/verify_cornell_shot.py`).~~ ✅
-- **M4** — Scene/material abstraction: `MeshInstance` / `Material` / `Light` /
-  `Camera` as renderer-known objects (today the sandbox knows them; the
-  renderer only knows "draw this mesh"). Replaces the generated Cornell header
-  with a real `scene.json` loader; adds area lights (retiring the point-grid
-  emitter approximation). Texture loading + OBJ mtl support.
-- **M5** — Image-based lighting: environment map, irradiance, prefiltered
-  specular, BRDF LUT — replaces the ambient-gradient placeholder wholesale.
-- **M6** — Shadows (directional sun depth pre-pass).
-- **M7** — Light culling / clustered lighting (8 lights × every pixel → N
-  relevant lights per pixel).
-- **M8** — Indirect lighting experiments (probes / screen-space / voxel /
-  hybrid).
+- ~~M4 — Heightfield shadows: interval capture (max surface from above + min
+  from below, exact for the frozen scene's convex solids), per-point-light
+  march in the PBR shader, 16-superposition penumbra; `--no-shadows` A/B;
+  clean 320-spp reference set + MAE/ΔE2000/edge-error metric suite;
+  positive umbra/penumbra acceptance probes.~~ ✅
+- **M5** — Area-light approximation: per-pixel emitter visibility
+  integration over the rig (retiring the 16-superposition penumbra
+  residue), plus the scene/material abstraction it requires (`Light` /
+  `AreaLight` / `MeshInstance` objects, a real `scene.json` loader retiring
+  the generated Cornell header). General omnidirectional shadowing
+  (cube/point maps) lands here too, for non-heightfield scenes.
+- **M6** — Light probes / irradiance: environment map, irradiance,
+  prefiltered specular, BRDF LUT — retires the ambient-gradient placeholder
+  wholesale (the old M5 IBL slot folds in here).
+- **M7** — Indirect lighting: screen-space / voxel / probe GI (first
+  bounce light; CBox-03's reference is bounce-only and will drive it).
+- **M8** — Hybrid renderer (raster + targeted ray-traced features where the
+  Cornell ledger says the error budget is).
 - **M9+** — Research: the renderer chooses the cheapest acceptable solution,
-  benchmarked against the M3.2 reference values and the M3.3 Cornell ledger.
-  Multi-scattering energy compensation, temporal reuse, auto-exposure.
-  Larger standard scenes (Sponza / San Miguel / Bistro class) enter the
-  rotation only after the Cornell protocol has been exercised for several
-  milestones.
+  benchmarked against the M3.2 reference values and the M4 Cornell ledger
+  (clean references). Multi-scattering energy compensation, temporal reuse,
+  auto-exposure. Larger standard scenes (Sponza / San Miguel / Bistro class)
+  enter the rotation only after the Cornell protocol has been exercised for
+  several milestones.
 
 Ground rule (learned the hard way in M3.2): fix known errors FIRST. When
 something later "looks better", you need to know whether you invented an

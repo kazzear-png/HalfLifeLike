@@ -4,7 +4,7 @@ Checklist for verifying that a given build behaves correctly. Run through it
 after every milestone that touches build / window / input / rendering / assets
 / math.
 
-**Current milestone:** M3.3.1 — *Cornell Box benchmark hotfix (geometry r2 + acceptance harness)*.
+**Current milestone:** M4 — *heightfield shadows for the Cornell rig + clean-reference methodology*.
 
 ---
 
@@ -19,7 +19,7 @@ after every milestone that touches build / window / input / rendering / assets
       - `math_tests` — **73 checks, 0 failure(s)**
       - `obj_tests` — **24 checks, 0 failure(s)**
       - `brdf_tests` — **38 checks, 0 failure(s)** (M3.2: reference-value suite)
-      - `bench_tests` — **100 checks, 0 failure(s)** (M3.3 frozen pins + M3.3.1 orientation pins)
+      - `bench_tests` — **173 checks, 0 failure(s)** (M3.3 frozen pins + M3.3.1 orientation pins + M4 shadow-march/capture-matrix/field-verify pins + M4.0.4 world→texel registration pins + M4.0.7 soft-penumbra graded-path pins + M4.0.8 bracket-refinement pins)
 - [ ] (Windows) Double-clicking `engine_math_tests.exe` / `engine_obj_tests.exe`
       in Explorer runs the suite and holds the console open with
       "Press Enter to close..." — results stay readable; `ctest` runs are
@@ -81,27 +81,43 @@ Quick checklist:
       (center), glossy dielectric (right). The mirror reflects the emitter and
       lights but NOT the room (no environment specular yet — that gap is the
       M5 IBL target, visible against the reference).
-- [ ] `--scene cornell03` shows the baffle under the emitter; the floor is
-      lit ONLY by leaked direct light in the rasterizer (no shadows/GI yet),
-      while the reference shows bounce-only light — the largest ledger gap.
+- [ ] `--scene cornell03` shows the baffle under the emitter; with M4 shadows
+      the baffle CASTS a shadow (its interval [3.4, 5.4] blocks rays through
+      it and passes rays beneath it), while the reference shows bounce-only
+      light — the largest remaining ledger gap.
 - [ ] `--benchmark 300` prints a telemetry report (fps, frame/CPU/GPU ms,
-      draw calls, triangles, lights = 16) and writes the final frame PPM;
-      with `--report file` the same lines land in a file.
-- [ ] **Acceptance harness (M3.3.1)**: `python3 tools/verify_cornell_shot.py
-      <shot.ppm>` judges the M3.3 acceptance checklist from the deterministic
-      screenshot — camera framing, box-silhouette black ratio, interior mean
-      luminance, per-probe expected values (emitter/back wall/red wall/green
-      wall/floor/block tops) derived in float64 from the frozen light grid +
-      display transform, red/green dominance, and a ceiling "GI gap" pin that
-      fails if fake ambient ever appears. Prints the shot md5 for the ledger;
-      exit 0 iff `verdict: ACCEPTED`. Expect on hardware at 720p: global black
-      ~30-35% (the open-front void border is correct, not a bug), interior
-      black < 15%, red wall ≈ (130,22,17), green wall ≈ (42,104,28), back
-      wall ≈ 140, short-block top ≈ 160 — bands in the harness absorb MSAA /
+      draw calls, triangles, lights = 16, **shadows: on**) and writes the
+      final frame PPM; with `--report file` the same lines land in a file.
+      `--no-shadows` reports "shadows: off" and reproduces the M3.3
+      direct-only renderer byte-for-byte (A/B for the ledger).
+- [ ] **Acceptance harness (M3.3.1, M4 shadow probes)**:
+      `python3 tools/verify_cornell_shot.py <shot.ppm>` judges the acceptance
+      checklist from the deterministic screenshot — camera framing,
+      box-silhouette black ratio, interior mean luminance, per-probe expected
+      values (emitter/back wall/red wall/green wall/floor/block tops) derived
+      in float64 from the frozen light grid + **exact heightfield shadow
+      march** + display transform, red/green dominance, a ceiling "GI gap"
+      pin that fails if fake ambient ever appears, and since M4 two POSITIVE
+      shadow checks: a full-umbra probe (left wall beside the tall block, all
+      16 grid lights provably blocked, expected 0, ceiling 14) and a
+      penumbra probe (floor point with exactly 4/16 lights lit, expected ≈36
+      ± band). Prints the shot md5 for the ledger; exit 0 iff
+      `verdict: ACCEPTED`. Expect on hardware at 720p: global black ~30-35%
+      (the open-front void border is correct, not a bug), interior black
+      < 15%, red wall ≈ (130,22,17), green wall ≈ (42,104,28), back wall
+      ≈ 140, short-block top ≈ 160 — bands in the harness absorb MSAA /
       specular / dither deltas.
-- [ ] `tools/benchmark_compare.py <frame.ppm> <reference.ppm>` prints RMSE,
-      SSIM and a "Cornell similarity" score; identical images score 100.00.
-      Run AFTER the acceptance harness passes.
+- [ ] `tools/benchmark_compare.py <frame.ppm> <reference.ppm>` prints the
+      metric suite — RMSE, MAE, SSIM, ΔE2000 (mean perceptual color
+      difference), edge/shadow RMSE — and the "Cornell similarity" headline;
+      identical images score 100.00 on every axis. Compare against the CLEAN
+      reference (`cbox0*_clean.ppm`, 320 spp) since M4; the raw 64/80-spp
+      renders are provenance only (their noise alone costs ~45 similarity
+      points: raw-vs-clean self-check = 54.32). Run AFTER the acceptance
+      harness passes.
+- [ ] `tools/benchmark_compare.py --self-test` validates the metric suite
+      against 7 published Sharma-2005 ΔE2000 pairs plus identity/edge
+      invariants — 0 failures expected.
 - [ ] (Headless container/CI, no display) the sandbox still exits gracefully
       with the standard GLFW failure messages — for cornell scenes too.
 
@@ -113,7 +129,7 @@ winding contradicting their own vn). The rasterizer shades one-sided; the
 reference path tracer shades two-sided, so offline reference checks could
 never catch it. Now unshippable by construction:
 
-- `bench_tests` "frozen normal orientation" section (100 checks total):
+- `bench_tests` "frozen normal orientation" section:
   room-quad normals pinned exactly (floor +Y, ceiling −Y, left +X, right
   −X, back +Z, emitter −Y), winding·vn > 0 for every triangle of every
   variant mesh, solids face outward from their own center.
@@ -122,6 +138,89 @@ never catch it. Now unshippable by construction:
 - If a Cornell render is ever again majority-black, FIRST check the
   orientation pins (`ctest --test-dir build -R bench_tests`), THEN suspect
   the renderer — in that order.
+
+### M4 regression classes: shadow correctness
+
+- `bench_tests` "heightfield shadow march" section (132 checks total): the
+  C++ port of the shader's `shadowVisibility` pinned against analytic
+  column-interval fields — tall/short blocks (front lit, behind shadowed,
+  top self-shadow guard, above-top pass, mid-height blocked), the hanging
+  baffle (rays beneath pass, rays through block, same-side light never
+  crosses), the sphere (exact interval, blocked/lit cases cross-checked
+  against 3D segment-sphere intersection), and the 16-light lit/blocked
+  census for the acceptance probes (floor gap 16/16 lit, penumbra probe
+  4/16, umbra probe 0/16).
+- `bench_tests` "shadow capture matrices": corner mappings (x/z → ndc −1/+1
+  at the footprint edges) and depth orderings for BOTH captures (max pass:
+  higher surface wins LESS; min pass: lower surface wins).
+- The march step is pinned below the thinnest occluder (static_assert in
+  the sandbox + runtime check in bench_tests): 0.16 m < baffle 0.20 m — a
+  larger step would let rays skip thin geometry between samples.
+- If shadows look wrong on hardware, the M4.0.2/M4.0.4/M4.0.5
+  instrumentation localizes the failure in five layers:
+  1. Console at startup: `[ShadowHeightfield] field verify OK: coverage ...
+     top ...` — the captured field PROVED ITSELF AGGREGATELY (coverage vs
+     the frozen footprints, e.g. cbox01 expects 15.9% ± 5, top 3.30 m). A
+     `FIELD VERIFY FAILED` line means the capture is broken and shadows are
+     auto-disabled.
+  2. M4.0.4 REGISTRATION PROBES (console, right after layer 1): aggregate
+     statistics cannot see a mirrored/transposed field in a square room
+     (same area, same top), and M4.0.3 hardware evidence proved the image
+     can be byte-identical to --no-shadows while every statistic passes.
+     The probes read the captured interval at frozen world points with the
+     SAME world→texel mapping the march uses: block/sphere/baffle centers
+     must read their frozen tops (baffle also pins the MIN capture at
+     3.40), and mirror-X / mirror-Z / transpose sentinels + two empty
+     corners must read empty — each sentinel is inside the footprint a
+     flipped capture would have, so exactly one sentinel unmasks each
+     failure mode. `[ShadowHeightfield] registration probes: 8/8 PASS` or
+     a per-probe FAIL line; any FAIL disables shadows.
+  3. Benchmark telemetry `shadows:` line — four honest states: `off
+     (--no-shadows: M3.3 direct-only)`, `on (heightfield march, field
+     verified + registered)`, `off (capture failed, verify or registration
+     FAILED)`, demo `n/a`.
+  4. Acceptance harness FAIL details: failing shadow probes carry a
+     DIAGNOSIS (matches UNSHADOWED model = march inert / shadows off /
+     empty field; partial leak = between models; darker = over-blocking).
+  Plus `sandbox --dump-heightfield <prefix>` (M4.0.4, temporary): renders
+  both captured fields through the march's EXACT sampler wiring (same
+  bind + setInt sequence, same uniform names, floor quad + capture ortho,
+  1 px = 1 texel, raw linear gray) into `<prefix>_hmax/_hmin.ppm`.
+  Footprints visible in place → field and sampler path fine, the defect
+  is in the march's uniforms/logic; black or displaced → the field or its
+  sampler path is the defect. This is the A/B/C discriminator for the
+  M4.0.3 hardware world ("march enabled, image byte-identical to
+  --no-shadows").
+  5. M4.0.5 RESOLUTION + the GPU-side instrument that closes the last gap:
+     the M4.0.4 hardware run passed layers 1–4 AND the dump (probes 7/7,
+     footprints in place, telemetry on, GPU time up by real fetch cost)
+     while the image stayed byte-identical to --no-shadows — leaving only
+     how the march INTERPRETS the footprint uniforms. Root cause found by
+     inspection under that lens: the uniforms pack (worldX, worldZ, pad)
+     into a vec3, but `shadowVisibility()` unpacked the footprint with
+     `.xz` = (worldX, pad) instead of `.xy` = (worldX, worldZ). The span
+     became (5.5, 0.0), invSpan.z = +inf, uv.y = worldZ·inf clamped to the
+     field's edge rows (floor, hMax = 0) — every fetch executed, the
+     interval test could never fire, and the image matched --no-shadows
+     byte-for-byte. THE LESSON, now part of the methodology: this is a
+     GLSL-only divergence between the shader and its CPU port — the C++
+     port implements the INTENDED mapping, so it pins the math but not the
+     swizzle; no CPU instrument (verifyField, probes, dump — all correct
+     here) can see it. Standing instrument for that class:
+     `sandbox --shadow-debug vis|field|uv` (M4.0.5, temporary, default
+     OFF) computes blatant debug views INSIDE the PBR shader — `vis`:
+     black where any light is blocked (the march's verdict, BRDF-free);
+     `field`: R = hMax fetched at the fragment's own footprint uv, G =
+     march calls / 16, B = uShadowMaxHeight / 6; `uv`: the march's uv
+     formula shown directly (a hard binary green seam at z = 0 is the
+     ±inf-uv.y signature this build fixes). Debug views replace the shaded
+     image and are never ledger images.
+  M4.0.1 hardware evidence that motivated this: both shadow probes read
+  byte-identical to the UNSHADOWED model (umbra 50/6/5 vs 51/4/2;
+  penumbra 105/103/100 vs 105/103/101) — a march that never blocked
+  anything is indistinguishable from --no-shadows in the image.
+- `bench_tests` also pins that `verifyField` refuses a context-less
+  instance (cannot silently pass on an un-captured field).
 
 ## PBR correctness checks (M3.2)
 
@@ -252,16 +351,17 @@ Verified two ways:
    Anchors are re-derivable with `tools/brdf_reference.py` (float64,
    independent algebra + quadrature). Rule: change a shader equation →
    re-derive anchors → update the test → only then judge the image.
-   - `bench_tests` (100 checks) — pins the FROZEN cornell-box/1.0
+   - `bench_tests` (132 checks) — pins the FROZEN cornell-box/1.0
      standard: standard string, exposure, camera, emitter dimensions/radiance,
      canonical reflectances, variant mesh lists; the point-light grid flux
-     model (I = A·L_e/N, positions inside the emitter footprint); and — since
-     M3.3.1 — the on-disk OBJs (triangle counts + exact bounds vs the
-     generated header, zero degenerate faces — the pole-cap regression from
-     generation is guarded here) plus FROZEN normal orientation: room-quad
-     normals pinned exactly (floor +Y, ceiling −Y, left +X, right −X, back
-     +Z, emitter −Y), winding·vn agreement for every triangle of every
-     variant mesh, and solids facing outward from their own center.
+     model (I = A·L_e/N, positions inside the emitter footprint); the on-disk
+     OBJs (triangle counts + exact bounds vs the generated header, zero
+     degenerate faces) plus FROZEN normal orientation: room-quad normals
+     pinned exactly (floor +Y, ceiling −Y, left +X, right −X, back +Z,
+     emitter −Y), winding·vn agreement for every triangle of every variant
+     mesh, and solids facing outward from their own center; and — since M4 —
+     the heightfield shadow march port + capture-matrix contract (see the M4
+     regression section above).
 
    Rules for the benchmark live in `benchmarks/cornell_box/README.md`; the
    two-axis ledger in `benchmarks/cornell_box/BASELINE.md`.
@@ -299,9 +399,12 @@ Expected output:
 [brdf] M3.1 regression reference (old squared-term form)
   old form deviates 15.0% from exact Smith at NoV=NoL=0.975, alpha=0.7
 [brdf] 38 checks, 0 failure(s)
-=== engine benchmark tests (M3.3, cornell-box/1.0) ===
+=== engine benchmark tests (cornell-box/1.0 + M4 shadow march) ===
 [bench] frozen standard pins (cornell-box/1.0)
 [bench] point-light grid flux model
 [bench] geometry on disk matches the generated pins
-[bench] 100 checks, 0 failure(s)
+[bench] frozen normal orientation (M3.3.1 regression pins)
+[bench] heightfield shadow march (M4 contract pins)
+[bench] shadow capture matrices (M4 contract pins)
+[bench] 156 checks, 0 failure(s)
 ```

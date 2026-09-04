@@ -10,6 +10,7 @@
 #include <limits>
 #include <sstream>
 #include <unordered_map>
+#include <utility>   // std::move (do not rely on <algorithm> leaking it)
 
 namespace engine {
 namespace {

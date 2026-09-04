@@ -1,6 +1,9 @@
+// Milestone 4: M3 demo scene + the frozen cornell-box/1.0 benchmark scenes.
 //
-// Milestone 3.3: M3 demo scene + the frozen cornell-box/1.0 benchmark scenes.
-//
+// M4 change: cornell scenes gain HEIGHTFIELD SHADOWS -- a one-time top-down
+// capture of the occluders' max world Y (engine::ShadowHeightfield), marched
+// per point light in the PBR shader. --no-shadows restores the exact M3.3
+// direct-only behavior for A/B ledger comparisons.
 // Demo scene (M1/M2 objects remain the regression foundation):
 //   - reference floor + spinning quad, shaded with the PBR pipeline
 //   - imported OBJ "hero" model; keys 1-4 swap the bundled assets
@@ -32,6 +35,7 @@
 #include "rendering/Lighting.h"
 #include "rendering/Mesh.h"
 #include "rendering/Shader.h"
+#include "rendering/ShadowHeightfield.h"
 #include "shaders.h"
 #include "cornell_scene_gen.h"
 
@@ -39,6 +43,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <iterator>   // std::begin/std::end (M4.0.4 probe table splice; MSVC does not leak this)
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -271,6 +276,372 @@ const cornell::MaterialDef* findCornellMaterial(const char* name) {
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// M4 heightfield shadows -- frozen-standard constants (scene.json "box")
+// ---------------------------------------------------------------------------
+
+// Room footprint of cornell-box/1.0. Mirrors tools/generate_cornell.py; kept
+// OUT of the generated header so that file stays byte-identical to the pinned
+// r2 revision (bench_tests pins values, docs pin the md5 story).
+constexpr float kRoomHalfX = 2.75f;
+constexpr float kRoomHalfZ = 2.75f;
+// Occluder tops per variant: the shader's march early-outs above this height.
+constexpr float kOccluderTopBoxes  = 3.30f;   // tall block
+constexpr float kOccluderTopBaffle = 5.40f;   // cbox03 baffle (reaches y=5.4)
+// March step in world meters. Safety invariant: the XZ spacing between
+// consecutive march samples is at most kMarchStep (triangle inequality), so
+// any occluder thicker than kMarchStep along a crossing ray is sampled at
+// least once. The thinnest occluder in the frozen scene is the cbox03
+// baffle: 0.2 m thick in z. 0.08 < 0.2 keeps it un-leakable WITH room to
+// spare; bench_tests pins the same invariant at runtime.
+// M4.0.6: 0.16 -> 0.08 (single change; nothing else touched). The first lit
+// march (M4.0.5, ledger ACCEPTED) exposed the march step as the shadow
+// boundary's dominant quantizer: the staircase band pitch tracked the 0.16 m
+// sample cadence = 7.4 field texels per step (the field itself is
+// 5.5 m / 256 = 21.5 mm/texel, and the samplers are already GL_LINEAR, so
+// filtering is NOT the quantizer). Halving the step doubles the march's
+// texture taps; at M4.0.5 the whole frame cost 0.583 ms GPU at 960x540
+// against a 16.7 ms 60 fps budget, so the extra cost is expected to be
+// small -- but it is MEASURED in the ledger row (both axes), not assumed.
+// Floor of useful refinement: ~0.04 m (~1.9 texels) -- steps finer than the
+// field texel pitch buy no information the capture cannot represent.
+constexpr float kMarchStep  = 0.08f;
+static_assert(kMarchStep < 0.19f,
+              "march step must stay below the baffle's 0.2 m thickness or "
+              "thin occluders become leakable");
+constexpr float kShadowBias = 0.01f;          // ~half a texel height quantum
+
+// M4.0.7: soft-penumbra scale (dimensionless). The 16-light rig is a 4x4
+// QUADRATURE of the area emitter: adjacent lights sit kLightPitch = 0.325 m
+// apart (x/z in {+-0.1625, +-0.4875}) at height kLightHeight = 5.44 m
+// (frozen grid, cornell_scene_gen.h). A point-sample quadrature of an area
+// light under-reconstructs the continuum by a blur of about
+// (pitch/2) * t / height at an occluder t meters along the ray -- so
+// instead of adding light samples (M5's job) or march samples (M4.0.6's
+// linear-cost lever), apply that blur where the march already has every
+// input it needs: the per-sample clearance d and the traveled distance t.
+// Horizon-style soft accumulation costs a few ALU per sample and ZERO extra
+// texture taps; it converts the staircase boundary into a graded edge.
+// Derived, not tuned: kShadowPenumbra = 0.5 * 0.325 / 5.44 ~= 0.0299.
+// 0.0 disables the soft path entirely and reproduces the M4.0.6 binary
+// march byte-for-byte (--shadow-penumbra 0 is the A/B + regression pin).
+constexpr float kLightPitch     = 0.325f;  // frozen 4x4 grid spacing
+constexpr float kLightHeight    = 5.44f;   // frozen grid plane y
+constexpr float kShadowPenumbra = 0.5f * kLightPitch / kLightHeight;
+
+// M4.0.8: bracket refinement of the soft minimum (default ON). Research
+// verdict (docs/SHADOW_EDGE_REFERENCES.md): every shipped heightfield-ray
+// solver is two-phase -- a coarse linear search brackets the feature, a
+// refinement phase resolves it (GPU Gems 3 ch.18 names the bare linear
+// search "prone to aliasing", which is the staircase the ledger measured).
+// The refinement engages ONLY where the M4.0.7 window fired (vis < 1), so
+// fully lit and hard-blocked pixels pay nothing and every binary decision
+// (penumbra = 0) is untouched: the --shadow-penumbra 0 md5-replay pins
+// still hold. --shadow-refine 0 reproduces the M4.0.7 soft march exactly.
+constexpr int kShadowRefineDefault = 1;
+
+// --- M4.0.4 field REGISTRATION probes (frozen) -----------------------------
+// verifyField() proves the field's aggregate content (coverage %, top,
+// interval validity) but not WHERE the content sits. A displaced, mirrored,
+// or transposed field passes all of those statistics while every shadow ray
+// misses it (M4.0.3 hardware evidence: verify OK + march enabled + image
+// byte-identical to --no-shadows). These probes read the captured interval
+// at specific frozen world points; the sentinel probes sit OUTSIDE every
+// real occluder footprint but INSIDE the footprint a flipped/swapped
+// capture would have -- any mirroring failure mode flips exactly one
+// sentinel from empty to occluder.
+//
+// Provenance: footprints from tools/generate_cornell.py (frozen r2):
+//   tall  x -1.55..-0.55  z -2.05.. 0.35  y 0..3.30
+//   short x  0.40.. 1.40  z -0.70.. 1.70  y 0..1.65
+//   spheres (cbox02) r 0.55 at (±1.70, 1.55) and (0, 0.90), tops 1.10
+//   baffle (cbox03) x -1.00..1.00 z -0.10..0.10 y 3.40..5.40
+struct FieldProbeSpec {
+    const char* label;
+    float x, z;
+    bool  expectOccluder;  // false: hMax must read empty (<= kEmptyMax)
+    float expMax;          // expected hMax at the probe (occluder probes)
+    float expMin;          // expected hMin (underside; 0 = floor-resting)
+};
+constexpr float kProbeTopTol = 0.15f;  // same band as verifyField's top check
+constexpr float kProbeEmptyMax = 0.25f;  // same occupancy threshold as verifyField
+
+// cbox01 base set (always run; cbox02/03 share these points -- the sentinels
+// and corners are clear of the sphere/baffle footprints too).
+constexpr FieldProbeSpec kFieldProbesBase[] = {
+    // Core registration: the two block centers must read their frozen tops.
+    { "tall block center",  -1.05f, -0.85f, true,  3.30f, 0.00f },
+    { "short block center",  0.90f,  0.50f, true,  1.65f, 0.00f },
+    // Mirror-X sentinel: inside the X-MIRRORED tall footprint, outside
+    // every real one (short block starts at z -0.70 > -0.85).
+    { "mirror-X sentinel",   1.05f, -0.85f, false, 0.0f,  0.00f },
+    // Mirror-Z sentinel: inside the Z-MIRRORED tall footprint (z -0.35..2.05),
+    // outside every real one (nearest sphere center 0.955 m > 0.55).
+    { "mirror-Z sentinel",  -1.05f,  0.85f, false, 0.0f,  0.00f },
+    // Transpose sentinel: a square room makes an X<->Z swap coverage- and
+    // top-invisible. This point is inside the TRANSPOSED tall footprint but
+    // outside the real one -- the probe a transposed capture fails.
+    { "transpose sentinel", -2.00f, -1.05f, false, 0.0f,  0.00f },
+    // Plain empty corners (dodging the cbox02 sphere footprints: nearest
+    // center 0.96 m > 0.55).
+    { "empty corner NE",     2.30f,  2.30f, false, 0.0f,  0.00f },
+    { "empty corner NW",    -2.30f,  2.30f, false, 0.0f,  0.00f },
+};
+// cbox02 extra: gold sphere center column must read the sphere's top.
+constexpr FieldProbeSpec kFieldProbeSphere =
+    { "gold sphere center",  0.00f,  0.90f, true,  1.10f, 0.00f };
+// cbox03 extra: the hanging baffle is the ONE probe whose underside is not
+// the floor -- it validates the MIN capture (hMin ~3.40, not ~0).
+constexpr FieldProbeSpec kFieldProbeBaffle =
+    { "baffle center",       0.00f,  0.00f, true,  5.40f, 3.40f };
+
+// Room shell never occludes the ceiling rig; everything else does.
+bool isOccluderMaterial(const char* mat) {
+    return std::strncmp(mat, "wall", 4) != 0
+        && std::strcmp(mat, "floor") != 0
+        && std::strncmp(mat, "ceiling", 7) != 0;
+}
+
+bool variantHasBaffle(const cornell::VariantDef* def) {
+    for (std::uint32_t i = 0; i < def->meshCount; ++i) {
+        if (std::strcmp(def->meshes[i].material, "baffle") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// One-time capture pair of every occluder's vertical interval [minY, maxY]
+// per footprint texel (max surface from above, min surface from below).
+// Contract (3-state):
+//   return false                     -> capture unavailable, shadows off
+//   return true  + *verifiedOut==false -> captured field FAILED acceptance
+//   return true  + *verifiedOut==true  -> valid, verified shadow field
+// M4.0.2: on success the captured field is also READ BACK AND VERIFIED
+// against the frozen footprints; *verifiedOut carries the verdict. The
+// capture path is hardware GL -- M4.0.1 showed an inert field is
+// indistinguishable from --no-shadows in the image, so the field must
+// prove itself before the telemetry is allowed to say "shadows: on".
+// M4.0.3: BUGFIX -- the verifyField() verdict never reached *verifiedOut
+// (it was only returned), so hardware captures that verified OK were
+// reported as FAILED by the caller and shadows were silently disabled.
+bool captureCornellHeightfield(engine::ShadowHeightfield& hf,
+                               const CornellScene& scene,
+                               engine::Renderer& renderer,
+                               bool* verifiedOut) {
+    *verifiedOut = false;
+    if (!hf.create(/*resolution=*/256, /*minY=*/-0.5f, /*maxY=*/6.0f)) {
+        return false;
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        hf.beginCapture(/*maxPass=*/pass == 0,
+                        -kRoomHalfX, kRoomHalfX, -kRoomHalfZ, kRoomHalfZ);
+        for (std::uint32_t i = 0; i < scene.def->meshCount; ++i) {
+            if (!scene.meshLoaded[i]) {
+                continue;
+            }
+            if (!isOccluderMaterial(scene.def->meshes[i].material)) {
+                continue;
+            }
+            hf.setModel(engine::Mat4::identity());
+            renderer.drawIndexed(scene.meshes[i]);
+        }
+        hf.endCapture();
+    }
+
+    // Expected coverage from the FROZEN footprints (pinned by bench_tests):
+    //   tall 1.0x2.4 + short 1.0x2.4 = 4.8 m2; spheres 3*pi*0.55^2 = 2.85 m2;
+    //   baffle 2.0x0.2 = 0.4 m2; room 5.5x5.5 = 30.25 m2.
+    const bool hasBaffle = variantHasBaffle(scene.def);
+    bool hasSpheres = false;
+    for (std::uint32_t i = 0; i < scene.def->meshCount; ++i) {
+        if (std::strncmp(scene.def->meshes[i].material, "sphere_", 7) == 0) {
+            hasSpheres = true;
+        }
+    }
+    const float occM2 = 4.8f + (hasSpheres ? 2.85f : 0.0f) + (hasBaffle ? 0.4f : 0.0f);
+    const float expectedCoveragePct = 100.0f * occM2 / (5.5f * 5.5f);
+    const bool verified = hf.verifyField(
+        hasBaffle ? kOccluderTopBaffle : kOccluderTopBoxes,
+        expectedCoveragePct - 5.0f, expectedCoveragePct + 5.0f);
+
+    // M4.0.3: propagate the verdict through verifiedOut as the caller-side
+    // contract documents. The return value only answers "was a capture made
+    // at all?" -- conflating the two here meant a PASSING hardware field
+    // still left shadowsActive==false and the march was never enabled.
+    *verifiedOut = verified;
+    return true;
+}
+
+// M4.0.4: read the captured fields back and check WHERE the content sits,
+// at the frozen probe points (kFieldProbes* above). Returns true iff every
+// probe passed. Each probe uses ShadowHeightfield::worldToTexel -- the same
+// mapping the GLSL march uses -- so a PASS means "the texel the march reads
+// at this world point really contains the frozen interval". Aggregate
+// statistics (verifyField) cannot catch a mirrored/transposed field in a
+// square room; these sentinels can.
+bool runFieldRegistrationProbes(const cornell::VariantDef* def,
+                                const engine::ShadowHeightfield& hf) {
+    std::vector<float> fmax, fmin;
+    const unsigned res = hf.resolution();
+    if (!hf.readbackHeights(fmax, fmin) || res == 0) {
+        std::fprintf(stderr,
+            "[ShadowHeightfield] registration probes SKIPPED (readback failed) "
+            "-- shadows disabled\n");
+        return false;
+    }
+
+    bool hasSpheres = false;
+    for (std::uint32_t i = 0; i < def->meshCount; ++i) {
+        if (std::strncmp(def->meshes[i].material, "sphere_", 7) == 0) {
+            hasSpheres = true;
+        }
+    }
+    std::vector<FieldProbeSpec> probes;
+    probes.insert(probes.end(), std::begin(kFieldProbesBase),
+                                std::end(kFieldProbesBase));
+    if (hasSpheres)          probes.push_back(kFieldProbeSphere);
+    if (variantHasBaffle(def)) probes.push_back(kFieldProbeBaffle);
+
+    int passed = 0;
+    for (const FieldProbeSpec& p : probes) {
+        float colF = 0.0f, rowF = 0.0f;
+        if (!engine::ShadowHeightfield::worldToTexel(
+                p.x, p.z, -kRoomHalfX, kRoomHalfX, -kRoomHalfZ, kRoomHalfZ,
+                res, &colF, &rowF)) {
+            std::fprintf(stderr,
+                "[ShadowHeightfield] probe '%s': point outside footprint "
+                "(probe-table bug)\n", p.label);
+            continue;
+        }
+        const int col = std::min<int>(int(res) - 1, std::max(0, int(colF)));
+        const int row = std::min<int>(int(res) - 1, std::max(0, int(rowF)));
+        const float hMax = fmax[std::size_t(row) * res + std::size_t(col)];
+        const float hMin = fmin[std::size_t(row) * res + std::size_t(col)];
+
+        char expect[80];
+        bool ok;
+        if (p.expectOccluder) {
+            ok = std::fabs(hMax - p.expMax) <= kProbeTopTol
+              && std::fabs(hMin - p.expMin) <= kProbeTopTol;
+            std::snprintf(expect, sizeof(expect),
+                          "expect hMax %.2f hMin %.2f", double(p.expMax), double(p.expMin));
+        } else {
+            ok = hMax <= kProbeEmptyMax;
+            std::snprintf(expect, sizeof(expect),
+                          "expect empty (hMax <= %.2f)", double(kProbeEmptyMax));
+        }
+        passed += ok ? 1 : 0;
+        if (ok) {
+            std::printf("[ShadowHeightfield] probe '%s' @ (%.2f, %.2f) texel (%d, %d): "
+                        "hMax %.3f hMin %.3f (%s) PASS\n",
+                        p.label, double(p.x), double(p.z), col, row,
+                        double(hMax), double(hMin), expect);
+        } else {
+            std::fprintf(stderr,
+                "[ShadowHeightfield] probe '%s' @ (%.2f, %.2f) texel (%d, %d): "
+                "hMax %.3f hMin %.3f (%s) FAIL -- CAPTURE IS MISREGISTERED\n",
+                p.label, double(p.x), double(p.z), col, row,
+                double(hMax), double(hMin), expect);
+        }
+    }
+    const int expected = static_cast<int>(probes.size());
+    if (passed == expected) {
+        std::printf("[ShadowHeightfield] registration probes: %d/%d PASS\n",
+                    passed, expected);
+    } else {
+        std::fprintf(stderr,
+            "[ShadowHeightfield] REGISTRATION FAILED: %d/%d probes PASS "
+            "-- shadows disabled, telemetry will say so\n", passed, expected);
+    }
+    return passed == expected;
+}
+
+// M4.0.4: render the captured fields DIRECTLY through the march's sampler
+// wiring -- bindTextures(maxUnit, minUnit) + setInt("uShadowHeightsMax"/"Min")
+// + the same footprint uniforms -- one texel per pixel, raw linear gray, NO
+// tonemap. Reads <prefix>_hmax.ppm / <prefix>_hmin.ppm. Discriminates:
+//   dump black / displaced -> the field or its SAMPLER path is the bug;
+//   dump shows the footprints in place -> field fine, march logic/uniforms.
+// The draw goes through renderer.drawIndexed on the floor quad transformed
+// by the capture's own ortho, so it exercises the same GL state sequence as
+// the PBR draw (a state clobber between bind and draw reproduces here).
+void dumpHeightfieldFields(const CornellScene& scene,
+                           const engine::ShadowHeightfield& hf,
+                           const std::string& prefix,
+                           engine::Renderer& renderer) {
+    int floorIndex = -1;
+    for (std::uint32_t i = 0; i < scene.def->meshCount; ++i) {
+        if (scene.meshLoaded[i]
+                && std::strcmp(scene.def->meshes[i].material, "floor") == 0) {
+            floorIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    if (floorIndex < 0) {
+        std::fprintf(stderr,
+            "[Sandbox] --dump-heightfield: floor mesh unavailable; dump skipped\n");
+        return;
+    }
+    engine::Shader dumpProgram = engine::Shader::fromSource(
+        shaders::kHeightfieldDumpVertex, shaders::kHeightfieldDumpFragment);
+    if (!dumpProgram.valid()) {
+        std::fprintf(stderr,
+            "[Sandbox] --dump-heightfield: program failed to compile; dump skipped\n");
+        return;
+    }
+
+    const unsigned res    = hf.resolution();
+    const float    norm   = variantHasBaffle(scene.def) ? kOccluderTopBaffle
+                                                        : kOccluderTopBoxes;
+    std::vector<unsigned char> px(std::size_t(res) * std::size_t(res) * 4u);
+
+    // Raw backbuffer, depth off, viewport = capture resolution (1 px = 1
+    // texel). FBO 0 is still bound from the capture's endCapture().
+    engine::gl::Disable(engine::gl::DepthTest);
+    renderer.setViewport(0, 0, static_cast<int>(res), static_cast<int>(res));
+    engine::gl::ClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    engine::gl::Clear(engine::gl::ColorBufferBit);
+
+    dumpProgram.bind();
+    dumpProgram.setMat4("uModel", engine::Mat4::identity());
+    // The capture's own down-looking ortho maps the room footprint onto the
+    // full clip square: the floor quad covers every pixel, 1 px = 1 texel.
+    dumpProgram.setMat4("uViewProj", hf.captureViewProjection(/*maxPass=*/true));
+    dumpProgram.setFloat3("uShadowFootprintMin", -kRoomHalfX, -kRoomHalfZ, 0.0f);
+    dumpProgram.setFloat3("uShadowFootprintMax",  kRoomHalfX,  kRoomHalfZ, 0.0f);
+    dumpProgram.setFloat("uDumpNorm", norm);
+    dumpProgram.setFloat("uDumpRes", static_cast<float>(res));
+
+    const char* fieldTag[2] = { "hmax", "hmin" };
+    for (int f = 0; f < 2; ++f) {
+        // The march's EXACT sampler wiring order, every field.
+        hf.bindTextures(/*maxUnit=*/0, /*minUnit=*/1);
+        dumpProgram.setInt("uShadowHeightsMax", 0);
+        dumpProgram.setInt("uShadowHeightsMin", 1);
+        dumpProgram.setInt("uDumpField", f);
+        renderer.drawIndexed(scene.meshes[std::size_t(floorIndex)]);
+        if (!renderer.readBackbufferPixels(int(res), int(res), px.data())) {
+            std::fprintf(stderr, "[Sandbox] heightfield dump: GL readback error (%s)\n",
+                         fieldTag[f]);
+        }
+        const std::string path = prefix + "_" + fieldTag[f] + ".ppm";
+        if (writePpm(path, px.data(), int(res), int(res))) {
+            std::printf("[Sandbox] heightfield dump: %s (%ux%u, linear gray, "
+                        "0..%.2f m, black = empty)\n",
+                        path.c_str(), res, res, double(norm));
+        } else {
+            std::fprintf(stderr, "[Sandbox] heightfield dump FAILED: %s\n",
+                         path.c_str());
+        }
+    }
+
+    // Restore the state the frame loop assumes (viewport is re-set per frame;
+    // depth test and clear color are restored here).
+    engine::gl::Enable(engine::gl::DepthTest);
+    renderer.setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+}
+
 // Flat quad from 4 corners (CCW seen from -Y for the emitter underside).
 engine::Mesh createEmitterQuad() {
     const float x0 = cornell::kEmitterMin[0], x1 = cornell::kEmitterMax[0];
@@ -344,6 +715,12 @@ int main(int argc, char** argv) {
     std::string sceneName = "demo";    // --scene demo|cornell01|cornell02|cornell03
     std::string reportPath;            // --report path (benchmark telemetry file)
     int  windowWidth = 1280, windowHeight = 720;
+    bool shadowsEnabled = true;        // --no-shadows: exact M3.3 behavior (A/B)
+    float shadowPenumbra = kShadowPenumbra;  // --shadow-penumbra overrides; 0 = binary
+    float marchStepOverride = kMarchStep;    // --shadow-step overrides (A/B lever)
+    int  shadowRefine = kShadowRefineDefault; // --shadow-refine 0|1 (M4.0.8, soft path only)
+    std::string dumpHeightfieldPrefix; // --dump-heightfield p: write <p>_hmax/_hmin.ppm
+    int  shadowDebugMode = 0;          // --shadow-debug vis|field|uv (M4.0.5 instrument)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             screenshotFrames = std::atoi(argv[++i]);
@@ -359,6 +736,52 @@ int main(int argc, char** argv) {
             windowWidth = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
             windowHeight = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--no-shadows") == 0) {
+            shadowsEnabled = false;
+        } else if (std::strcmp(argv[i], "--dump-heightfield") == 0 && i + 1 < argc) {
+            dumpHeightfieldPrefix = argv[++i];
+        } else if (std::strcmp(argv[i], "--shadow-penumbra") == 0 && i + 1 < argc) {
+            shadowPenumbra = static_cast<float>(std::atof(argv[++i]));
+            if (shadowPenumbra < 0.0f) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-penumbra: negative scale '%s' "
+                             "(use 0 = binary march, or a positive scale)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-step") == 0 && i + 1 < argc) {
+            marchStepOverride = static_cast<float>(std::atof(argv[++i]));
+            if (marchStepOverride <= 0.0f || marchStepOverride >= 0.19f) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-step: '%s' out of range "
+                             "(0 < step < 0.19, the baffle-thickness invariant)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-refine") == 0 && i + 1 < argc) {
+            shadowRefine = std::atoi(argv[++i]);
+            if (shadowRefine < 0 || shadowRefine > 1) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-refine: '%s' out of range "
+                             "(0 = exact M4.0.7 soft march, 1 = M4.0.8 bracket "
+                             "refinement)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-debug") == 0 && i + 1 < argc) {
+            const char* mode = argv[++i];
+            if (std::strcmp(mode, "vis") == 0) {
+                shadowDebugMode = 1;
+            } else if (std::strcmp(mode, "field") == 0) {
+                shadowDebugMode = 2;
+            } else if (std::strcmp(mode, "uv") == 0) {
+                shadowDebugMode = 3;
+            } else {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-debug: unknown mode '%s' (use vis|field|uv)\n",
+                             mode);
+                return 1;
+            }
         }
     }
 
@@ -489,6 +912,8 @@ int main(int argc, char** argv) {
 
     // --- cornell benchmark scene (M3.3) --------------------------------------
     CornellScene cornell;
+    engine::ShadowHeightfield cornellHeightfield;   // M4; destroyed before `app`
+    bool shadowsActive = false;
     if (cornellVariant >= 0) {
         std::string benchSearchLog;
         const std::string geoDir = findBenchmarkDir(argc > 0 ? argv[0] : nullptr, &benchSearchLog);
@@ -504,6 +929,34 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[Sandbox] cornell scene '%s' failed to load.\n", sceneName.c_str());
             return 1;
         }
+
+        // M4: one-time height capture for the shadow march. The capture
+        // clobbers GL clear color; re-issue the scene's clear color after.
+        if (!shadowsEnabled) {
+            std::printf("[Sandbox] shadows disabled (--no-shadows): M3.3 direct-only mode\n");
+        } else if (captureCornellHeightfield(cornellHeightfield, cornell, renderer, &shadowsActive)) {
+            // shadowsActive carries the FIELD VERIFICATION verdict: an inert
+            // field means no shadows, and telemetry must not claim them.
+            if (!shadowsActive) {
+                std::fprintf(stderr, "[Sandbox] shadow field verification FAILED; continuing without shadows\n");
+            } else {
+                // M4.0.4: aggregate statistics pass for a displaced, mirrored,
+                // or transposed field; the registration probes check WHERE the
+                // content is before the march is allowed to claim shadows.
+                shadowsActive = runFieldRegistrationProbes(cornell.def, cornellHeightfield);
+            }
+        } else {
+            std::fprintf(stderr, "[Sandbox] heightfield unavailable; continuing without shadows\n");
+        }
+        // M4.0.4 instrument: dump the captured fields through the march's
+        // sampler wiring REGARDLESS of the verdict -- seeing where the
+        // content went (or that none made it through the sampler path) is
+        // exactly what this mode is for.
+        if (!dumpHeightfieldPrefix.empty()) {
+            dumpHeightfieldFields(cornell, cornellHeightfield,
+                                  dumpHeightfieldPrefix, renderer);
+        }
+        renderer.setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     }
 
     // Point-light grid radiance for the cornell scenes (kLightCount must fit
@@ -750,6 +1203,30 @@ int main(int argc, char** argv) {
             pbrShader.setFloat3("uSpotRadiance", 0.0f, 0.0f, 0.0f);
             pbrShader.setFloat("uSpotInnerCos", 1.0f);
             pbrShader.setFloat("uSpotOuterCos", 0.5f);
+
+            // M4 heightfield shadows (see shaders.h for the march contract).
+            pbrShader.setInt("uShadowOn", shadowsActive ? 1 : 0);
+            // M4.0.5 debug instrument, independent of shadowsActive so the
+            // panel stays readable even when the march is disabled. uShadowDebugNorm
+            // is the frozen capture top (field-mode R normalizer).
+            pbrShader.setInt("uShadowDebug", shadowDebugMode);
+            pbrShader.setFloat("uShadowDebugNorm",
+                               variantHasBaffle(cornell.def) ? kOccluderTopBaffle
+                                                             : kOccluderTopBoxes);
+            if (shadowsActive) {
+                cornellHeightfield.bindTextures(/*maxUnit=*/0, /*minUnit=*/1);
+                pbrShader.setInt("uShadowHeightsMax", 0);
+                pbrShader.setInt("uShadowHeightsMin", 1);
+                // XZ packed into vec3 (loader carries no Uniform2f entry).
+                pbrShader.setFloat3("uShadowFootprintMin", -kRoomHalfX, -kRoomHalfZ, 0.0f);
+                pbrShader.setFloat3("uShadowFootprintMax",  kRoomHalfX,  kRoomHalfZ, 0.0f);
+                pbrShader.setFloat("uShadowMaxHeight",
+                                   variantHasBaffle(cornell.def) ? kOccluderTopBaffle : kOccluderTopBoxes);
+                pbrShader.setFloat("uShadowStep", marchStepOverride);
+                pbrShader.setFloat("uShadowBias", kShadowBias);
+                pbrShader.setFloat("uShadowPenumbra", shadowPenumbra);
+                pbrShader.setInt("uShadowRefine", shadowRefine);
+            }
         } else {
             pbrShader.setFloat3("uSunDirection", sun.direction);
             pbrShader.setFloat3("uSunColor", sun.color);
@@ -769,6 +1246,7 @@ int main(int argc, char** argv) {
                                 flashlight.color * flashlight.intensity);
             pbrShader.setFloat("uSpotInnerCos", std::cos(flashlight.innerCutoffDegrees * (3.14159265f / 180.0f)));
             pbrShader.setFloat("uSpotOuterCos", std::cos(flashlight.outerCutoffDegrees * (3.14159265f / 180.0f)));
+            pbrShader.setInt("uShadowOn", 0);   // demo scene: no heightfield rig
         }
 
         if (cornellVariant >= 0) {
@@ -893,7 +1371,7 @@ int main(int argc, char** argv) {
         const std::uint32_t lightCount = (cornellVariant >= 0)
             ? cornell.def->lightCount : static_cast<std::uint32_t>(kOrbitLightCount);
 
-        char lines[12][160];
+        char lines[14][160];   // M4.0.7: +1 for the "shadow penumbra" line
         int n = 0;
         std::snprintf(lines[n++], 160, "=== benchmark report ===");
         std::snprintf(lines[n++], 160, "standard: %s", cornellVariant >= 0 ? cornell::kStandard : "n/a (demo scene)");
@@ -919,6 +1397,27 @@ int main(int argc, char** argv) {
                       static_cast<unsigned long long>(st.triangles), lightCount);
         std::snprintf(lines[n++], 160, "exposure: %.2f (fixed)  vram: not reported (no core GL query)",
                       cornellVariant >= 0 ? static_cast<double>(cornell::kExposure) : 1.0);
+        std::snprintf(lines[n++], 160, "shadows: %s",
+                      (cornellVariant < 0) ? "n/a (demo scene)"
+                      : (!shadowsEnabled) ? "off (--no-shadows: M3.3 direct-only)"
+                      : shadowsActive ? "on (heightfield march, field verified + registered)"
+                                      : "off (capture failed, verify or registration FAILED)");
+        if (cornellVariant >= 0 && shadowsEnabled && shadowsActive) {
+            std::snprintf(lines[n++], 160,
+                          "shadow penumbra: %.4f (%s)  march step: %.3f m%s  "
+                          "refine: %s",
+                          shadowPenumbra,
+                          shadowPenumbra > 0.0f
+                              ? "soft, derived from grid pitch/height"
+                              : "0 = binary march (M4.0.6 regression mode)",
+                          marchStepOverride,
+                          marchStepOverride == kMarchStep ? " (default)" : " (override)",
+                          shadowRefine ? "on (M4.0.8)" : "off (exact M4.0.7)");
+        }
+        if (shadowDebugMode > 0) {
+            std::snprintf(lines[n++], 160, "shadow-debug: %s (M4.0.5 instrument -- NOT a ledger image)",
+                          shadowDebugMode == 1 ? "vis" : shadowDebugMode == 2 ? "field" : "uv");
+        }
 
         std::printf("[Sandbox] ");
         for (int i = 0; i < n; ++i) {
