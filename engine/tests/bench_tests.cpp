@@ -434,24 +434,183 @@ struct MarchParams {
     // penumbra == 0 never reaches it). Mirrors the sandbox default
     // (--shadow-refine, default ON); 0 = the exact M4.0.7 soft march.
     int refine = 1;
+    // M4.0.9: centroid-march rig visibility. 0 = the legacy per-light pin
+    // path (every pre-M4.0.9 fixture keeps its exact semantics); 1 = one
+    // march to the "light" argument interpreted as the emitter centroid,
+    // graded by the half-plane area model with window S = lightSize
+    // (0 = binary centroid march). The SANDBOX default is centroid ON
+    // (--shadow-centroid 1); the PORT defaults to 0 so every legacy pin
+    // runs the path it pinned -- new fixtures pass centroid = 1 explicitly.
+    int centroid = 0;
+    float lightSize = 0.0f;   // S in the half-plane window (centroid path)
+    int jitter = 0;           // M4.0.9 diagnostic: per-pixel lattice jitter
+    float noise = 0.0f;       // the deterministic "pixel noise" in [0, 1]
 };
+
+// Mirrors shadowVisibilityCentroid() in shaders.h (M4.0.9): one march to the
+// emitter centroid shared by the rig, graded per sample by the half-plane
+// area model g = clamp(0.5 + d/(S*t), 0, 1), min-accumulated. The `light`
+// arguments are the CENTROID's coordinates. Binary path (lightSize == 0):
+// first d < 0 returns the hard 0; break once above every occluder. Soft
+// path: the early-out compares the future grade lower bound
+// 0.5 + B(t)/(S*t) (B = global clearance bound, rising in t) against vis;
+// near-receiver samples saturate the grade exactly like the legacy 2*step
+// start zone. Vertical rays (horiz < 1e-4): exact column-interval test --
+// the centroid hangs INSIDE the cbox03 baffle footprint, so the vertical
+// case is reachable and must not silently return 1. Jitter shifts the
+// lattice by (noise - 0.5) spacings (deterministic in the port; the shader
+// derives the noise from gl_FragCoord).
+float marchVisibilityCentroidPort(const SceneFields& scene,
+                                  const MarchParams& pm,
+                                  float rx, float ry, float rz,
+                                  float lx, float ly, float lz) {
+    const float dx = lx - rx, dz = lz - rz;
+    const float horiz = std::sqrt(dx * dx + dz * dz);
+    if (horiz < 1e-4f) {
+        // Vertical ray: the whole segment shares the receiver's column.
+        // Blocked iff the segment overlaps some column interval
+        // (Min + bias, hMax - bias]: max of the two clearance terms < 0
+        // iff both overlaps hold -- the exact 1-D interval intersection.
+        float dV = -1e30f;
+        for (int f = 0; f < scene.count; ++f) {
+            const float hMax = scene.fields[f].maxY(rx, rz);
+            const float hMin = scene.fields[f].minY(rx, rz);
+            dV = std::max(dV,
+                          std::max(hMin + pm.bias - std::max(ry, ly),
+                                   std::min(ry, ly) - (hMax - pm.bias)));
+        }
+        return (dV < 0.0f) ? 0.0f : 1.0f;
+    }
+    const int steps = static_cast<int>(horiz / pm.step) + 1;
+    const float segLen = std::sqrt(dx * dx + dz * dz + (ly - ry) * (ly - ry));
+    const float jitterOff = (pm.jitter != 0) ? (pm.noise - 0.5f) : 0.0f;
+    // M4.0.9 march span (mirrors the shader): tCap for the binary path
+    // (light size 0 -- the break at t > tCap is exactly the legacy binary
+    // early-out), tEnd = tCap + wCap / (y1 - y0) for the soft path -- the
+    // upper grade band above the top edge, window capped at
+    // wCap = lightSize * tCap.
+    float tCap = 1.0f;
+    if (ly > ry) {
+        tCap = (pm.maxHeight - pm.bias - ry) / (ly - ry);
+        tCap = std::clamp(tCap, 0.0f, 1.0f);
+    } else if (ry > pm.maxHeight - pm.bias) {
+        tCap = 0.0f;
+    }
+    float tEnd = tCap;
+    if (pm.lightSize > 0.0f) {
+        const float wCap = pm.lightSize * tCap;
+        const float dy = ly - ry;
+        tEnd = (dy > 0.0f) ? std::min(tCap + wCap / dy, 1.0f) : 1.0f;
+    }
+    float vis = 1.0f;    // min of the per-sample grades
+    float tBest = -1.0f; // argmin sample, for the bracket refinement
+    for (int s = 1; s <= steps; ++s) {
+        const float t = (static_cast<float>(s) + jitterOff) /
+                        static_cast<float>(steps);
+        if (t <= 0.0f || t > tEnd) {
+            break;   // jitter can push the lattice past the light
+        }
+        const float rayY = ry + (ly - ry) * t;
+        const float px = rx + dx * t;
+        const float pz = rz + dz * t;
+        float d = 1e30f;   // clearance to the nearest column interval at (px, pz)
+        bool anySolid = false;   // a real column interval exists at this sample
+        for (int f = 0; f < scene.count; ++f) {
+            const float hMax = scene.fields[f].maxY(px, pz);
+            const float hMin = scene.fields[f].minY(px, pz);
+            anySolid = anySolid || (hMax > hMin);
+            d = std::min(d, std::max(hMin + pm.bias - rayY,
+                                     rayY - (hMax - pm.bias)));
+        }
+        if (pm.lightSize <= 0.0f) {
+            // Binary centroid march (light size 0): exact legacy semantics.
+            if (d < 0.0f) {
+                return 0.0f;
+            }
+            continue;
+        }
+        // Soft path early-out: the grade lower bound 0.5 + B(t)/(S*t) rises
+        // monotonically in t (the B0/t term decays), so once it reaches vis
+        // no future sample -- empty columns are skipped below -- can lower
+        // vis. Descending rays march to the end (cannot happen in the
+        // frozen rig; the guard keeps the port total).
+        if (ly > ry &&
+            0.5f + (rayY - (pm.maxHeight - pm.bias)) /
+                       std::max(pm.lightSize * t, 1e-5f) >= vis) {
+            break;
+        }
+        const float traveled = t * segLen;
+        if (traveled > 2.0f * pm.step && anySolid) {
+            // ONLY a real column interval grades (mirrors the shader's
+            // hMax > hMin skip); window capped at the occluder-bearing
+            // lightSize * tCap.
+            float g = 0.5f + d / std::max(pm.lightSize * std::min(t, tCap),
+                                          1e-5f);
+            g = std::clamp(g, 0.0f, 1.0f);
+            if (g < vis) {
+                vis = g;     // min(), plus the argmin t for the refinement
+                tBest = t;
+            }
+        }
+    }
+    // Bracket refinement: two fetch pairs at half-step offsets around the
+    // worst sample, same grade, same start zone; a refined pierce grades
+    // dark. Monotone-safe: vis can only decrease.
+    if (pm.lightSize > 0.0f && pm.refine > 0 && vis < 1.0f && tBest >= 0.0f) {
+        const float halfT = 0.5f / static_cast<float>(steps);
+        for (int r = 0; r < 2; ++r) {
+            const float m = tBest + ((r == 0) ? -halfT : halfT);
+            if (m <= 0.0f || m > tEnd) {
+                continue;
+            }
+            const float rayYr = ry + (ly - ry) * m;
+            const float pxr = rx + dx * m;
+            const float pzr = rz + dz * m;
+            float d = 1e30f;
+            bool anySolidR = false;
+            for (int f = 0; f < scene.count; ++f) {
+                const float hMax = scene.fields[f].maxY(pxr, pzr);
+                const float hMin = scene.fields[f].minY(pxr, pzr);
+                anySolidR = anySolidR || (hMax > hMin);
+                d = std::min(d, std::max(hMin + pm.bias - rayYr,
+                                         rayYr - (hMax - pm.bias)));
+            }
+            const float traveledR = m * segLen;
+            if (traveledR > 2.0f * pm.step && anySolidR) {
+                const float gR = std::clamp(
+                    0.5f + d / std::max(pm.lightSize * std::min(m, tCap),
+                                        1e-5f), 0.0f, 1.0f);
+                vis = std::min(vis, gR);
+            }
+        }
+    }
+    return vis;
+}
 
 // Mirrors shadowVisibility() in shaders.h. `texture()` becomes a direct
 // IntervalField lookup (bilinear filtering is a softening detail, not part
 // of the blocking contract). M4.0.7: the port also mirrors the soft-penumbra
 // path -- per-sample signed clearance d to the column interval, hard return
 // on d < 0, otherwise min-accumulate d against a penumbra window of
-// penumbra * traveled (traveled > 2*step start zone). M4.0.8: the port
-// mirrors the bracket refinement too -- the argmin sample's t is tracked,
-// and two half-step fetch pairs around it re-evaluate the clearance against
-// the same window (soft path only, vis < 1); a refined fetch landing inside
-// an interval returns the hard 0. With penumbra == 0 the decisions are
-// identical to the M4.0.5/M4.0.6 binary port: max(a, b) < 0 iff both old
-// inequalities held, and the early-out only skips samples that could never
-// block.
+// penumbra * traveled (traveled > 2*step start zone). M4.0.9: the window is
+// the PARALLAX form penumbra * t / (1 - t) -- the lateral offset between
+// adjacent grid lights' shadow edges at blocker depth t -- and the early-out
+// bound extends to the window at tCap (the ray's last occluder-bearing
+// fraction); at penumbra == 0 the bound is 0 and every decision is
+// identical to the M4.0.5/M4.0.6 binary port, so the md5-replay pins hold.
+// M4.0.8: the port mirrors the bracket refinement too -- the argmin
+// sample's t is tracked, and two half-step fetch pairs around it
+// re-evaluate the clearance against the same window (soft path only,
+// vis < 1); a refined fetch landing inside an interval returns the hard 0.
+// With penumbra == 0 the decisions are identical to the M4.0.5/M4.0.6
+// binary port: max(a, b) < 0 iff both old inequalities held, and the
+// early-out only skips samples that could never block.
 float marchVisibilityPort(const SceneFields& scene, const MarchParams& pm,
                           float rx, float ry, float rz,
                           float lx, float ly, float lz) {
+    if (pm.centroid != 0) {
+        return marchVisibilityCentroidPort(scene, pm, rx, ry, rz, lx, ly, lz);
+    }
     const float dx = lx - rx, dz = lz - rz;
     const float horiz = std::sqrt(dx * dx + dz * dz);
     if (horiz < 1e-4f) {
@@ -459,13 +618,32 @@ float marchVisibilityPort(const SceneFields& scene, const MarchParams& pm,
     }
     const int steps = static_cast<int>(horiz / pm.step) + 1;
     const float segLen = std::sqrt(dx * dx + dz * dz + (ly - ry) * (ly - ry));
+    // M4.0.9 march span (mirrors the shader): tCap = the legacy binary
+    // early-out fraction (byte-identical break for penumbra == 0); tEnd
+    // extends the SOFT path over the upper grade band with the window
+    // capped at its occluder-bearing value.
+    float tCap = 1.0f;
+    if (ly > ry) {
+        tCap = (pm.maxHeight - pm.bias - ry) / (ly - ry);
+        tCap = std::clamp(tCap, 0.0f, 1.0f);
+    } else if (ry > pm.maxHeight - pm.bias) {
+        tCap = 0.0f;
+    }
+    // M4.0.9 soft-path span + capped window (mirrors the shader).
+    float tEnd = tCap;
+    if (pm.penumbra > 0.0f) {
+        const float wCap = pm.penumbra * tCap / std::max(1.0f - tCap, 1e-4f);
+        const float dy = ly - ry;
+        tEnd = (dy > 0.0f) ? std::min(tCap + wCap / dy, 1.0f) : 1.0f;
+    }
+    const float tCapRatio = tCap / std::max(1.0f - tCap, 1e-4f);
     float vis = 1.0f;
     float tBest = -1.0f;   // M4.0.8: t of the sample that last lowered vis
     for (int s = 1; s <= steps; ++s) {
         const float t = static_cast<float>(s) / static_cast<float>(steps);
         const float rayY = ry + (ly - ry) * t;
-        if (rayY - (pm.maxHeight - pm.bias) > pm.penumbra * segLen) {
-            break;   // clearance exceeds the largest penumbra window possible
+        if (t > tEnd) {
+            break;
         }
         const float px = rx + dx * t;
         const float pz = rz + dz * t;
@@ -481,9 +659,12 @@ float marchVisibilityPort(const SceneFields& scene, const MarchParams& pm,
         if (pm.penumbra > 0.0f) {
             const float traveled = t * segLen;
             if (traveled > 2.0f * pm.step) {
+                // M4.0.9 parallax window, capped at the occluder-bearing
+                // value (mirrors the shader).
+                const float window = pm.penumbra *
+                    std::min(t / std::max(1.0f - t, 1e-4f), tCapRatio);
                 const float graded =
-                    std::clamp(d / std::max(pm.penumbra * traveled, 1e-5f),
-                               0.0f, 1.0f);
+                    std::clamp(d / std::max(window, 1e-5f), 0.0f, 1.0f);
                 if (graded < vis) {
                     vis = graded;   // min(), plus the argmin t for M4.0.8
                     tBest = t;
@@ -500,13 +681,10 @@ float marchVisibilityPort(const SceneFields& scene, const MarchParams& pm,
         const float halfT = 0.5f / static_cast<float>(steps);
         for (int r = 0; r < 2; ++r) {
             const float m = tBest + ((r == 0) ? -halfT : halfT);
-            if (m <= 0.0f || m >= 1.0f) {
+            if (m <= 0.0f || m > tEnd) {
                 continue;
             }
             const float rayYr = ry + (ly - ry) * m;
-            if (rayYr - (pm.maxHeight - pm.bias) > pm.penumbra * segLen) {
-                continue;
-            }
             const float pxr = rx + dx * m;
             const float pzr = rz + dz * m;
             float d = 1e30f;
@@ -521,8 +699,10 @@ float marchVisibilityPort(const SceneFields& scene, const MarchParams& pm,
             }
             const float traveledR = m * segLen;
             if (traveledR > 2.0f * pm.step) {
+                const float windowR = pm.penumbra *
+                    std::min(m / std::max(1.0f - m, 1e-4f), tCapRatio);
                 vis = std::min(vis,
-                               std::clamp(d / std::max(pm.penumbra * traveledR, 1e-5f),
+                               std::clamp(d / std::max(windowR, 1e-5f),
                                           0.0f, 1.0f));
             }
         }
@@ -588,18 +768,23 @@ float g_box1mMax(float x, float z) {
 IntervalField g_box1m { g_box1mMin, g_box1mMax };
 SceneFields g_box1mScene { 1, { g_box1m } };
 
-// M4.0.8 refinement fixture: a triangular ridge, hMax = 1 - |x|/2 for
-// |x| < 2 (apex at x = 0, height 1 m, clearance slope 0.5 m per meter).
-// A horizontal ray at y = 1.02 from x = -2 to x = +2 holds apex clearance
-// 0.03 m, but the 0.08 m sample grid (51 samples spanning -2..+2) lands its
-// nearest samples at x = +/-0.0392 with clearance 0.0496 m -- the SAMPLED
+// M4.0.9 refinement fixture: a TALL STEEP ridge, hMax = 3 - 1.65*|x| for
+// |x| < 1.818 (apex 3.0 m at x = 0, clearance slope 1.65 m per meter),
+// probed by a RISING ray from (-2, 1.02, 0) to (2, 5.02, 0) -- slope 1.0 m
+// per meter, so the ray's clearance FALLS on the ridge's rising side
+// (1.65 > 1.0) and rises on its falling side: the apex is a true interior
+// dip. The ray clears the apex by 0.03 m and EXITS the occluder band at
+// tCap = 0.5675 (the parallax window's divergence tail is therefore capped
+// and harmless -- horizontal synthetic rays never exit the band and cannot
+// pin this window form). At the 0.08 m cadence (51 samples) the nearest
+// samples land at x = -/+0.0392 with clearance 0.0555 m -- the SAMPLED
 // minimum overstates the true apex clearance (0.03 m). Exactly the
-// staircase noise the bracket refinement removes: the half-step probes land
-// at x = 0.0 (clearance 0.03 m) and x = +0.0784, strictly sharper.
+// staircase noise the bracket refinement removes: the half-step probe lands
+// on the apex (x = 0, clearance 0.03 m), strictly sharper.
 float g_ridgeMin(float, float) { return 0.0f; }
 float g_ridgeMax(float x, float) {
     const float ax = std::fabs(x);
-    return ax >= 2.0f ? 0.0f : 1.0f - ax * 0.5f;
+    return ax >= 1.818f ? 0.0f : 3.0f - ax * 1.65f;
 }
 IntervalField g_ridge { g_ridgeMin, g_ridgeMax };
 SceneFields g_ridgeScene { 1, { g_ridge } };
@@ -709,10 +894,10 @@ void testSoftPenumbraMarch() {
 
     MarchParams pm;              // binary path (penumbra = 0)
     MarchParams pmSoft = pm;
-    pmSoft.penumbra = 0.03f;     // the sandbox's derived default
-                                 // (0.5 * 0.325 / 5.44)
+    pmSoft.penumbra = 0.325f;    // the sandbox's derived default (the grid
+                                 // pitch; M4.0.9 parallax window scale)
     MarchParams pmWide = pm;
-    pmWide.penumbra = 0.06f;     // 2x window: strictly softer
+    pmWide.penumbra = 0.65f;     // 2x window: strictly softer
 
     // 1) Deep umbra stays HARD in both modes: the ray crosses the tall
     //    block's interval mid-footprint, meters below the top. No penumbra
@@ -776,41 +961,46 @@ void testBracketRefinement() {
 
     MarchParams pmBase;              // binary reference (penumbra = 0)
     MarchParams pmSoft = pmBase;
-    pmSoft.penumbra = 0.03f;         // the sandbox's derived default
+    pmSoft.penumbra = 0.325f;        // the sandbox's derived default (M4.0.9)
     MarchParams pmSoftNoRefine = pmSoft;
-    pmSoftNoRefine.refine = 0;       // the exact M4.0.7 soft march
+    pmSoftNoRefine.refine = 0;       // the exact M4.0.8 soft march (pre-M4.0.9 window)
 
-    // 1) The ridge graze: the sampled minimum lands OFF the apex (nearest
-    //    samples at x = +/-0.0392, clearance 0.0496 m), so the window fires
-    //    on an overestimated clearance. The refinement's half-step probes
-    //    land at x = 0.0 (clearance 0.03 m) -- strictly sharper. Both
-    //    values stay graded (inside (0, 1)).
+    // 1) The ridge graze (M4.0.9 tall-ridge fixture, RISING ray): the
+    //    sampled minimum lands OFF the apex (nearest sample at x = -0.0392,
+    //    clearance 0.0555 m), so the window fires on an overestimated
+    //    clearance. The refinement's +half-step probe lands ON the apex
+    //    (x = 0, clearance 0.03 m) -- strictly sharper. Both values stay
+    //    graded, and the sampled value pins the PARALLAX window form: the
+    //    M4.0.7 linear form would grade the same clearance to ~0.087
+    //    (window 0.325*0.49*4.0), outside the band below.
     const float sampled = marchVisibilityPort(g_ridgeScene, pmSoftNoRefine,
                                               -2.0f, 1.02f, 0.0f,
-                                               2.0f, 1.02f, 0.0f);
+                                               2.0f, 5.02f, 0.0f);
     const float refined = marchVisibilityPort(g_ridgeScene, pmSoft,
                                               -2.0f, 1.02f, 0.0f,
-                                               2.0f, 1.02f, 0.0f);
-    expectTrue(sampled > 0.0f && sampled < 1.0f,
-               "ridge graze: window fired on the sampled minimum (trigger)");
+                                               2.0f, 5.02f, 0.0f);
+    expectTrue(sampled > 0.15f && sampled < 0.20f,
+               "ridge graze: sampled minimum pins the parallax window form");
     expectTrue(refined > 0.0f && refined < sampled,
                "ridge graze: refinement strictly sharpens the sampled minimum");
 
-    // 2) Flat-bottom clearance (1 m box graze, clearance 0.03 m across the
-    //    footprint): even with d constant, d/w(t) keeps falling while the
-    //    window grows with traveled distance, so the true graded minimum
-    //    sits at the ray's EXIT edge, between samples. The refinement's
-    //    half-step probe re-locates it -- sharpening here too, and never
-    //    inventing occlusion (the value stays strictly inside (0, 1)).
-    const float flatOn  = marchVisibilityPort(g_box1mScene, pmSoft,
-                                              0.0f, 1.02f, 2.0f,
-                                              0.0f, 1.02f, -2.0f);
-    const float flatOff = marchVisibilityPort(g_box1mScene, pmSoftNoRefine,
-                                              0.0f, 1.02f, 2.0f,
-                                              0.0f, 1.02f, -2.0f);
-    expectTrue(flatOn > 0.0f && flatOn < 1.0f && flatOff > flatOn,
-               "constant-clearance graze: refinement sharpens the exit-edge "
-               "minimum (window grows with traveled)");
+    // 2) Refinement gate: the refinement engages ONLY where the window
+    //    fired (vis < 1). A fully-lit ridge ray (receiver above the apex
+    //    band, every grade saturates) returns EXACTLY 1 with refinement on,
+    //    and a hard-blocked ridge ray returns EXACTLY 0 -- the refinement
+    //    phase never touches binary outcomes.
+    const float litOn  = marchVisibilityPort(g_ridgeScene, pmSoft,
+                                             -2.0f, 3.50f, 0.0f,
+                                              2.0f, 5.02f, 0.0f);
+    const float litOff = marchVisibilityPort(g_ridgeScene, pmSoftNoRefine,
+                                             -2.0f, 3.50f, 0.0f,
+                                              2.0f, 5.02f, 0.0f);
+    expectTrue(litOn == 1.0f && litOff == 1.0f,
+               "ridge fully-lit ray: refinement gate keeps exactly 1");
+    expectTrue(marchVisibilityPort(g_ridgeScene, pmSoft,
+                                   -0.5f, 1.02f, 0.0f,
+                                    2.0f, 5.02f, 0.0f) == 0.0f,
+               "ridge pierce ray: refinement keeps the hard 0");
 
     // 3) Binary neutrality: penumbra = 0 never reaches the refinement, so
     //    the flag is decision-neutral there -- the port-level statement of
@@ -826,11 +1016,11 @@ void testBracketRefinement() {
                                                   -1.05f, 0.0f, -2.40f,
                                                   -0.4875f, 5.44f, -0.3938f);
     const float binOffLit = marchVisibilityPort(g_ridgeScene, pmBin0,
-                                                -2.0f, 1.02f, 0.0f,
-                                                 2.0f, 1.02f, 0.0f);
+                                                -2.0f, 3.50f, 0.0f,
+                                                 2.0f, 5.02f, 0.0f);
     const float binOnLit  = marchVisibilityPort(g_ridgeScene, pmBin1,
-                                                -2.0f, 1.02f, 0.0f,
-                                                 2.0f, 1.02f, 0.0f);
+                                                -2.0f, 3.50f, 0.0f,
+                                                 2.0f, 5.02f, 0.0f);
     expectTrue(binOffUmbra == 0.0f && binOffUmbra == binOnUmbra,
                "penumbra 0, refine 0 vs 1: deep-umbra verdict identical");
     expectTrue(binOffLit == 1.0f && binOffLit == binOnLit,
@@ -865,6 +1055,179 @@ void testBracketRefinement() {
         expectTrue(vOn <= vOff + 1e-6f && vOn >= 0.0f && vOn <= 1.0f,
                    "room fixture: refinement never raises visibility");
     }
+}
+
+// ---------------------------------------------------------------------------
+// M4.0.9: the centroid rig march (flag-gated experiment, --shadow-centroid 1)
+// and the parallax-window form, pinned against the same analytic fields.
+// Centroid contract: hard outcomes exact in the binary path (lightSize = 0),
+// graded values monotone in the light size S, the west-wall top-edge band
+// grades smoothly (the geometry the half-plane model CAN see), the z-side
+// floor band stays binary (the documented single-ray blindness: rim rays
+// passing BESIDE the block are invisible to one ray), the vertical-ray
+// column test is exact (the centroid hangs inside the cbox03 baffle
+// footprint), refinement stays monotone-safe, and jitter changes graded
+// values without breaking any binary verdict.
+// ---------------------------------------------------------------------------
+void testCentroidRigMarch() {
+    std::printf("[bench] centroid rig march + parallax window (M4.0.9 contract pins)\n");
+
+    // Cadence invariant: the centroid path's finer step keeps the
+    // baffle-thickness margin (mirror of the sandbox static_assert).
+    expectTrue(0.04f < 0.19f,
+               "centroid march step 0.04 stays below the baffle's 0.2 m thickness");
+
+    MarchParams pmC;             // centroid binary (lightSize = 0)
+    pmC.centroid = 1;
+    pmC.step = 0.04f;            // mirrors kCentroidMarchStep
+    MarchParams pmS = pmC;
+    pmS.lightSize = 1.175f;      // mirrors kShadowLightSize (emitter mean)
+    MarchParams pmSNoRefine = pmS;
+    pmSNoRefine.refine = 0;
+
+    // 1) Hard outcomes stay exact (binary centroid): the behind-the-block
+    //    floor ray crosses the tall block's interval below its top; the
+    //    open-corner floor ray clears everything; the block-top receiver
+    //    breaks at the first sample (tCap = 0).
+    expectTrue(marchVisibilityPort(g_tallScene, pmC, -1.05f, 0.0f, -2.40f,
+                                   0.0f, 5.44f, 0.0f) == 0.0f,
+               "centroid binary: behind-block floor ray is blocked");
+    expectTrue(marchVisibilityPort(g_tallScene, pmC, 2.40f, 0.0f, 2.40f,
+                                   0.0f, 5.44f, 0.0f) == 1.0f,
+               "centroid binary: open-corner floor ray is lit");
+    expectTrue(marchVisibilityPort(g_tallScene, pmC, -1.05f, 3.30f, 0.0f,
+                                   0.0f, 5.44f, 0.0f) == 1.0f,
+               "centroid binary: top-surface receiver stays lit (acne guard)");
+
+    // 2) Deep pierce grades to exactly 0 in the soft path (the half-plane
+    //    grade saturates): same behind-block ray, meters below the top.
+    expectTrue(marchVisibilityPort(g_tallScene, pmS, -1.05f, 0.0f, -2.40f,
+                                   0.0f, 5.44f, 0.0f) == 0.0f,
+               "centroid soft: deep-pierce ray returns exactly 0");
+
+    // 3) The west-wall top-edge band (the geometry the half-plane model
+    //    sees): receivers at x = -2.75 whose centroid rays skim the tall
+    //    block's top-west edge (entry t ~ 0.436, rayY ~ y_w + 1.46). The
+    //    band grades monotonically from umbra to lit as the receiver rises.
+    const float bandLow  = marchVisibilityPort(g_tallScene, pmS,
+                                               -2.75f, 1.00f, -0.85f,
+                                               0.0f, 5.44f, 0.0f);
+    const float bandMid  = marchVisibilityPort(g_tallScene, pmS,
+                                               -2.75f, 1.50f, -0.85f,
+                                               0.0f, 5.44f, 0.0f);
+    const float bandHigh = marchVisibilityPort(g_tallScene, pmS,
+                                               -2.75f, 1.90f, -0.85f,
+                                               0.0f, 5.44f, 0.0f);
+    const float bandLit  = marchVisibilityPort(g_tallScene, pmS,
+                                               -2.75f, 2.30f, -0.85f,
+                                               0.0f, 5.44f, 0.0f);
+    expectTrue(bandLow == 0.0f,
+               "centroid band: below the edge the grade saturates to 0");
+    expectTrue(bandMid > 0.25f && bandMid < 0.5f,
+               "centroid band: near-edge receiver grades strictly inside (0.25, 0.5)");
+    expectTrue(bandMid < bandHigh && bandHigh < 1.0f,
+               "centroid band: rising toward the edge strictly brightens");
+    expectTrue(bandLit == 1.0f,
+               "centroid band: clearing receivers stay exactly 1");
+
+    // 4) The documented single-ray blindness, pinned so it can never be
+    //    silently "fixed": on the z-side floor band the centroid ray either
+    //    pierces the footprint (deep, -> 0) or misses it entirely (-> 1);
+    //    the lateral rim-ray penumbra is structurally absent from one ray.
+    //    This is why the centroid path is an EXPERIMENT and the default
+    //    transport keeps the 16 per-light rays.
+    expectTrue(marchVisibilityPort(g_tallScene, pmS, -1.05f, 0.0f, 0.60f,
+                                   0.0f, 5.44f, 0.0f) == 0.0f,
+               "centroid blindness: z-side floor point with footprint pierce -> 0");
+    expectTrue(marchVisibilityPort(g_tallScene, pmS, -1.05f, 0.0f, 0.80f,
+                                   0.0f, 5.44f, 0.0f) == 1.0f,
+               "centroid blindness: z-side floor point with footprint miss -> 1 "
+               "(the lateral penumbra a single ray cannot see)");
+
+    // 5) Window monotonicity in S on the CLEAR side of the band (receiver
+    //    y_w = 1.95, sampled clearance ~0.21 m): a wider emitter extent is
+    //    strictly softer; a narrow window saturates the grade to exactly 1.
+    MarchParams pmSNarrow = pmS;
+    pmSNarrow.lightSize = 0.5f;
+    MarchParams pmSWide = pmS;
+    pmSWide.lightSize = 2.0f;
+    const float sNarrow = marchVisibilityPort(g_tallScene, pmSNarrow,
+                                              -2.75f, 1.95f, -0.85f,
+                                              0.0f, 5.44f, 0.0f);
+    const float sWide   = marchVisibilityPort(g_tallScene, pmSWide,
+                                              -2.75f, 1.95f, -0.85f,
+                                              0.0f, 5.44f, 0.0f);
+    expectTrue(sNarrow == 1.0f,
+               "centroid: half-size window saturates the clear-side graze to 1");
+    const float bandClear = marchVisibilityPort(g_tallScene, pmS,
+                                                -2.75f, 1.95f, -0.85f,
+                                                0.0f, 5.44f, 0.0f);
+    expectTrue(sNarrow > bandClear && bandClear > sWide && sWide > 0.5f,
+               "centroid: larger light size strictly softens the same graze");
+
+    // 6) Refinement stays monotone-safe and strictly sharpens a sub-step
+    //    dip under the half-plane grade (tall-ridge apex, RISING ray at the
+    //    centroid cadence 0.04 m -- 101 samples; the +half-step probe lands
+    //    on the apex).
+    const float ridgeOn  = marchVisibilityPort(g_ridgeScene, pmS,
+                                               -2.0f, 1.02f, 0.0f,
+                                               2.0f, 5.02f, 0.0f);
+    const float ridgeOff = marchVisibilityPort(g_ridgeScene, pmSNoRefine,
+                                               -2.0f, 1.02f, 0.0f,
+                                               2.0f, 5.02f, 0.0f);
+    expectTrue(ridgeOn > 0.5f && ridgeOn < 0.6f && ridgeOff > 0.5f &&
+               ridgeOff < 0.6f && ridgeOn < ridgeOff,
+               "centroid ridge graze: refinement strictly sharpens, both graded");
+
+    // 7) Jitter (deterministic noise in the port): shifts the lattice,
+    //    changes the graded value (the grain mechanism), never breaks a
+    //    binary verdict, and stays inside [0, 1].
+    MarchParams pmJ = pmS;
+    pmJ.jitter = 1;
+    pmJ.noise = 0.25f;           // lattice shifted a quarter spacing early
+    const float jitterMid = marchVisibilityPort(g_tallScene, pmJ,
+                                                -2.75f, 1.50f, -0.85f,
+                                                0.0f, 5.44f, 0.0f);
+    expectTrue(jitterMid >= 0.0f && jitterMid <= 1.0f,
+               "centroid jitter: graded value stays in [0, 1]");
+    expectTrue(jitterMid != bandMid,
+               "centroid jitter: the lattice shift changes the graded value "
+               "(per-pixel grain by construction)");
+    expectTrue(marchVisibilityPort(g_tallScene, pmJ, -1.05f, 0.0f, -2.40f,
+                                   0.0f, 5.44f, 0.0f) == 0.0f,
+               "centroid jitter: binary-pierce verdict unchanged");
+    MarchParams pmCBinJ = pmC;
+    pmCBinJ.jitter = 1;
+    pmCBinJ.noise = 0.0f;
+    expectTrue(marchVisibilityPort(g_tallScene, pmCBinJ, 2.40f, 0.0f, 2.40f,
+                                   0.0f, 5.44f, 0.0f) == 1.0f,
+               "centroid jitter: binary-lit verdict unchanged");
+
+    // 8) Vertical-ray column test (exact): the centroid hangs INSIDE the
+    //    cbox03 baffle footprint, so a receiver directly beneath it must
+    //    block through the hanging plate -- the legacy per-light path could
+    //    treat this as measure-zero, the centroid path cannot.
+    expectTrue(marchVisibilityPort(g_baffleScene, pmC, 0.0f, 0.001f, 0.0f,
+                                   0.0f, 5.44f, 0.0f) == 0.0f,
+               "centroid vertical ray: under-baffle receiver is blocked "
+               "(exact column test)");
+    expectTrue(marchVisibilityPort(g_emptyScene, pmC, 0.0f, 0.001f, 0.0f,
+                                   0.0f, 5.44f, 0.0f) == 1.0f,
+               "centroid vertical ray: empty column stays lit");
+
+    // 9) Parallax-window form (default per-light path): a constant-clearance
+    //    graze deep along the ray (t -> 1) grades near-black -- the
+    //    physically real under-baffle darkening (the plate hangs 4 cm under
+    //    the grid). The divergence is bounded by the tCap-capped window, so
+    //    the value stays a positive grade, never negative.
+    MarchParams pmDeep;          // per-light legacy path (centroid = 0)
+    pmDeep.penumbra = 0.325f;    // the sandbox's derived default (M4.0.9)
+    const float deepGraze = marchVisibilityPort(g_box1mScene, pmDeep,
+                                                0.0f, 1.02f, 0.55f,
+                                                0.0f, 1.02f, -0.55f);
+    expectTrue(deepGraze >= 0.0f && deepGraze < 0.05f,
+               "parallax window: constant clearance at t -> 1 grades near 0 "
+               "(diverging window, tCap-capped march)");
 }
 
 void testShadowCaptureMatrix() {
@@ -1000,6 +1363,7 @@ int main() {
     testHeightfieldShadowMarch();
     testSoftPenumbraMarch();
     testBracketRefinement();
+    testCentroidRigMarch();
     testShadowCaptureMatrix();
     testWorldToTexelMapping();
 

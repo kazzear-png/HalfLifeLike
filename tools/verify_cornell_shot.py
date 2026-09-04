@@ -84,8 +84,24 @@ SPHERES = (  # (cx, cz, r, floor_y) -- column interval is exact for convex solid
     (0.00, 0.90, 0.55, 0.0),    # gold
     (1.70, 1.55, 0.55, 0.0),    # dielectric
 )
-MARCH_STEP = 0.16
+MARCH_STEP = 0.08        # sandbox per-light default (kMarchStep, M4.0.6)
+MARCH_STEP_CENTROID = 0.04  # sandbox centroid default (kCentroidMarchStep, M4.0.9)
 MARCH_BIAS = 0.01
+PENUMBRA = 0.325         # kShadowPenumbra (M4.0.9 parallax window scale = grid pitch)
+LIGHT_SIZE = 1.175       # kShadowLightSize (M4.0.9 centroid half-plane S, emitter mean)
+
+# M4.0.9 shadow-mode arguments (must mirror the sandbox flags used for the
+# shot; the defaults track the sandbox defaults). The float64 march below is
+# the EXACT algorithm the PBR shader runs, so the probe expectations stay
+# honest under every mode.
+class ShadowMode:
+    def __init__(self, centroid=False, light_size=LIGHT_SIZE,
+                 step=None, penumbra=PENUMBRA):
+        self.centroid = centroid
+        self.light_size = light_size
+        self.step = step if step is not None else \
+            (MARCH_STEP_CENTROID if centroid else MARCH_STEP)
+        self.penumbra = 0.0 if centroid and light_size <= 0.0 else penumbra
 MAXH_BOXES = 3.30
 MAXH_BAFFLE = 5.40
 
@@ -112,24 +128,148 @@ def solid_intervals(variant):
 
 
 def march_visibility(px, py, pz, lx, ly, lz, solids, max_h,
-                     step=MARCH_STEP, bias=MARCH_BIAS):
-    """float64 port of the shader's shadowVisibility (same sample schedule)."""
+                     step=MARCH_STEP, bias=MARCH_BIAS, penumbra=PENUMBRA,
+                     refine=True):
+    """float64 port of the shader's shadowVisibility (M4.0.9 form):
+    parallax window penumbra * t / (1 - t) capped at its occluder-bearing
+    value, march span tCap (binary) / tEnd (soft), 2*step start zone,
+    M4.0.8 bracket refinement. penumbra = 0 reduces to the exact binary
+    march (the M4.0.6 regression form)."""
     dx, dz = lx - px, lz - pz
     horiz = math.sqrt(dx * dx + dz * dz)
     if horiz < 1e-4:
         return 1.0
+    if ly > py:
+        t_cap = (max_h - bias - py) / (ly - py)
+        t_cap = min(1.0, max(0.0, t_cap))
+    elif py > max_h - bias:
+        t_cap = 0.0
+    else:
+        t_cap = 1.0
+    t_end = t_cap
+    if penumbra > 0.0:
+        w_cap = penumbra * t_cap / max(1.0 - t_cap, 1e-4)
+        dy = ly - py
+        t_end = min(t_cap + w_cap / dy, 1.0) if dy > 0.0 else 1.0
+    t_cap_ratio = t_cap / max(1.0 - t_cap, 1e-4)
     steps = int(horiz / step) + 1
+    seg_len = math.sqrt(dx * dx + dz * dz + (ly - py) * (ly - py))
+    vis, t_best = 1.0, -1.0
     for s in range(1, steps + 1):
         t = s / steps
-        ray_y = py + (ly - py) * t
-        if ray_y > max_h:
+        if t > t_end:
             break
+        ray_y = py + (ly - py) * t
         x, z = px + dx * t, pz + dz * t
+        d = 1e30
         for lo_fn, hi_fn in solids:
             h_max, h_min = hi_fn(x, z), lo_fn(x, z)
-            if ray_y < h_max - bias and ray_y > h_min + bias:
+            d = min(d, max(h_min + bias - ray_y, ray_y - (h_max - bias)))
+        if d < 0.0:
+            return 0.0
+        if penumbra > 0.0:
+            traveled = t * seg_len
+            if traveled > 2.0 * step:
+                window = penumbra * min(t / max(1.0 - t, 1e-4), t_cap_ratio)
+                graded = min(1.0, max(0.0, d / max(window, 1e-5)))
+                if graded < vis:
+                    vis, t_best = graded, t
+    if penumbra > 0.0 and refine and vis < 1.0 and t_best >= 0.0:
+        half_t = 0.5 / steps
+        for r in range(2):
+            m = t_best + (-half_t if r == 0 else half_t)
+            if m <= 0.0 or m > t_end:
+                continue
+            ray_yr = py + (ly - py) * m
+            xr, zr = px + dx * m, pz + dz * m
+            d = 1e30
+            for lo_fn, hi_fn in solids:
+                h_max, h_min = hi_fn(xr, zr), lo_fn(xr, zr)
+                d = min(d, max(h_min + bias - ray_yr,
+                               ray_yr - (h_max - bias)))
+            if d < 0.0:
                 return 0.0
-    return 1.0
+            if m * seg_len > 2.0 * step:
+                window_r = penumbra * min(m / max(1.0 - m, 1e-4),
+                                          t_cap_ratio)
+                vis = min(vis, min(1.0, max(0.0, d / max(window_r, 1e-5))))
+    return vis
+
+
+def march_visibility_centroid(px, py, pz, cx, cy, cz, solids, max_h,
+                              step=MARCH_STEP_CENTROID, bias=MARCH_BIAS,
+                              light_size=LIGHT_SIZE, refine=True):
+    """float64 port of the shader's shadowVisibilityCentroid (M4.0.9):
+    ONE march to the emitter centroid shared by the rig, graded per sample
+    by the half-plane area model g = clamp(0.5 + d/(S*t), 0, 1)."""
+    dx, dz = cx - px, cz - pz
+    horiz = math.sqrt(dx * dx + dz * dz)
+    if horiz < 1e-4:
+        d_v = -1e30
+        for lo_fn, hi_fn in solids:
+            h_max, h_min = hi_fn(px, pz), lo_fn(px, pz)
+            d_v = max(d_v, max(h_min + bias - max(py, cy),
+                               min(py, cy) - (h_max - bias)))
+        return 0.0 if d_v < 0.0 else 1.0
+    if cy > py:
+        t_cap = (max_h - bias - py) / (cy - py)
+        t_cap = min(1.0, max(0.0, t_cap))
+    elif py > max_h - bias:
+        t_cap = 0.0
+    else:
+        t_cap = 1.0
+    t_end = t_cap
+    if light_size > 0.0:
+        dy = cy - py
+        t_end = min(t_cap + light_size * t_cap / dy, 1.0) if dy > 0.0 else 1.0
+    steps = int(horiz / step) + 1
+    seg_len = math.sqrt(dx * dx + dz * dz + (cy - py) * (cy - py))
+    vis, t_best = 1.0, -1.0
+    for s in range(1, steps + 1):
+        t = s / steps
+        if t <= 0.0 or t > t_end:
+            break
+        ray_y = py + (cy - py) * t
+        x, z = px + dx * t, pz + dz * t
+        d = 1e30
+        solid = False
+        for lo_fn, hi_fn in solids:
+            h_max, h_min = hi_fn(x, z), lo_fn(x, z)
+            solid = solid or (h_max > h_min)
+            d = min(d, max(h_min + bias - ray_y, ray_y - (h_max - bias)))
+        if light_size <= 0.0:
+            if d < 0.0:
+                return 0.0
+            continue
+        if cy > py and 0.5 + (ray_y - (max_h - bias)) / \
+                max(light_size * t, 1e-5) >= vis:
+            break
+        traveled = t * seg_len
+        if traveled > 2.0 * step and solid:
+            g = min(1.0, max(0.0,
+                    0.5 + d / max(light_size * min(t, t_cap), 1e-5)))
+            if g < vis:
+                vis, t_best = g, t
+    if light_size > 0.0 and refine and vis < 1.0 and t_best >= 0.0:
+        half_t = 0.5 / steps
+        for r in range(2):
+            m = t_best + (-half_t if r == 0 else half_t)
+            if m <= 0.0 or m > t_end:
+                continue
+            ray_yr = py + (cy - py) * m
+            xr, zr = px + dx * m, pz + dz * m
+            d = 1e30
+            solid = False
+            for lo_fn, hi_fn in solids:
+                h_max, h_min = hi_fn(xr, zr), lo_fn(xr, zr)
+                solid = solid or (h_max > h_min)
+                d = min(d, max(h_min + bias - ray_yr,
+                               ray_yr - (h_max - bias)))
+            if m * seg_len > 2.0 * step and solid:
+                g = min(1.0, max(0.0,
+                        0.5 + d / max(light_size * min(m, t_cap), 1e-5)))
+                vis = min(vis, g)
+    return vis
 
 BLACK_LUM = 8          # <= this (0..255) counts as "essentially black"
 DITHER_LSB = 2.0       # triangular dither tails reach +-1.5 LSB
@@ -187,7 +327,18 @@ def project_all(points, w, h):
 # Specular is intentionally omitted: walls are roughness 0.90 dielectrics,
 # the add is small, and the acceptance band absorbs it (documented above).
 # ---------------------------------------------------------------------------
-def expected_byte(p, n, albedo, solids=(), max_h=MAXH_BOXES):
+def expected_byte(p, n, albedo, solids=(), max_h=MAXH_BOXES, mode=None):
+    """Frozen direct lighting at a probe: the 4x4 flux-preserving grid
+    (Lambert exitance) with the M4.0.9 shadow transport -- per-light soft
+    parallax-window marches (default), or ONE centroid march shared by the
+    rig when mode.centroid is set. Specular is intentionally omitted (the
+    acceptance band absorbs it)."""
+    mode = mode or ShadowMode()
+    centroid_vis = None
+    if mode.centroid:
+        centroid_vis = march_visibility_centroid(
+            p[0], p[1], p[2], 0.0, GRID_Y, 0.0, solids, max_h,
+            step=mode.step, light_size=mode.light_size)
     er, eg, eb = 0.0, 0.0, 0.0
     for gx in GRID_XS:
         for gz in GRID_ZS:
@@ -196,11 +347,15 @@ def expected_byte(p, n, albedo, solids=(), max_h=MAXH_BOXES):
             ndotl = (n[0] * lx + n[1] * ly + n[2] * lz) / dist
             if ndotl <= 0.0:
                 continue
-            vis = march_visibility(p[0], p[1], p[2], gx, GRID_Y, gz,
-                                   solids, max_h)
+            if mode.centroid:
+                vis = centroid_vis
+            else:
+                vis = march_visibility(p[0], p[1], p[2], gx, GRID_Y, gz,
+                                       solids, max_h, step=mode.step,
+                                       penumbra=mode.penumbra)
             if vis <= 0.0:
                 continue
-            e = GRID_I * ndotl / (dist * dist)
+            e = GRID_I * ndotl / (dist * dist) * vis
             er += e * albedo[0]
             eg += e * albedo[1]
             eb += e * albedo[2]
@@ -325,7 +480,7 @@ class Report:
         return fails
 
 
-def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES):
+def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES, mode=None):
     """World-space probes: expected value from the frozen lighting model
     (direct grid + heightfield shadow march)."""
     # Physical albedo per shadow probe, used ONLY by the failure diagnosis
@@ -375,7 +530,16 @@ def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES):
         if q is None or not (0.0 <= q[0] < 1.0 and 0.0 <= q[1] < 1.0):
             rep.add("FAIL", label, "probe projects outside the frame -- camera pin broken")
             continue
-        exp = expected_byte(p, n, alb, solids, max_h)
+        exp = expected_byte(p, n, alb, solids, max_h, mode)
+        # M4.0.9 centroid mode: the documented single-ray blindness puts the
+        # penumbra probe's centroid ray INSIDE the block (hard pierce ->
+        # expected 0), which would turn its band [0.5*exp, 2*exp] inside
+        # out. When the mode's model expects black here, judge absolute-dark
+        # instead -- the same contract the umbra probe already uses.
+        eff_abs_hi = abs_hi
+        if (mode.centroid and label == "tall block penumbra (floor)"
+                and max(exp) <= 2.0):
+            eff_abs_hi = 20.0
         act = patch_median(img, w, h, q[0], q[1], half_frac)
         ok = True
         detail = []
@@ -387,10 +551,11 @@ def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES):
             ch_floor = floor if ch == 0 else floor * 0.25
             lo = max(ch_floor, lo_s * exp[ch] - DITHER_LSB)
             hi = min(255.0, hi_s * exp[ch] + DITHER_LSB)
-            if abs_hi is not None and exp[ch] <= 2.0:
-                # Expected-dark probe (umbra): judge against an absolute
-                # ceiling instead of a band around zero.
-                hi = float(abs_hi)
+            if eff_abs_hi is not None and exp[ch] <= 2.0:
+                # Expected-dark probe (umbra, or the centroid-blinded
+                # penumbra): judge against an absolute ceiling instead of a
+                # band around zero.
+                hi = float(eff_abs_hi)
             if not (lo <= act[ch] <= hi):
                 ok = False
             detail.append("%s %3d (expect %.0f..%.0f)" % (name, act[ch], lo, hi))
@@ -402,7 +567,7 @@ def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES):
             # --no-shadows in the image). Compare against the UNSHADOWED
             # model with the probe's PHYSICAL albedo to classify the failure
             # instead of leaving it unexplained.
-            unsh = expected_byte(p, n, diagnosis_albedo[label], (), max_h)
+            unsh = expected_byte(p, n, diagnosis_albedo[label], (), max_h, mode)
             tol = 3.0
             if all(abs(act_all[c] - unsh[c]) <= tol for c in range(3)):
                 kind = ("DIAGNOSIS: matches the UNSHADOWED model (~%d/%d/%d) "
@@ -427,6 +592,18 @@ def main():
     ap.add_argument("shot", help="deterministic screenshot (PPM, from sandbox --frames/--out)")
     ap.add_argument("--variant", default="cornell01",
                     choices=["cornell01", "cornell02", "cornell03"])
+    ap.add_argument("--shadow-centroid", type=int, default=0, choices=[0, 1],
+                    help="shadow transport of the shot: 0 = per-light soft "
+                         "parallax-window marches (sandbox M4.0.9 default), "
+                         "1 = centroid rig march (--shadow-centroid 1)")
+    ap.add_argument("--shadow-light-size", type=float, default=LIGHT_SIZE,
+                    help="centroid half-plane window S in meters (mirrors "
+                         "--shadow-light-size; 0 = binary centroid march)")
+    ap.add_argument("--shadow-step", type=float, default=None,
+                    help="march step override in meters (mirrors --shadow-step)")
+    ap.add_argument("--shadow-penumbra", type=float, default=PENUMBRA,
+                    help="parallax window scale (mirrors --shadow-penumbra; "
+                         "0 = the exact binary march)")
     ap.add_argument("--expect-md5", default=None,
                     help="fail if the shot's md5 differs (determinism pin for the ledger)")
     args = ap.parse_args()
@@ -493,7 +670,11 @@ def main():
     # -- probes ---------------------------------------------------------------
     solids = solid_intervals(args.variant)
     max_h = MAXH_BAFFLE if args.variant == "cornell03" else MAXH_BOXES
-    check_probes(rep, img, w, h, solids, max_h)
+    mode = ShadowMode(centroid=bool(args.shadow_centroid),
+                      light_size=args.shadow_light_size,
+                      step=args.shadow_step,
+                      penumbra=args.shadow_penumbra)
+    check_probes(rep, img, w, h, solids, max_h, mode)
     # -- color dominance (redundant with probes, but stated as the criterion) --
     q_l = project((BOX[0] * -1 + 0.01, 2.75, -0.6), w, h)
     q_r = project((BOX[0] - 0.01, 2.75, -0.6), w, h)
@@ -515,8 +696,11 @@ def main():
             "ceiling direct-dark (GI gap pin)", "ceiling median R=%d G=%d B=%d must stay <=55 until M8 "
             "indirect lands (only bounce light reaches it; a fake ambient would show here first)" % pc)
     rep.add("GAP", "indirect color bounce (criterion)", "no GI until M8; similarity axis quantifies it vs the reference")
-    rep.add("GAP", "area-light penumbra quality (criterion)", "16 superposed hard shadows approximate the penumbra; "
-            "per-pixel emitter integration is the M5 slot -- similarity axis measures the residue")
+    rep.add("GAP", "area-light penumbra quality (criterion)", "the 4x4 light-grid quadrature + M4.0.9 parallax-window "
+            "grades approximate the penumbra (the M4.0.9 centroid experiment, "
+            "--shadow-centroid 1, is the analytic-SSSS prototype); true "
+            "per-pixel emitter integration is the M5 slot -- the similarity "
+            "axis measures the residue")
     rep.add("INFO", "cornell02/03 extras", "spheres/baffle probes intentionally via the SSIM similarity axis, not this harness")
 
     fails = rep.print()

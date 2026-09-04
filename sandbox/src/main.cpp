@@ -311,23 +311,28 @@ static_assert(kMarchStep < 0.19f,
               "thin occluders become leakable");
 constexpr float kShadowBias = 0.01f;          // ~half a texel height quantum
 
-// M4.0.7: soft-penumbra scale (dimensionless). The 16-light rig is a 4x4
-// QUADRATURE of the area emitter: adjacent lights sit kLightPitch = 0.325 m
-// apart (x/z in {+-0.1625, +-0.4875}) at height kLightHeight = 5.44 m
-// (frozen grid, cornell_scene_gen.h). A point-sample quadrature of an area
-// light under-reconstructs the continuum by a blur of about
-// (pitch/2) * t / height at an occluder t meters along the ray -- so
-// instead of adding light samples (M5's job) or march samples (M4.0.6's
-// linear-cost lever), apply that blur where the march already has every
-// input it needs: the per-sample clearance d and the traveled distance t.
-// Horizon-style soft accumulation costs a few ALU per sample and ZERO extra
-// texture taps; it converts the staircase boundary into a graded edge.
-// Derived, not tuned: kShadowPenumbra = 0.5 * 0.325 / 5.44 ~= 0.0299.
+// M4.0.7: soft-penumbra scale (dimensionless), UPGRADED in place by M4.0.9.
+// The 16-light rig is a 4x4 QUADRATURE of the area emitter: adjacent lights
+// sit kLightPitch = 0.325 m apart (x/z in {+-0.1625, +-0.4875}) at height
+// kLightHeight = 5.44 m (frozen grid, cornell_scene_gen.h). M4.0.7 graded
+// each light against a LINEAR window (scale * traveled, scale = half the
+// pitch over the grid height ~ 0.0299) -- an under-window at deep blockers,
+// which is where the 16-step superposition staircase (the ledger's "blocky
+// penumbra") lived. M4.0.9 grades against the PARALLAX window
+//     w(t) = kShadowPenumbra * t / (1 - t)
+// -- the lateral offset between ADJACENT GRID LIGHTS' shadow edges at
+// blocker depth t (similar triangles through the receiver) -- so each
+// light's grade spans exactly its neighbor's edge offset and the composite
+// becomes the continuous band the area emitter produces. Derived, not
+// tuned: the scale IS the frozen grid pitch (kLightPitch); the reference
+// path tracer integrates visibility over the emitter area whose projected
+// band is exactly that parallax spread (the tall block's top edge alone
+// spans pitch * 3.30 / (5.49 - 3.30) ~ 0.49 m between adjacent rows).
 // 0.0 disables the soft path entirely and reproduces the M4.0.6 binary
 // march byte-for-byte (--shadow-penumbra 0 is the A/B + regression pin).
 constexpr float kLightPitch     = 0.325f;  // frozen 4x4 grid spacing
 constexpr float kLightHeight    = 5.44f;   // frozen grid plane y
-constexpr float kShadowPenumbra = 0.5f * kLightPitch / kLightHeight;
+constexpr float kShadowPenumbra = kLightPitch;
 
 // M4.0.8: bracket refinement of the soft minimum (default ON). Research
 // verdict (docs/SHADOW_EDGE_REFERENCES.md): every shipped heightfield-ray
@@ -337,8 +342,57 @@ constexpr float kShadowPenumbra = 0.5f * kLightPitch / kLightHeight;
 // The refinement engages ONLY where the M4.0.7 window fired (vis < 1), so
 // fully lit and hard-blocked pixels pay nothing and every binary decision
 // (penumbra = 0) is untouched: the --shadow-penumbra 0 md5-replay pins
-// still hold. --shadow-refine 0 reproduces the M4.0.7 soft march exactly.
+// still hold. --shadow-refine 0 reproduces the M4.0.8 soft march exactly
+// (the window itself was upgraded in place by M4.0.9; see kShadowPenumbra).
 constexpr int kShadowRefineDefault = 1;
+
+// M4.0.9: centroid-march rig visibility (the analytic SSSS adaptation).
+// ONE march per pixel to the emitter centroid is shared by the whole 4x4
+// grid -- the per-light BRDF quadrature is unchanged, only the shadow
+// transport collapses 16 marches into 1 -- and the graded penumbra becomes
+// a per-sample HALF-PLANE AREA model keyed to the MEASURED blocker depth
+// (see shadowVisibilityCentroid in shaders.h). Ships as an EXPERIMENT
+// (default OFF): the geometric analysis (docs/SHADOW_EDGE_REFERENCES.md,
+// M4.0.9 section) shows a single ray cannot see the LATERAL penumbra that
+// rim rays produce when they pass BESIDE a convex occluder -- most of the
+// floor band -- so the default transport keeps the 16 per-light rays (now
+// merged by the M4.0.9 parallax window) and the ledger's A/B rows measure
+// whether the centroid path's smoothness wins where its band shape loses.
+constexpr int kShadowCentroidDefault = 0;
+
+// M4.0.9: S for the half-plane window -- the frozen emitter's MEAN EXTENT,
+// derived, not tuned: 0.5 * (1.30 + 1.05) = 1.175 m. The window
+// g = clamp(0.5 + d/(S*t), 0, 1) models the blocker edge as a half-plane
+// cutting the emitter, so S must be the emitter's own extent: the reference
+// path tracer integrates visibility over exactly that area (the true
+// penumbra band of the tall block's top edge alone spans ~1.96 m on the
+// floor = 1.30 * 3.30 / (5.49 - 3.30) by similar triangles). 0 disables
+// grading (binary centroid march).
+constexpr float kShadowLightSize =
+    0.5f * ((cornell::kEmitterMax[0] - cornell::kEmitterMin[0])
+          + (cornell::kEmitterMax[2] - cornell::kEmitterMin[2]));
+static_assert(kShadowLightSize > 0.0f,
+              "emitter extent must be positive (frozen standard)");
+
+// M4.0.9: the centroid path's march cadence. The rig drops from 16 marches
+// per pixel to 1, so the freed budget buys the finest USEFUL cadence: the
+// documented refinement floor ~0.04 m (~1.9 field texels -- steps finer
+// than the capture's 21.5 mm/texel pitch buy no representable information).
+// Still 5x below the baffle-thickness invariant, so the no-leak invariant
+// holds a fortiori.
+constexpr float kCentroidMarchStep = 0.04f;
+static_assert(kCentroidMarchStep < 0.19f,
+              "centroid march step must stay below the baffle's 0.2 m "
+              "thickness or thin occluders become leakable");
+
+// M4.0.9: per-pixel march jitter (Solution A diagnostic, default OFF). The
+// engine has no temporal accumulation (MSAA shades once per pixel), so the
+// jitter's per-pixel value variation ships as grain, not smoothness -- it
+// is the TAA-precondition feature, exposed for A/B only. The jitter shifts
+// BOTH march lattices (the 16 per-light loops and the centroid loop); at
+// the default the added term is exactly +0.0 (bit-identical lattices), so
+// the M4.0.5/M4.0.6 replay pins are unaffected by its existence.
+constexpr int kShadowJitterDefault = 0;
 
 // --- M4.0.4 field REGISTRATION probes (frozen) -----------------------------
 // verifyField() proves the field's aggregate content (coverage %, top,
@@ -719,6 +773,10 @@ int main(int argc, char** argv) {
     float shadowPenumbra = kShadowPenumbra;  // --shadow-penumbra overrides; 0 = binary
     float marchStepOverride = kMarchStep;    // --shadow-step overrides (A/B lever)
     int  shadowRefine = kShadowRefineDefault; // --shadow-refine 0|1 (M4.0.8, soft path only)
+    int  shadowCentroid = kShadowCentroidDefault; // --shadow-centroid 0|1 (M4.0.9)
+    float shadowLightSize = kShadowLightSize; // --shadow-light-size (M4.0.9, centroid path)
+    int  shadowJitter = kShadowJitterDefault; // --shadow-jitter 0|1 (M4.0.9 diagnostic)
+    bool marchStepOverridden = false;         // --shadow-step seen (binds BOTH paths)
     std::string dumpHeightfieldPrefix; // --dump-heightfield p: write <p>_hmax/_hmin.ppm
     int  shadowDebugMode = 0;          // --shadow-debug vis|field|uv (M4.0.5 instrument)
     for (int i = 1; i < argc; ++i) {
@@ -751,10 +809,42 @@ int main(int argc, char** argv) {
             }
         } else if (std::strcmp(argv[i], "--shadow-step") == 0 && i + 1 < argc) {
             marchStepOverride = static_cast<float>(std::atof(argv[++i]));
+            marchStepOverridden = true;
             if (marchStepOverride <= 0.0f || marchStepOverride >= 0.19f) {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-step: '%s' out of range "
                              "(0 < step < 0.19, the baffle-thickness invariant)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-centroid") == 0 && i + 1 < argc) {
+            shadowCentroid = std::atoi(argv[++i]);
+            if (shadowCentroid < 0 || shadowCentroid > 1) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-centroid: '%s' out of range "
+                             "(0 = exact M4.0.8 per-light march, 1 = M4.0.9 "
+                             "centroid rig march)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-light-size") == 0 && i + 1 < argc) {
+            shadowLightSize = static_cast<float>(std::atof(argv[++i]));
+            if (shadowLightSize < 0.0f) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-light-size: negative size '%s' "
+                             "(use 0 = binary centroid march, or a positive "
+                             "extent in meters)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-jitter") == 0 && i + 1 < argc) {
+            shadowJitter = std::atoi(argv[++i]);
+            if (shadowJitter < 0 || shadowJitter > 1) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-jitter: '%s' out of range "
+                             "(0 = deterministic lattice, 1 = per-pixel IGN "
+                             "jitter of both march lattices, diagnostic only "
+                             "-- needs TAA to converge)\n",
                              argv[i]);
                 return 1;
             }
@@ -963,6 +1053,11 @@ int main(int argc, char** argv) {
     // the engine's uniform array; bench_tests pins this).
     std::array<float, 3 * engine::kMaxPointLights> cornellLightPos{};
     std::array<float, 3 * engine::kMaxPointLights> cornellLightRad{};
+    // M4.0.9: emitter centroid = average of the frozen 4x4 grid == the
+    // emitter's center XZ at the grid height. ONE march per pixel ends here
+    // in centroid mode. (kLightPositions is the frozen standard; averaging
+    // keeps this correct if the grid ever changes shape.)
+    std::array<float, 3> centroidPos{};
     if (cornellVariant >= 0) {
         for (std::uint32_t i = 0; i < cornell::kLightCount && i < engine::kMaxPointLights; ++i) {
             cornellLightPos[3 * i + 0] = cornell::kLightPositions[3 * i + 0];
@@ -971,8 +1066,20 @@ int main(int argc, char** argv) {
             cornellLightRad[3 * i + 0] = cornell::kLightIntensity;
             cornellLightRad[3 * i + 1] = cornell::kLightIntensity;
             cornellLightRad[3 * i + 2] = cornell::kLightIntensity;
+            centroidPos[0] += cornell::kLightPositions[3 * i + 0];
+            centroidPos[1] += cornell::kLightPositions[3 * i + 1];
+            centroidPos[2] += cornell::kLightPositions[3 * i + 2];
+        }
+        for (int c = 0; c < 3; ++c) {
+            centroidPos[c] /= static_cast<float>(cornell::kLightCount);
         }
     }
+
+    // M4.0.9: the centroid path defaults to the finer cadence the freed
+    // budget affords (16 marches -> 1); an explicit --shadow-step overrides
+    // BOTH paths so the A/B matrix can compare at equal cadence.
+    const float centroidStep = marchStepOverridden ? marchStepOverride
+                                                   : kCentroidMarchStep;
 
     // --- camera ----------------------------------------------------------------
     engine::Camera camera;
@@ -1222,10 +1329,19 @@ int main(int argc, char** argv) {
                 pbrShader.setFloat3("uShadowFootprintMax",  kRoomHalfX,  kRoomHalfZ, 0.0f);
                 pbrShader.setFloat("uShadowMaxHeight",
                                    variantHasBaffle(cornell.def) ? kOccluderTopBaffle : kOccluderTopBoxes);
-                pbrShader.setFloat("uShadowStep", marchStepOverride);
+                // M4.0.9: the two march paths share the uShadowStep uniform;
+                // each gets its own default cadence (see centroidStep above).
+                pbrShader.setFloat("uShadowStep",
+                                   shadowCentroid == 1 ? centroidStep
+                                                       : marchStepOverride);
                 pbrShader.setFloat("uShadowBias", kShadowBias);
                 pbrShader.setFloat("uShadowPenumbra", shadowPenumbra);
                 pbrShader.setInt("uShadowRefine", shadowRefine);
+                pbrShader.setInt("uShadowCentroid", shadowCentroid);
+                pbrShader.setFloat3("uShadowCentroidPos",
+                                    centroidPos[0], centroidPos[1], centroidPos[2]);
+                pbrShader.setFloat("uShadowLightSize", shadowLightSize);
+                pbrShader.setInt("uShadowJitter", shadowJitter);
             }
         } else {
             pbrShader.setFloat3("uSunDirection", sun.direction);
@@ -1403,16 +1519,38 @@ int main(int argc, char** argv) {
                       : shadowsActive ? "on (heightfield march, field verified + registered)"
                                       : "off (capture failed, verify or registration FAILED)");
         if (cornellVariant >= 0 && shadowsEnabled && shadowsActive) {
-            std::snprintf(lines[n++], 160,
-                          "shadow penumbra: %.4f (%s)  march step: %.3f m%s  "
-                          "refine: %s",
-                          shadowPenumbra,
-                          shadowPenumbra > 0.0f
-                              ? "soft, derived from grid pitch/height"
-                              : "0 = binary march (M4.0.6 regression mode)",
-                          marchStepOverride,
-                          marchStepOverride == kMarchStep ? " (default)" : " (override)",
-                          shadowRefine ? "on (M4.0.8)" : "off (exact M4.0.7)");
+            if (shadowCentroid == 1) {
+                // M4.0.9 mode line (replaces the M4.0.7 penumbra line; the
+                // legacy line prints verbatim under --shadow-centroid 0).
+                std::snprintf(lines[n++], 160,
+                              "shadow mode: centroid march (M4.0.9)  "
+                              "light size: %.3f m (%s)  march step: %.3f m%s  "
+                              "refine: %s  jitter: %s",
+                              shadowLightSize,
+                              shadowLightSize == 0.0f
+                                  ? "0 = binary centroid march"
+                                  : (shadowLightSize == kShadowLightSize
+                                         ? "derived, emitter mean"
+                                         : "override"),
+                              centroidStep,
+                              marchStepOverridden
+                                  ? " (override)"
+                                  : " (centroid default)",
+                              shadowRefine ? "on" : "off",
+                              shadowJitter ? "on (diagnostic grain)" : "off");
+            } else {
+                std::snprintf(lines[n++], 160,
+                              "shadow penumbra: %.4f (%s)  march step: %.3f m%s  "
+                              "refine: %s  jitter: %s",
+                              shadowPenumbra,
+                              shadowPenumbra > 0.0f
+                                  ? "soft parallax window (M4.0.9), scale = grid pitch"
+                                  : "0 = binary march (M4.0.6 regression mode)",
+                              marchStepOverride,
+                              marchStepOverride == kMarchStep ? " (default)" : " (override)",
+                              shadowRefine ? "on (M4.0.8)" : "off (exact M4.0.8 soft)",
+                              shadowJitter ? "on (diagnostic grain)" : "off");
+            }
         }
         if (shadowDebugMode > 0) {
             std::snprintf(lines[n++], 160, "shadow-debug: %s (M4.0.5 instrument -- NOT a ledger image)",

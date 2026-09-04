@@ -19,7 +19,7 @@ after every milestone that touches build / window / input / rendering / assets
       - `math_tests` — **73 checks, 0 failure(s)**
       - `obj_tests` — **24 checks, 0 failure(s)**
       - `brdf_tests` — **38 checks, 0 failure(s)** (M3.2: reference-value suite)
-      - `bench_tests` — **173 checks, 0 failure(s)** (M3.3 frozen pins + M3.3.1 orientation pins + M4 shadow-march/capture-matrix/field-verify pins + M4.0.4 world→texel registration pins + M4.0.7 soft-penumbra graded-path pins + M4.0.8 bracket-refinement pins)
+      - `bench_tests` — **195 checks, 0 failure(s)** (M3.3 frozen pins + M3.3.1 orientation pins + M4 shadow-march/capture-matrix/field-verify pins + M4.0.4 world→texel registration pins + M4.0.7 soft-penumbra graded-path pins + M4.0.8 bracket-refinement pins + M4.0.9 centroid-march / parallax-window / jitter / vertical-column pins)
 - [ ] (Windows) Double-clicking `engine_math_tests.exe` / `engine_obj_tests.exe`
       in Explorer runs the suite and holds the console open with
       "Press Enter to close..." — results stay readable; `ctest` runs are

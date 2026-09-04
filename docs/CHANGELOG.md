@@ -6,6 +6,131 @@ sections Added / Changed / Removed / Deprecated / Fixed as needed.
 
 ---
 
+## 0.4.9 — M4.0.9: the parallax penumbra window + the centroid rig-march experiment (the analytic SSSS adaptation)
+
+User verdict after M4.0.8: the penumbra still reads blocky on hardware. The
+research verdict (docs/SHADOW_EDGE_REFERENCES.md, M4.0.9 section): the
+M4.0.7 window was derived from the grid QUADRATURE BLUR (half pitch over
+height, linear in traveled distance) — an under-window at deep blockers,
+which is exactly where the 16-step superposition staircase lived. The
+reference path tracer integrates visibility over the EMITTER AREA: the true
+penumbra band of the tall block's top edge alone spans ~1.96 m on the floor
+(1.30 · 3.30 / (5.49 − 3.30) by similar triangles), while the M4.0.7 grade
+spanned ~0.17 m. The blockiness was the composite of 16 narrow graded edges,
+not (anymore) the binary quantization M4.0.7 fixed.
+
+### Added
+
+- **`--shadow-centroid 0|1` (M4.0.9 experiment, default 0)** — the
+  analytic SSSS adaptation: ONE heightfield march per pixel to the emitter
+  centroid (average of the frozen 4x4 grid == the emitter's center XZ at
+  the grid plane) shared by the whole rig. The per-light BRDF quadrature
+  (falloff, NoL, GGX) is unchanged — only the shadow transport collapses
+  16 marches into 1 (~16x fewer march taps). The graded penumbra is a
+  per-sample HALF-PLANE AREA model keyed to the measured blocker depth:
+  `g = clamp(0.5 + d / (S·t), 0, 1)` — the blocker edge cuts the emitter,
+  `d = 0` means HALF the emitter visible, `S·t` is the emitter's projected
+  extent at that depth (S derived: 0.5·(1.30 + 1.05) = 1.175 m, the frozen
+  emitter's mean extent). Ships as an EXPERIMENT because the geometric
+  analysis shows a single ray is structurally BLIND to the lateral
+  penumbra that rim rays produce passing BESIDE a convex occluder (most of
+  the floor band); the blind spots are PINNED by bench_tests so they can
+  never be silently "fixed", and the ledger's A/B rows measure whether the
+  smoothness wins where the band shape loses. Includes: the exact
+  vertical-ray column test (the centroid hangs INSIDE the cbox03 baffle
+  footprint — the legacy per-light path could treat that as measure-zero,
+  the centroid cannot), empty-column grade skipping (grading an empty
+  column's huge clearance against the window would pull every far sample
+  toward the half-lit 0.5), and the M4.0.8 bracket refinement reused under
+  the half-plane grade.
+- **`--shadow-light-size <meters>`** (default 1.175, derived) — the
+  centroid half-plane window scale S; 0 = binary centroid march.
+- **`--shadow-jitter 0|1` (default 0, diagnostic)** — Solution A from the
+  research thread: per-pixel IGN jitter of BOTH march lattices — the 16
+  per-light loops AND the centroid loop (+/- half a spacing; spacing
+  unchanged, so the step < occluder-thickness invariant holds; at the
+  default the added term is exactly +0.0, bit-identical to the M4.0.8
+  lattices, so every replay pin is untouched — deep-umbra/lit verdicts are
+  shift-invariant, only boundary samples can flip). Honest
+  limitation documented up front: this engine has NO temporal accumulation
+  (MSAA shades once per pixel), so the jitter ships as per-pixel GRAIN,
+  not smoothness — it is the TAA-precondition feature (M8+ slot),
+  exposed for A/B only.
+- **`--shadow-refine` semantics extended to both soft paths** (the
+  centroid path reuses the M4.0.8 bracket refinement under the half-plane
+  grade; a refined pierce grades dark instead of the legacy hard-0 — the
+  grade IS the contract there).
+- **`testCentroidRigMarch()`** (bench 173 -> 195 checks): centroid binary
+  pins (umbra/lit/top-receiver exact), deep-pierce saturation to exactly 0,
+  the west-wall top-edge band grading monotonically (the geometry the
+  half-plane model CAN see), the z-side blindness pins (pierce -> 0,
+  miss -> 1 — pinned so the limitation is a contract, not a bug),
+  window-scale monotonicity on the clear side (half-size saturates to 1,
+  double-size strictly softer), the tall-ridge refinement fixture (NEW:
+  apex 3.0 m, slope 1.65 m/m, RISING ray — the old horizontal fixture
+  cannot pin the parallax window because a horizontal ray never exits the
+  occluder band and the diverging tail dominates the minimum), the
+  refinement-gate pins (fully-lit exactly 1, pierce exactly 0), jitter
+  pins (graded value changes, binary verdicts unchanged, bounds hold), and
+  the exact vertical-column pins under the baffle.
+
+### Changed
+
+- **The per-light soft window form (the DEFAULT path), in place**:
+  M4.0.7's `graded = d / (scale · traveled)` becomes the PARALLAX form
+  `graded = d / (scale · t / (1 − t))` with the scale RE-DERIVED from the
+  grid pitch (`kShadowPenumbra = kLightPitch = 0.325`; was
+  0.5·pitch/height ≈ 0.0299). w(t) is the lateral offset between ADJACENT
+  GRID LIGHTS' shadow edges at blocker depth t — grading each light over
+  its neighbor's edge offset merges the 16-step superposition staircase
+  into the continuous band the area emitter produces. `--shadow-penumbra`
+  keeps its CLI role (0 = the exact binary march; the A/B brackets are now
+  0.1625 / 0.325 / 0.65).
+- **March span + window cap (both soft paths)**: the parallax window
+  diverges as t → 1, so the march stops at `tEnd = tCap + wCap/(y1−y0)`
+  (tCap = the ray's crossing of maxHeight − bias; wCap = the window there)
+  and the window is CAPPED at wCap — samples above the top edge but within
+  the window still grade (the upper half of the penumbra band), while
+  empty-space samples saturate instead of poisoning the minimum. For
+  `penumbra = 0` the span collapses to tCap, which is sample-for-sample
+  IDENTICAL to the legacy binary early-out
+  (`rayY − (maxHeight − bias) > 0`) — the M4.0.5/M4.0.6 md5-replay pins
+  hold byte-for-byte.
+- The M4.0.7/M4.0.8 soft ledger rows are SUPERSEDED by the M4.0.9 row (the
+  window form changed in place); the binary replay pins are retained
+  byte-exact. `--shadow-refine 0` now reproduces the M4.0.8 soft march
+  under the pre-M4.0.9 window only historically; the ledger records the
+  supersession.
+- Telemetry: the shadow line is mode-aware — `shadow mode: centroid march
+  (M4.0.9) light size: ... march step: ... refine: ... jitter: ...` for the
+  experiment, and the legacy `shadow penumbra: ...` line (now labeled
+  "soft parallax window (M4.0.9), scale = grid pitch") for the default
+  path. Report line count unchanged (14).
+- `tools/verify_cornell_shot.py` is mode-aware: its float64 march mirrors
+  the M4.0.9 form (it was still the M4.0.5-era binary 0.16 m march), gains
+  `--shadow-centroid/--shadow-light-size/--shadow-step/--shadow-penumbra`
+  mirroring the sandbox flags, and judges the penumbra probe
+  absolute-dark under centroid mode (the documented blindness puts that
+  probe's centroid ray inside the block — expectation 0 — which would
+  invert its band). The probe expectations under the DEFAULT mode are
+  unchanged from M4.0.8 (the frozen probes sit on rays the window grades
+  0 or 1 exactly — verified numerically), so the acceptance bands carry
+  over without re-calibration.
+- `bench_tests` count 173 -> 195; VERIFICATION updated.
+
+### Preserved (regression surface untouched)
+
+- `--shadow-penumbra 0` still byte-reproduces the M4.0.6 binary march and
+  the M4.0.5 shot (`e830e543f6be06b9a2b58e6103fcd827`): at scale 0 the new
+  span collapses to the legacy early-out exactly (structural, port-pinned).
+- `--no-shadows` still reproduces the M3.3 direct-only renderer.
+- BRDF, light rig, bias, Cornell geometry, capture: all frozen.
+- The centroid experiment is flag-gated OFF: the default image path is the
+  proven per-light march + the new window (no new uniforms on the hot path
+  beyond two int/float sets).
+
+---
+
 ## 0.4.8 — M4.0.8: bracket refinement (the reference-standard second phase of the march)
 
 User verdict after the first lit march: "no other engine has blocky

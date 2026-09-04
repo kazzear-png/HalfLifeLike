@@ -1,8 +1,79 @@
 # Shadow-edge quality: how shipped engines solve what our marcher hit
 
-**Status:** research verdict, M4.0.8.
+**Status:** research verdict, M4.0.8; extended M4.0.9 (parallax window +
+the centroid rig-march experiment).
 **Question (user):** the blocky penumbra after the first lit march — no other
 engine shows that. Is it a bug, and how do other codebases avoid it?
+
+## M4.0.9 extension: the blockiness after M4.0.8 was the WINDOW, not the march
+
+The external analysis (the "Solution A/B/C" thread) diagnosed two causes:
+the 16-level superposition and iq-form min-accumulation quantization. By
+M4.0.8 the second was addressed (refinement) and the first was HALF-true:
+each light's graded visibility is continuous since M4.0.7, so the
+superposition no longer quantizes to 17 levels — but each of the 16 graded
+edges was still NARROW (the M4.0.7 window scale ≈ 0.0299·traveled ≈ 0.17 m
+at typical depths), and 16 narrow edges offset by the grid pitch compose
+into the structured staircase the ledger measured.
+
+**First-principles check against the reference.** The clean reference
+integrates visibility over the true emitter area. For a straight edge at
+height y_B under an emitter of extent E at height H, the penumbra band on
+the receiver plane spans E · y_B / (H − y_B) (similar triangles): the tall
+block's top edge alone spans 1.30 · 3.30 / (5.49 − 3.30) ≈ 1.96 m on the
+floor; the emitter's z-extent gives 1.05 · 1.54 ≈ 1.62 m. The rig's
+adjacent grid lights are kLightPitch = 0.325 m apart, so their shadow edges
+land ~pitch · y_B / (H − y_B) apart — the 16-superposition staircase has
+~4–5 risers across the physical band. Grading each light over exactly its
+neighbor's edge offset — the PARALLAX window w(t) = pitch · t / (1 − t) —
+merges the staircase into the continuous band. That is M4.0.9's default
+change (one window-form swap, zero extra taps), and it is the same idea
+PCSS formalizes: **blocker distance → penumbra width → filtered visibility**
+(Fernando 2005), with the width derived from the frozen rig instead of
+tuned.
+
+**Why not the literal Solution B (screen-space SSSS)?** Hillaire-style
+SSSS renders a hard shadow mask and blurs it in screen space because a
+shadow map cannot be filtered analytically. This engine's heightfield is
+directly queryable in world space — the blur's effect (neighboring samples'
+visibility averaged over the light's projected extent) is computable
+exactly where the information lives, without a mask prepass, without a
+composite pass (the renderer is forward + MSAA), and without screen-space
+edge artifacts (a screen-space blur bleeds shadows across geometry
+silhouettes; the heightfield grade stays in world space). The heightfield
+adaptation of B is the per-light parallax window (shipped, default) and the
+centroid rig march (shipped, experiment — see below).
+
+**Why the centroid march is an experiment, not the default.** One ray to
+the emitter centroid + a half-plane grade (`g = clamp(0.5 + d/(S·t), 0, 1)`,
+S = the emitter's mean extent 1.175 m) reproduces the top-edge band
+smoothly and cuts the march cost ~16x — but a single ray is structurally
+BLIND to the LATERAL penumbra: rim rays that pass BESIDE a convex
+occluder (the emitter's z-rims past the tall block's z-face) produce
+visibility the ray never measures. Concretely: a floor point at
+z = 0.5 (just south of the block's z-face at 0.35) sees ~40% of the
+emitter past the face rim, while its centroid ray pierces the block face
+below the top → the model returns hard 0. Screen-space SSSS solves this
+with the spatial ensemble (neighboring pixels' rays straddle the edge);
+the 16-light rig solves it with light-domain sampling; the single ray
+cannot. The bench pins the blind spots as a contract, and the ledger's
+A/B rows decide whether the smoothness wins where the band shape loses.
+The M5 slot (true per-pixel emitter integration) retires the question.
+
+**Why not Solution A (jitter) as the default?** The thread's premise —
+"your existing MSAA/TAA will smooth the noise" — is false in this engine:
+there is no TAA, and standard MSAA shades once per pixel, so per-pixel
+jitter ships as static grain. Against a CLEAN 320-spp reference, SSIM
+penalizes grain more than a smooth (slightly mis-shaped) band. The jitter
+ships flag-gated (`--shadow-jitter 1`) as the TAA-precondition diagnostic;
+it shifts BOTH march lattices (the 16 per-light loops and the centroid
+loop), so the A/B row quantifies grain with and without the centroid
+experiment — the first hardware pass proved why that matters: with the
+jitter wired centroid-only, the "without centroid" row silently measured
+nothing (its fps matched the default row exactly).
+Solution C (min-max mip hierarchy / cone stepping) remains the M4.1+
+candidate for the cadence ceiling; the M4.0.9 window work is orthogonal
+to it.
 
 ## Verdict
 
@@ -107,3 +178,15 @@ M4.0.7 shipped 3, M4.0.8 ships 2.
    below ~half a step) stay leakable — the same class the baffle-thickness
    invariant (step < 0.19 m) guards for the frozen scene, and below the
    capture's 21.5 mm/texel meaningful resolution for anything thinner.
+3. M4.0.9: the parallax window diverges as t -> 1; the march span stops at
+   tEnd = tCap + wCap/(y1-y0) and the window caps at wCap. The capped tail
+   is exact where occluders can be (t <= tCap) and saturating beyond — a
+   ray that NEVER exits the occluder band (only the cbox03 under-baffle
+   region) grades against the capped window (wCap ~ 35 m there), which is
+   the physically correct near-black. The default window scale moves the
+   ledger's tuning bracket to --shadow-penumbra 0.1625 / 0.65.
+4. M4.0.9: the centroid experiment's single-ray blindness (lateral
+   penumbra) is pinned in bench_tests as a contract; see the M4.0.9
+   section above. The pin protects the analysis: if a future change makes
+   the "blind" fixtures grade, the model changed and the ledger must
+   re-measure.

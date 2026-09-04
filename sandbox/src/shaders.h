@@ -115,6 +115,29 @@ uniform float uShadowPenumbra;      // M4.0.7: soft-penumbra scale; 0 = exact
 uniform int   uShadowRefine;        // M4.0.8: bracket refinement of the soft
                                     // minimum (0 = exact M4.0.7 soft march).
 
+// --- M4.0.9 centroid rig march (the analytic SSSS adaptation) --------------
+// uShadowCentroid == 1 collapses the rig's 16 per-light marches into ONE
+// march per pixel, from the receiver to the emitter centroid
+// (uShadowCentroidPos). The 16-light BRDF quadrature (irradiance/falloff)
+// is UNCHANGED -- only the shadow transport is shared. The graded penumbra
+// is a per-sample HALF-PLANE AREA model (see shadowVisibilityCentroid):
+// the window scale uShadowLightSize is the frozen emitter's mean extent
+// (derived in main.cpp), replacing the legacy kShadowPenumbra scale (which
+// the per-light path above keeps using untouched).
+uniform int   uShadowCentroid;      // 1 = one centroid march (M4.0.9 default);
+                                    // 0 = exact M4.0.8 per-light path
+uniform vec3  uShadowCentroidPos;   // emitter centroid on the frozen grid
+                                    // plane; FULL vec3 (no .xy pack here --
+                                    // the pack trap is documented at the
+                                    // footprint uniforms above)
+uniform float uShadowLightSize;     // S in the half-plane window; 0 = binary
+                                    // centroid march (no grading)
+uniform int   uShadowJitter;        // M4.0.9 diagnostic (Solution A): per-pixel
+                                    // IGN jitter of BOTH march lattices (the
+                                    // per-light loops and the centroid loop);
+                                    // needs temporal accumulation (TAA, M8+)
+                                    // to converge -- default OFF, A/B only
+
 // --- M4.0.5 shadow-march debug instrument (temporary) ----------------------
 // --shadow-debug vis|field|uv, default OFF (0). All modes REPLACE the shaded
 // image, so they are diagnostic-only: never feed one to the similarity
@@ -230,6 +253,22 @@ float V_SmithGGXCorrelated(float NoV, float NoL, float alpha)
 // binary march (max(a,b) < 0 iff both old inequalities hold; the early-out
 // only skips samples that could never block), so --shadow-penumbra 0 must
 // reproduce that run's md5 byte-for-byte.
+// M4.0.9 WINDOW UPGRADE (in place, soft path only): the M4.0.7 form
+// (scale * traveled, linear in t) under-windowed the deep blockers where
+// the 16-superposition staircase lived -- the ledger's blocky penumbra. The
+// window is now the PARALLAX form
+//     w(t) = uShadowPenumbra * t / (1 - t)
+// with the scale = the frozen grid pitch (kLightPitch, main.cpp): w(t) is
+// the lateral offset between ADJACENT GRID LIGHTS' shadow edges at blocker
+// depth t (similar triangles through the receiver). Grading each light over
+// its neighbor's edge offset merges the 16-step superposition staircase
+// into the continuous band the area emitter produces -- the band the
+// reference path tracer integrates over exactly. Contact stays crisp
+// (w -> 0 as t -> 0) and deep blockers grade wide (the under-baffle
+// darkening is physically real: the cbox03 baffle hangs 4 cm under the
+// grid). The binary path (penumbra == 0) is untouched, so the
+// M4.0.6/M4.0.5 md5-replay pins hold byte-for-byte; the M4.0.7/M4.0.8 soft
+// ledger rows are superseded by the M4.0.9 row.
 // M4.0.8 bracket refinement (uShadowRefine > 0, soft path only): the graded
 // edge is computed from the SAMPLED minimum clearance, and near a silhouette
 // the true minimum sits BETWEEN samples -- the graded value inherits the
@@ -243,7 +282,7 @@ float V_SmithGGXCorrelated(float NoV, float NoL, float alpha)
 // refined fetch landing inside the interval returns the hard 0 (a crossing
 // the cadence jumped over is a real crossing). Binary decisions (penumbra
 // == 0) are untouched, so --shadow-penumbra 0 replay pins hold
-// byte-for-byte, and --shadow-refine 0 reproduces the M4.0.7 soft march
+// byte-for-byte, and --shadow-refine 0 reproduces the M4.0.8 soft march
 // exactly.
 float shadowVisibility(vec3 receiverPos, vec3 lightPos)
 {
@@ -262,6 +301,39 @@ float shadowVisibility(vec3 receiverPos, vec3 lightPos)
     float segLen = distance(receiverPos, lightPos);   // true path length: the
                                                       // penumbra window grows with this
     int steps = int(horiz / uShadowStep) + 1;
+    // M4.0.9 march span. tCap = the path fraction where the ray passes
+    // maxHeight - bias: beyond it no column top can reach the ray, and the
+    // legacy binary early-out (rayY - (maxHeight - bias) > 0) fires at
+    // exactly the same sample -- so the binary path (penumbra == 0) breaks
+    // at tCap and the M4.0.5/M4.0.6 md5-replay pins hold byte-for-byte.
+    // The SOFT path extends to tEnd = tCap + wCap / (y1 - y0), where
+    // wCap = the parallax window at tCap: samples between tCap and tEnd are
+    // ABOVE every column but still WITHIN the grade window of the top edge
+    // (clearance in (0, wCap)), which is the upper half of the penumbra
+    // band -- cutting them would clip the grade at 0.5 and band the edge.
+    // The window is CAPPED at wCap there, so empty-space samples saturate
+    // the grade instead of poisoning it (the uncapped window diverges as
+    // t -> 1).
+    float tCap = 1.0;
+    if (y1 > y0) {
+        tCap = clamp((uShadowMaxHeight - uShadowBias - y0) / (y1 - y0),
+                     0.0, 1.0);
+    } else if (y0 > uShadowMaxHeight - uShadowBias) {
+        tCap = 0.0;
+    }
+    float tEnd = tCap;
+    if (uShadowPenumbra > 0.0) {
+        float wCap = uShadowPenumbra * tCap / max(1.0 - tCap, 1e-4);
+        float dy = y1 - y0;
+        tEnd = (dy > 0.0) ? min(tCap + wCap / dy, 1.0) : 1.0;
+    }
+    // The per-sample window is the parallax form CAPPED at its
+    // occluder-bearing value: beyond tCap the physical parallax keeps
+    // diverging, but there is no deeper blocker to justify it -- the capped
+    // window makes the upper grade band continuous (the grade reaches 1
+    // exactly at tEnd) instead of re-darkening far samples. For tCap = 1
+    // (horizontal synthetic rays) the cap ratio is 1e4 and never binds.
+    float tCapRatio = tCap / max(1.0 - tCap, 1e-4);
     // M4.0.5 BUGFIX: unpack the packed footprint with .xy, NOT .xz. The
     // uniforms carry (worldX, worldZ, pad), so (x, z) = components (0, 1) =
     // .xy. With .xz the span was (maxX - minX, pad - pad) = (5.5, 0.0):
@@ -276,23 +348,27 @@ float shadowVisibility(vec3 receiverPos, vec3 lightPos)
     // not the shader's swizzle. GLSL-only divergences need GPU-side
     // instruments; uShadowDebug below is that instrument.
     vec2 invSpan = 1.0 / (uShadowFootprintMax.xy - uShadowFootprintMin.xy);
+    // M4.0.9 (A/B row 5): the IGN lattice jitter is shared by BOTH march
+    // lattices -- the per-light loop here and the centroid loop below. At
+    // the default (uShadowJitter == 0) jitterOff is exactly 0.0 and
+    // (s + 0.0)/steps == s/steps bit-for-bit in IEEE-754, so every replay
+    // pin is untouched -- the flag can only ever move the diagnostic path.
+    float jitterOff = 0.0;
+    if (uShadowJitter == 1) {
+        float noise = fract(sin(dot(gl_FragCoord.xy,
+                                    vec2(12.9898, 78.233))) * 43758.5453);
+        jitterOff = noise - 0.5;   // +/- half a sample spacing
+    }
     float vis = 1.0;   // M4.0.7 soft accumulator (1 = fully lit)
     float tBest = -1.0;   // M4.0.8: t of the sample that last lowered vis
     for (int s = 1; s <= steps; ++s) {
-        float t = float(s) / float(steps);
+        float t = (float(s) + jitterOff) / float(steps);
         float rayY = mix(y0, y1, t);
-        // M4.0.7: penumbra-aware early-out. No column's top exceeds
-        // uShadowMaxHeight, so a sample's GLOBAL clearance lower bound is
-        // rayY - (uShadowMaxHeight - uShadowBias); every future sample's
-        // clearance is at least that (the ray rises), and every future
-        // penumbra window is at most uShadowPenumbra * segLen (t <= 1).
-        // Once the bound exceeds the largest window, no future sample can
-        // lower vis. With uShadowPenumbra == 0 this breaks one bias EARLIER
-        // than the M4.0.6 early-out -- strictly on samples whose interval
-        // test could never fire (blocking needs rayY < hMax - bias <=
-        // maxHeight - bias) -- so the binary image is unchanged.
-        if (rayY - (uShadowMaxHeight - uShadowBias) > uShadowPenumbra * segLen) {
-            break;    // above every occluder's reach for the rest of the ray
+        // M4.0.9: stop at the path span computed above -- tCap for the
+        // binary path (byte-identical to the legacy early-out), tEnd for
+        // the soft path (covers the upper grade band, window capped).
+        if (t > tEnd) {
+            break;
         }
         // .xy, not .xz: the pack is (worldX, worldZ, pad) -- M4.0.5 BUGFIX.
         vec2 uv = (mix(p0, p1, t) - uShadowFootprintMin.xy) * invSpan;
@@ -309,16 +385,20 @@ float shadowVisibility(vec3 receiverPos, vec3 lightPos)
         if (uShadowPenumbra > 0.0) {
             float traveled = t * segLen;
             if (traveled > 2.0 * uShadowStep) {
-                // Horizon-style soft accumulation: a sample that merely
-                // GRAZES the interval (clearance small against a penumbra
-                // window growing with distance traveled) shades partially
-                // instead of flipping hard. The 2*step start zone keeps the
-                // receiver's own neighborhood binary: contact shadows stay
-                // crisp (physically correct) and a receiver standing on an
-                // occluder top cannot self-shade (the acne the bias also
-                // guards). Scale derivation: kShadowPenumbra in main.cpp.
-                float graded = clamp(d / max(uShadowPenumbra * traveled, 1e-5),
-                                     0.0, 1.0);
+                // M4.0.9 parallax window (upgrades the M4.0.7 linear form in
+                // place -- see the contract note above): a sample that
+                // merely GRAZES the interval shades partially against the
+                // lateral offset between adjacent grid lights' shadow edges
+                // at this blocker depth, merging the 16-step superposition
+                // staircase into the continuous area-emitter band. The
+                // 2*step start zone keeps the receiver's own neighborhood
+                // binary: contact shadows stay crisp (physically correct)
+                // and a receiver standing on an occluder top cannot
+                // self-shade (the acne the bias also guards). Scale
+                // derivation: kShadowPenumbra in main.cpp.
+                float window = uShadowPenumbra *
+                    min(t / max(1.0 - t, 1e-4), tCapRatio);
+                float graded = clamp(d / max(window, 1e-5), 0.0, 1.0);
                 if (graded < vis) {
                     vis = graded;   // min(), plus the argmin t for M4.0.8
                     tBest = t;
@@ -336,14 +416,10 @@ float shadowVisibility(vec3 receiverPos, vec3 lightPos)
         float halfT = 0.5 / float(steps);
         for (int r = 0; r < 2; ++r) {
             float m = tBest + ((r == 0) ? -halfT : halfT);
-            if (m <= 0.0 || m >= 1.0) {
+            if (m <= 0.0 || m > tEnd) {
                 continue;
             }
             float rayYr = mix(y0, y1, m);
-            if (rayYr - (uShadowMaxHeight - uShadowBias) >
-                uShadowPenumbra * segLen) {
-                continue;
-            }
             // .xy, not .xz: the pack is (worldX, worldZ, pad) -- M4.0.5.
             vec2 uvR = (mix(p0, p1, m) - uShadowFootprintMin.xy) * invSpan;
             float hMaxR = texture(uShadowHeightsMax, uvR).r;
@@ -355,9 +431,192 @@ float shadowVisibility(vec3 receiverPos, vec3 lightPos)
             }
             float traveledR = m * segLen;
             if (traveledR > 2.0 * uShadowStep) {
+                float windowR = uShadowPenumbra *
+                    min(m / max(1.0 - m, 1e-4), tCapRatio);
                 vis = min(vis,
-                          clamp(dR / max(uShadowPenumbra * traveledR, 1e-5),
-                                0.0, 1.0));
+                          clamp(dR / max(windowR, 1e-5), 0.0, 1.0));
+            }
+        }
+    }
+    return vis;
+}
+
+// M4.0.9 centroid rig visibility: ONE march per pixel, receiver -> emitter
+// centroid, shared by the whole 4x4 grid (the per-light BRDF quadrature in
+// main() is unchanged). This is the heightfield adaptation of the industry
+// Solution-B structure (one shadow test per pixel + analytic penumbra from
+// the measured blocker, PCSS-style) -- the screen-space blur variant is the
+// wrong tool HERE because the heightfield is directly queryable in world
+// space (see docs/SHADOW_EDGE_REFERENCES.md, M4.0.9 section).
+//
+// Grading model (half-plane area approximation). A sample at path fraction
+// t reports its signed clearance d to the column interval; the emitter's
+// projected angular diameter at that blocker depth is S * t (S =
+// uShadowLightSize, similar triangles along the ray). Modelling the blocker
+// edge as a half-plane cutting the emitter, the visible fraction is
+//   g = clamp(0.5 + d / (S * t), 0, 1)
+// -- d = 0 (edge through the centroid direction) means HALF the emitter is
+// visible, d = +S*t means fully lit, d = -S*t fully blocked. The 0.5 offset
+// is what reconstructs the OUTER penumbra: a receiver whose centroid ray
+// PIERCES an occluder but sits near its silhouette still sees the emitter
+// rim (g in (0, 0.5)) -- the same tail a screen-space Gaussian blur of the
+// binary mask would produce, computed analytically in world space.
+// Documented approximation: d is the VERTICAL clearance while the angular
+// model wants the ray-perpendicular offset (they differ by cos(phi), phi =
+// ray angle from vertical, <= ~28 deg for the frozen rig -> <= ~12%
+// effective window error, uniform-ish, absorbed into the derived S).
+// vis = min over samples of g. Near-receiver samples saturate the grade
+// (d small, S*t smaller) exactly like the legacy 2*step start zone: contact
+// shadows stay crisp and a receiver on an occluder top cannot self-shade,
+// with no separate start-zone special case.
+//
+// Early-out (soft path): future samples' clearance is at least
+// B(t) = rayY - (maxHeight - bias) (column tops capped, ray rising), so the
+// future grade is at least 0.5 + B(t)/(S*t), which RISES with t (the
+// B0/t term decays); once it reaches vis, no future sample can lower vis.
+// Binary path (S == 0): legacy semantics -- first d < 0 returns the hard 0,
+// and the march breaks once the ray is above every occluder.
+//
+// Jitter (uShadowJitter, Solution A diagnostic): BOTH march lattices -- the
+// 16 per-light loops above and the centroid loop below -- are shifted
+// per-pixel by +/- half a spacing (interleaved-gradient-noise hash).
+// Spacing is unchanged, so the step < occluder-thickness invariant still
+// holds; deep-umbra and fully-lit verdicts are shift-invariant (only
+// boundary samples can flip, which is the point of the diagnostic). The
+// resulting per-pixel value variation is GRAIN by construction -- without
+// temporal accumulation (TAA, M8+) it does not average out, which is why
+// this ships default-OFF.
+//
+// Bracket refinement (uShadowRefine, same flag as M4.0.8): two extra fetch
+// pairs at t_best +/- half-step re-evaluate the grade at half-step
+// resolution, engaged only where the window fired (vis < 1). A refined
+// sample grading below the march value lowers vis (monotone-safe); there is
+// no hard-0 special case here because the half-plane grade IS the
+// contract -- a refined pierce simply grades dark.
+float shadowVisibilityCentroid(vec3 receiverPos, vec3 lightPos)
+{
+    if (uShadowDebug != 0) {
+        g_dbgCalls += 1.0;   // instrument only: tells field mode the march ran
+    }
+    vec2  p0    = receiverPos.xz;
+    vec2  p1    = lightPos.xz;
+    vec2  delta = p1 - p0;
+    float horiz = length(delta);
+    float y0 = receiverPos.y;
+    float y1 = lightPos.y;
+    // .xy, not .xz: the pack is (worldX, worldZ, pad) -- M4.0.5 BUGFIX.
+    vec2 invSpan = 1.0 / (uShadowFootprintMax.xy - uShadowFootprintMin.xy);
+    if (horiz < 1e-4) {
+        // Vertical ray: the whole segment shares the receiver's column.
+        // The legacy per-light path could treat this as measure-zero (no
+        // frozen grid light sits exactly above a receiver), but the CENTROID
+        // hangs inside the cbox03 baffle footprint, so the vertical case is
+        // tested exactly against the column interval. Binary verdict: the
+        // pierce depth has no path-fraction scale on a degenerate lattice.
+        vec2 uvV = (p0 - uShadowFootprintMin.xy) * invSpan;
+        float hMaxV = texture(uShadowHeightsMax, uvV).r;
+        float hMinV = texture(uShadowHeightsMin, uvV).r;
+        float dV = max(hMinV + uShadowBias - max(y0, y1),
+                       min(y0, y1) - (hMaxV - uShadowBias));
+        return (dV < 0.0) ? 0.0 : 1.0;
+    }
+    float segLen = distance(receiverPos, lightPos);
+    int steps = int(horiz / uShadowStep) + 1;
+    // M4.0.9 march span (mirrors the legacy path): tCap for the binary
+    // path (light size 0), tEnd = tCap + wCap / (y1 - y0) for the soft
+    // path -- the upper grade band above the top edge, window capped at
+    // its occluder-bearing value wCap = lightSize * tCap (the half-plane
+    // window lightSize * t is bounded, but the cap keeps the tEnd span
+    // tight and the semantics identical to the legacy path).
+    float tCap = 1.0;
+    if (y1 > y0) {
+        tCap = clamp((uShadowMaxHeight - uShadowBias - y0) / (y1 - y0),
+                     0.0, 1.0);
+    } else if (y0 > uShadowMaxHeight - uShadowBias) {
+        tCap = 0.0;
+    }
+    float tEnd = tCap;
+    if (uShadowLightSize > 0.0) {
+        float wCap = uShadowLightSize * tCap;
+        float dy = y1 - y0;
+        tEnd = (dy > 0.0) ? min(tCap + wCap / dy, 1.0) : 1.0;
+    }
+    float jitterOff = 0.0;
+    if (uShadowJitter == 1) {
+        float noise = fract(sin(dot(gl_FragCoord.xy,
+                                    vec2(12.9898, 78.233))) * 43758.5453);
+        jitterOff = noise - 0.5;   // +/- half a sample spacing
+    }
+    float vis   = 1.0;   // min of the per-sample grades (1 = fully lit)
+    float tBest = -1.0;  // argmin sample, for the bracket refinement
+    for (int s = 1; s <= steps; ++s) {
+        float t = (float(s) + jitterOff) / float(steps);
+        if (t <= 0.0 || t > tEnd) {
+            break;   // jitter can push the lattice past the light
+        }
+        float rayY = mix(y0, y1, t);
+        // .xy, not .xz: the pack is (worldX, worldZ, pad) -- M4.0.5 BUGFIX.
+        vec2 uv = (mix(p0, p1, t) - uShadowFootprintMin.xy) * invSpan;
+        float hMax = texture(uShadowHeightsMax, uv).r;
+        float hMin = texture(uShadowHeightsMin, uv).r;
+        float d = max(hMin + uShadowBias - rayY, rayY - (hMax - uShadowBias));
+        if (uShadowLightSize <= 0.0) {
+            // Binary centroid march (light size 0): exact legacy semantics.
+            if (d < 0.0) {
+                return 0.0;
+            }
+            continue;
+        }
+        // Soft path early-out (see the contract note above): the bound
+        // 0.5 + B(t)/(S*t) rises monotonically in t (the B0/t term decays),
+        // so once it reaches vis no future sample -- empty columns are
+        // skipped below -- can lower vis. y1 > y0 holds for the whole
+        // frozen rig; a descending ray simply marches to the end.
+        if (y1 > y0 &&
+            0.5 + (rayY - (uShadowMaxHeight - uShadowBias)) /
+                  max(uShadowLightSize * t, 1e-5) >= vis) {
+            break;
+        }
+        float traveled = t * segLen;
+        if (traveled > 2.0 * uShadowStep && hMax > hMin) {
+            // Same 2*step start zone as the legacy path; and ONLY a real
+            // column interval grades -- an empty column has no edge to
+            // graze, and grading its huge clearance against the window
+            // would pull every far sample toward the half-lit 0.5.
+            // Window: the half-plane form capped at tCap (the band above
+            // the top edge grades against the occluder-bearing window).
+            float g = 0.5 + d / max(uShadowLightSize * min(t, tCap), 1e-5);
+            g = clamp(g, 0.0, 1.0);
+            if (g < vis) {
+                vis = g;     // min(), plus the argmin t for the refinement
+                tBest = t;
+            }
+        }
+    }
+    // Bracket refinement (see the contract note above): two fetch pairs at
+    // half-step offsets around the worst sample, same grade, same start
+    // zone. A refined pierce grades dark; the refinement can only lower vis
+    // toward the true minimum, never raise it.
+    if (uShadowLightSize > 0.0 && uShadowRefine > 0.5 && vis < 1.0 &&
+        tBest >= 0.0) {
+        float halfT = 0.5 / float(steps);
+        for (int r = 0; r < 2; ++r) {
+            float m = tBest + ((r == 0) ? -halfT : halfT);
+            if (m <= 0.0 || m > tEnd) {
+                continue;
+            }
+            float rayYr = mix(y0, y1, m);
+            // .xy, not .xz: the pack is (worldX, worldZ, pad) -- M4.0.5.
+            vec2 uvR = (mix(p0, p1, m) - uShadowFootprintMin.xy) * invSpan;
+            float hMaxR = texture(uShadowHeightsMax, uvR).r;
+            float hMinR = texture(uShadowHeightsMin, uvR).r;
+            float dR = max(hMinR + uShadowBias - rayYr,
+                           rayYr - (hMaxR - uShadowBias));
+            float traveledR = m * segLen;
+            if (traveledR > 2.0 * uShadowStep && hMaxR > hMinR) {
+                float gR = clamp(0.5 + dR / max(uShadowLightSize * min(m, tCap), 1e-5),
+                                 0.0, 1.0);
+                vis = min(vis, gR);
             }
         }
     }
@@ -474,6 +733,11 @@ void main()
     // --- point lights ---
     // M4: the shadow test runs only after the NoL > 0 guard -- backfacing
     // lights must not pay for texture fetches (half the grid on average).
+    // M4.0.9 centroid mode: ONE march to the emitter centroid is shared by
+    // the whole rig -- the per-light BRDF quadrature (falloff, NoL, GGX) is
+    // UNCHANGED, only the shadow transport collapses 16 marches into 1.
+    float rigVis     = 1.0;
+    bool  rigMarched = false;
     for (int i = 0; i < 16; ++i) {
         if (i >= uPointCount) break;
         vec3  toLight = uPointPos[i] - vWorldPos;
@@ -482,8 +746,19 @@ void main()
         if (dot(N, L) <= 0.0) {
             continue;
         }
-        float vis = (uShadowOn == 1)
-            ? shadowVisibility(vWorldPos, uPointPos[i]) : 1.0;
+        float vis = 1.0;
+        if (uShadowOn == 1) {
+            if (uShadowCentroid == 1) {
+                if (!rigMarched) {
+                    rigVis = shadowVisibilityCentroid(vWorldPos,
+                                                      uShadowCentroidPos);
+                    rigMarched = true;
+                }
+                vis = rigVis;
+            } else {
+                vis = shadowVisibility(vWorldPos, uPointPos[i]);
+            }
+        }
         if (uShadowDebug != 0) {
             g_dbgMinVis = min(g_dbgMinVis, vis);   // instrument only
         }
@@ -527,7 +802,7 @@ void main()
         vec2 uvDbg      = (vWorldPos.xz - uShadowFootprintMin.xy) * invSpanDbg;
         float hDbg      = texture(uShadowHeightsMax, uvDbg).r;
         FragColor = vec4(clamp(hDbg / max(uShadowDebugNorm, 1e-4), 0.0, 1.0),
-                         min(g_dbgCalls / 16.0, 1.0),
+                         min(g_dbgCalls / 16.0, 1.0),   // centroid: 1 call -> 1/16
                          clamp(uShadowMaxHeight / 6.0, 0.0, 1.0), 1.0);
         return;
     }

@@ -55,7 +55,9 @@ innovation slot sits above it — in how the renderer chooses to solve lighting
   standard in three variants, a deterministic `--benchmark` mode (VSync off,
   fixed camera/lights/exposure, GPU timer queries, full telemetry), a
   reference path tracer, **heightfield shadows for the rig (M4,
-  `--no-shadows` for A/B)**, and a full metric suite (RMSE, MAE, SSIM,
+  `--no-shadows` for A/B; M4.0.9 parallax-window penumbra derived from the
+  frozen rig; `--shadow-centroid 1` analytic-SSSS experiment; `--shadow-jitter`
+  TAA-precondition diagnostic)**, and a full metric suite (RMSE, MAE, SSIM,
   ΔE2000, edge/shadow error) against a clean 320-spp reference. Every
   renderer change gets measured against the same room. See
   `benchmarks/cornell_box/README.md`.
@@ -155,7 +157,7 @@ ctest --test-dir build --output-on-failure
 # math_tests: 73 checks, 0 failure(s)
 # obj_tests:  24 checks, 0 failure(s)
 # brdf_tests: 38 checks, 0 failure(s)
-# bench_tests: 100 checks, 0 failure(s)
+# bench_tests: 195 checks, 0 failure(s)
 ```
 
 ### Run the Cornell Box benchmark
@@ -277,6 +279,15 @@ the BRDF). Nothing shading-related ships before its reference exists.
   march in the PBR shader, 16-superposition penumbra; `--no-shadows` A/B;
   clean 320-spp reference set + MAE/ΔE2000/edge-error metric suite;
   positive umbra/penumbra acceptance probes.~~ ✅
+- ~~M4.0.5..M4.0.8 — shadow hotfixes: uv swizzle (the inert march), step
+  halving, soft penumbra extraction, bracket refinement.~~ ✅
+- **M4.0.9** — the parallax penumbra window (the penumbra scale re-derived
+  from the frozen rig's geometry: the window spans the adjacent grid
+  lights' edge offset, merging the 16-step superposition into the
+  physical area-light band) + the `--shadow-centroid 1` analytic-SSSS
+  experiment (one centroid march per pixel, half-plane grade, ~16x fewer
+  march taps; flag-gated pending the ledger's A/B) + the
+  `--shadow-jitter` TAA-precondition diagnostic.
 - **M5** — Area-light approximation: per-pixel emitter visibility
   integration over the rig (retiring the 16-superposition penumbra
   residue), plus the scene/material abstraction it requires (`Light` /

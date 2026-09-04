@@ -70,6 +70,7 @@ point: the ledger quantifies exactly what M5 (area-light integration), M6
 | M4.0.1 (first hardware attempt) | **51.32** | — | — | *not reported* | *not reported* | **REJECTED** (gate: 17/19 probes, 2 shadow probes FAIL). Shot md5 `5e549b5417311b93fe729e7989184aeb`, 960×540. Metrics: RMSE 71.88, MAE 46.13, SSIM 0.5132, ΔE2000 18.04, edge/shadow RMSE 80.03. **Diagnosis (M4.0.2):** both failing probes read byte-identical to the harness's UNSHADOWED model (umbra meas 50/6/5 vs unshadowed 51/4/2; penumbra meas 105/103/100 vs 105/103/101) — the march never blocked a single light in this run. Row kept as the honest pre-instrumentation measurement; re-measure with M4.0.2 (field verification + honest telemetry + harness failure diagnosis). |
 | M4.0.2 (verification instrument) | **51.32** | — | — | *not reported* | *not reported* | **REJECTED** (same gate) — image identical to M4.0.1 as the bug predicts: SSIM 0.51318, RMSE 71.875, edge RMSE 80.030. FPS at the 960×540 compare run: 1523.6. **Instrument value:** first hardware proof the CAPTURE works — console `field verify OK`: coverage 15.65 % ∈ [10.87, 20.87], top 3.299 m (expected 3.30), intervals valid. But the verdict never reached `shadowsActive` (the out-param was never written; fixed in M4.0.3), so the caller reported FAILED, the march stayed off, and the telemetry honestly said so. Re-measure with M4.0.3. |
 | M4.0.5 (march swizzle fix: first LIT march) | **52.62** | — | — | *to measure* | *to measure* | **ACCEPTED** (gate: 19 pass / 0 fail / 2 documented gaps M5+M8). Shot md5 `e830e543f6be06b9a2b58e6103fcd827`, 960×540: RMSE 72.25, MAE 45.37, SSIM 0.52622, ΔE2000 17.98, edge/shadow RMSE 80.00. FPS 1089.2 @ 960×540, 300 frames (GPU 0.583 ms avg, vsync off, warmup 30 discarded). **Root cause of the M4.0.1/M4.0.2 inert march:** `.xz` vs `.xy` swizzle on the packed footprint uniforms — uv.y went to ±inf and clamped to the field's empty edge rows, so every fetch returned an empty column forever. Capture verified again this run (coverage 15.65 %, top 3.299 m, registration probes 7/7, `--dump-heightfield` clean). Shadows now visibly land: tall-block umbra on the red wall, floor penumbra, harness shadow probes pass. **Known defect:** shadow boundaries quantized into staircase bands, pitch tracks the 0.16 m march cadence (7.4 field texels; samplers already GL_LINEAR, so filtering is ruled out) → M4.0.6 halves kMarchStep to 0.08 m as a single change. |
+| M4.0.9 (parallax penumbra window + centroid experiment) | *captures pending — re-run the matrix with the corrected `out/` protocol (the first pass's `/tmp` writes all failed on Windows)* | *pending* | *pending* | *to measure* | *to measure* | The DEFAULT soft window form is upgraded in place: `w(t) = pitch·t/(1−t)` (the adjacent grid lights' edge offset at blocker depth; scale re-derived = kLightPitch 0.325; derivation in docs/SHADOW_EDGE_REFERENCES.md) merges the 16-step superposition staircase into the physical area-emitter band (~1.62–1.96 m on the floor — the M4.0.7 grade spanned ~0.17 m); binary replay pins hold byte-exact (the span collapses to the legacy early-out at scale 0). **COST axis of the A/B matrix measured** (first hardware pass, Debug build, 960×540, 300 frames, GPU timer avg): binary pin **474.6 fps / 1.237 ms** · default parallax **314.7 / 2.266** · half-pitch **337.4 / 2.141** · double-pitch **304.6 / 2.316** · centroid S=1.175 **663.9 / 0.719** · centroid binary **612.9 / 0.553** · jitter row **INVALID as run** (the flag was centroid-only in that build; fps 312.9 ≈ the default row proves the no-op — jitter now shifts both lattices in shaders.h, telemetry prints the state on both mode lines; re-run). Readings: (1) the physical window's true cost is **+83 % GPU over binary** — soft visibility defeats the hard early-out AND tEnd extends the march past tCap; (2) window scale is nearly **cost-flat** (2.141 → 2.316 ms across 0.1625 → 0.65), so the default scale must be decided on **similarity alone**; (3) the centroid experiment delivers the promised ~16× tap cut as **−42 % GPU vs even the binary row** (0.719 vs 1.237 ms) and −68 % vs the default soft row, at the documented lateral-band blindness — its fate is decided by the pending SSIM cells, not by cost; (4) do NOT compare these FPS against the M4.0.5 row's 1089.2 (different build config) — GPU ms is the only cross-entry metric. |
 
 ### Protocol (copy-paste)
 
@@ -130,6 +131,39 @@ python3 tools/benchmark_compare.py /tmp/cbox01.ppm \
 ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540                        --out /tmp/ab2_soft008.ppm
 ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-step 0.16     --out /tmp/ab3_soft016.ppm
 ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-penumbra 0 --shadow-step 0.16 --out /tmp/ab4_binary016.ppm
+# M4.0.9 A/B matrix (the parallax window is ON by default; every row records
+# similarity + edge/shadow RMSE + GPU ms + md5):
+#   1. binary replay (regression pin): --shadow-penumbra 0 must byte-match
+#      the M4.0.6 binary run's md5 (the M4.0.9 span collapses to the legacy
+#      early-out at scale 0 -- structural, port-pinned);
+#   2. M4.0.9 default (parallax window, scale = grid pitch 0.325): the
+#      quality row -- expected to dominate every earlier soft row on
+#      edge/shadow RMSE (the window now spans the physical band the
+#      reference integrates over);
+#   3. window bracket: --shadow-penumbra 0.1625 (half pitch) and 0.65
+#      (double pitch) -- decides the default scale on hardware;
+#   4. the centroid EXPERIMENT rows (--shadow-centroid 1; plus
+#      --shadow-light-size 0.65 / 2.0 brackets, and --shadow-centroid 1
+#      --shadow-light-size 0 for the binary-centroid cost row): measured
+#      for the 16x march-cost reduction vs the documented lateral-band
+#      loss -- NOT candidates for the default without a similarity win;
+#   5. jitter diagnostic (--shadow-jitter 1, with and without the
+#      centroid experiment): grain vs SSIM on a STILL image -- expected to
+#      regress SSIM without TAA; the row quantifies the TAA payoff.
+# HARDWARE NOTE (first M4.0.9 pass): /tmp does not exist on Windows cmd and
+#   fopen() will not create directories -- all seven captures failed to
+#   write ("Cannot open ... for writing") while the perf numbers printed
+#   fine. Write captures into out/ under the repo root (create it first) or
+#   any other EXISTING directory:
+mkdir -p out                     # bash/WSL -- Windows cmd:  mkdir out
+./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-penumbra 0                          --out out/m9_ab1_binary.ppm
+./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540                                              --out out/m9_ab2_default.ppm
+./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-penumbra 0.1625                     --out out/m9_ab3a_halfpitch.ppm
+./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-penumbra 0.65                       --out out/m9_ab3b_doublepitch.ppm
+./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-centroid 1                          --out out/m9_ab4_centroid.ppm
+./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-centroid 1 --shadow-light-size 0    --out out/m9_ab4b_centroid_binary.ppm
+./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-jitter 1                            --out out/m9_ab5_jitter.ppm
+./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-centroid 1 --shadow-jitter 1        --out out/m9_ab5b_centroid_jitter.ppm
 ```
 
 Row template:
