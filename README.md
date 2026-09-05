@@ -6,7 +6,7 @@ Renders a physically based, HDR-lit scene through a real 3D pipeline
 Wavefront OBJ models at runtime, and ships with an event-driven input system
 and an FPS-style fly camera.
 
-**Current milestone:** M4 — *heightfield shadows for the Cornell rig + clean-reference methodology (320-spp measurement target, full metric suite)*.
+**Current milestone:** M5.0.1 — *the true area light (M5.0) plus exact-reject fast paths: blockers that provably reach no piece skip hull + carve entirely, so clear-sight pixels pay near-march cost while shadowed pixels keep the full exact machinery (CSM adjudicated not-applicable; the 0.5.1-draft IE rewrite rejected on hardware and reverted)*.
 
 **Research direction:** *"How far can a small renderer push perceptual realism
 through intelligent approximation rather than brute-force computation?"*
@@ -56,8 +56,16 @@ innovation slot sits above it — in how the renderer chooses to solve lighting
   fixed camera/lights/exposure, GPU timer queries, full telemetry), a
   reference path tracer, **heightfield shadows for the rig (M4,
   `--no-shadows` for A/B; M4.0.9 parallax-window penumbra derived from the
-  frozen rig; `--shadow-centroid 1` analytic-SSSS experiment; `--shadow-jitter`
-  TAA-precondition diagnostic)**, and a full metric suite (RMSE, MAE, SSIM,
+  frozen rig; `--shadow-centroid 1` analytic-SSSS experiment;
+  `--shadow-jitter` TAA-precondition diagnostic; M4.0.9.1 analytic lateral
+  half-plane closing the centroid path's lateral blindness,
+  `--shadow-lateral 0` reproduces M4.0.9 bit-for-bit)**, **the true area
+  light (M5.0: the emitter is the frozen 1.30 x 1.05 m patch, transported as
+  the exact visible-patch form factor under analytic backprojection
+  visibility — zero texture taps, zero noise, exact multi-blocker unions;
+  `--area-light 0` keeps the legacy grid transport and every replay pin)**,
+  and a full metric
+  suite (RMSE, MAE, SSIM,
   ΔE2000, edge/shadow error) against a clean 320-spp reference. Every
   renderer change gets measured against the same room. See
   `benchmarks/cornell_box/README.md`.
@@ -281,19 +289,45 @@ the BRDF). Nothing shading-related ships before its reference exists.
   positive umbra/penumbra acceptance probes.~~ ✅
 - ~~M4.0.5..M4.0.8 — shadow hotfixes: uv swizzle (the inert march), step
   halving, soft penumbra extraction, bracket refinement.~~ ✅
-- **M4.0.9** — the parallax penumbra window (the penumbra scale re-derived
-  from the frozen rig's geometry: the window spans the adjacent grid
-  lights' edge offset, merging the 16-step superposition into the
-  physical area-light band) + the `--shadow-centroid 1` analytic-SSSS
-  experiment (one centroid march per pixel, half-plane grade, ~16x fewer
-  march taps; flag-gated pending the ledger's A/B) + the
-  `--shadow-jitter` TAA-precondition diagnostic.
-- **M5** — Area-light approximation: per-pixel emitter visibility
-  integration over the rig (retiring the 16-superposition penumbra
-  residue), plus the scene/material abstraction it requires (`Light` /
-  `AreaLight` / `MeshInstance` objects, a real `scene.json` loader retiring
-  the generated Cornell header). General omnidirectional shadowing
-  (cube/point maps) lands here too, for non-heightfield scenes.
+- **M4.0.9** — the parallax penumbra window, scale decided by the hardware
+  A/B matrix: the 4x4 grid's own parallax already synthesizes the physical
+  band, so the per-light window only de-quantizes each edge against the
+  march cadence (default 0.1625 = half pitch; emitter-extent windows
+  measured monotonically worse on similarity). The `--shadow-centroid 1`
+  analytic-SSSS experiment delivered its promised ~16x tap cut (−42% GPU
+  vs binary) but NO similarity win (the pinned lateral blindness measured
+  +1.2 edge/shadow RMSE) — closed as a default candidate, kept as the M5
+  prototype. The `--shadow-jitter` diagnostic measured SSIM-neutral on a
+  still image (kept for the M8 TAA slot).
+- **M4.0.9.1** — the analytic lateral half-plane: field verdict said the
+  centroid+jitter combo "looks the best so far" but the edges were still
+  very sharp and shorter penumbra never smoothed them — the M4.0.9
+  centroid grade was structurally blind to the LATERAL penumbra (a
+  receiver whose centroid ray skims past a footprint never touches a real
+  column, so the lateral silhouette was a full cliff; no penumbra width
+  fixes a cliff). The occluder set (the same convex prisms/spheres the
+  heightfield rasterizes) now rides along as uniforms and each march
+  sample grades the signed ground distance to the nearest eligible
+  primitive — zero new texture taps, continuous at every penumbra width.
+  `--shadow-lateral 0` reproduces M4.0.9 bit-for-bit; the default
+  transport is byte-identical (both replay pins hold).
+- **M5.0 (shipped)** — the TRUE area light: the PBR transport now evaluates
+  the exact visible-patch form factor (Arvo) of the frozen 1.30 x 1.05 m
+  emitter under analytic backprojection visibility — each occluder's
+  backprojected region (exact for convex prisms; the sphere's tangent cone
+  sampled by 33 direction-space directions) is subtracted from the patch
+  polygon by a piece decomposition, making multi-blocker unions exact.
+  Zero texture taps, zero march, zero jitter, C1-continuous penumbrae,
+  contact hardening and emitter anisotropy for free. Validated against a
+  float64 brute-force reference before any GLSL
+  (scripts/check_area_model.py); the CPU mirror is pinned in bench_tests
+  (225 checks). `--area-light 0` keeps the exact M4.0.9.1 transport and
+  every replay pin. Residuals documented in the ledger row (sphere conic
+  sampling, representative-point specular).
+- **M5.1** — the scene/material abstraction the AreaLight object started:
+  `MeshInstance`/`Scene` objects, a real `scene.json` loader retiring the
+  generated Cornell header, and general omnidirectional shadowing
+  (cube/point maps) for non-heightfield scenes.
 - **M6** — Light probes / irradiance: environment map, irradiance,
   prefiltered specular, BRDF LUT — retires the ambient-gradient placeholder
   wholesale (the old M5 IBL slot folds in here).

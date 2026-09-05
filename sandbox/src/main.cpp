@@ -259,12 +259,30 @@ ModelAsset kModelAssets[4] = {
 // Cornell Box benchmark runtime (M3.3, cornell-box/1.0 -- FROZEN standard)
 // ---------------------------------------------------------------------------
 
+// M4.0.9.1: analytic occluder primitives for the lateral half-plane grade
+// (shaders.h). Built in setupCornellScene from the SAME occluder meshes the
+// heightfield capture rasterizes (isOccluderMaterial, identity transform),
+// so the analytic set and the captured field can never disagree about what
+// occludes. Boxes carry their world AABB (footprint + vertical interval);
+// "sphere_*" materials become spheres (center = AABB center, R = half the
+// AABB x-extent -- the generated spheres are uniform, bench-pinned).
+constexpr int kMaxShadowBoxes   = 4;
+constexpr int kMaxShadowSpheres = 4;
+struct OccluderSet {
+    int boxCount = 0;
+    float boxMin[kMaxShadowBoxes][4] = {};   // (minX, minZ, minH, pad)
+    float boxMax[kMaxShadowBoxes][4] = {};   // (maxX, maxZ, maxH, pad)
+    int sphereCount = 0;
+    float sphere[kMaxShadowSpheres][4] = {}; // (cx, cy, cz, R)
+};
+
 struct CornellScene {
     const cornell::VariantDef* def = nullptr;
     std::vector<engine::Mesh>  meshes;        // parallel to def->meshes
     std::vector<bool>          meshLoaded;
     engine::Mesh               emitterQuad;   // unlit emissive draw
     bool                       emitterReady = false;
+    OccluderSet                occluders;     // M4.0.9.1 lateral half-plane set
 };
 
 const cornell::MaterialDef* findCornellMaterial(const char* name) {
@@ -323,16 +341,28 @@ constexpr float kShadowBias = 0.01f;          // ~half a texel height quantum
 // -- the lateral offset between ADJACENT GRID LIGHTS' shadow edges at
 // blocker depth t (similar triangles through the receiver) -- so each
 // light's grade spans exactly its neighbor's edge offset and the composite
-// becomes the continuous band the area emitter produces. Derived, not
-// tuned: the scale IS the frozen grid pitch (kLightPitch); the reference
-// path tracer integrates visibility over the emitter area whose projected
-// band is exactly that parallax spread (the tall block's top edge alone
+// becomes the continuous band the area emitter produces. FIRST derivation:
+// scale = the frozen grid pitch (kLightPitch; the tall block's top edge alone
 // spans pitch * 3.30 / (5.49 - 3.30) ~ 0.49 m between adjacent rows).
-// 0.0 disables the soft path entirely and reproduces the M4.0.6 binary
-// march byte-for-byte (--shadow-penumbra 0 is the A/B + regression pin).
+// HARDWARE VERDICT (M4.0.9 A/B matrix, ledger row): FALSIFIED for the full
+// pitch -- similarity vs the clean reference degrades MONOTONICALLY with
+// the scale (edge/shadow RMSE 80.069 / 80.182 / 80.272 / 80.423 at 0 /
+// 0.1625 / 0.325 / 0.65; SSIM likewise). The 4x4 grid IS the emitter
+// quadrature: the spread of its 16 hard edges already synthesizes the
+// physical parallax band, so a per-light window of the emitter extent
+// DOUBLE-COUNTS it (composite band ~ spread + w). The window's actual job
+// is narrower: de-quantize each per-light edge against the MARCH CADENCE
+// (kMarchStep 0.08 m) -- the staircase the ledger's "blocky penumbra"
+// named. Re-derived default = half the pitch (0.1625 ~ 2x cadence), also
+// the best SOFT row on every axis (SSIM 0.52479, edge 80.182, GPU 2.141 ms
+// vs 2.266 / 2.316 for pitch / double). The first default stays reachable
+// (--shadow-penumbra 0.325). 0.0 disables the soft path entirely and
+// reproduces the M4.0.6 binary march byte-for-byte (--shadow-penumbra 0 is
+// the A/B + regression pin; binary md5 949d61abdac74ea492fa7aad87867819,
+// the metric-king row).
 constexpr float kLightPitch     = 0.325f;  // frozen 4x4 grid spacing
 constexpr float kLightHeight    = 5.44f;   // frozen grid plane y
-constexpr float kShadowPenumbra = kLightPitch;
+constexpr float kShadowPenumbra = 0.5f * kLightPitch;  // hardware re-derived
 
 // M4.0.8: bracket refinement of the soft minimum (default ON). Research
 // verdict (docs/SHADOW_EDGE_REFERENCES.md): every shipped heightfield-ray
@@ -393,6 +423,34 @@ static_assert(kCentroidMarchStep < 0.19f,
 // the default the added term is exactly +0.0 (bit-identical lattices), so
 // the M4.0.5/M4.0.6 replay pins are unaffected by its existence.
 constexpr int kShadowJitterDefault = 0;
+
+// M4.0.9.1: analytic lateral half-plane grade in the centroid soft path
+// (default ON). The M4.0.9 centroid grade is exact IN-PLANE but structurally
+// blind to the LATERAL penumbra (rim rays passing BESIDE a convex occluder):
+// a receiver whose centroid ray misses every real column cliffs from fully
+// lit to pierce-dark across one pixel row -- the hardware-confirmed sharp
+// edge (the A/B row's +1.2 edge RMSE) and the field report "very sharp
+// edges". The fix grades the signed ground distance to the occluder set
+// itself (the same convex prisms/spheres the heightfield rasterizes; zero
+// new texture taps, continuous at every penumbra width; see
+// shadowVisibilityCentroid in shaders.h for the ramp and the eligibility
+// proof). --shadow-lateral 0 reproduces the M4.0.9 centroid march
+// bit-for-bit (the ledger's A/B lever for the 4.0.9.1 row).
+constexpr int kShadowLateralDefault = 1;
+
+// M5.0: the true area-light transport (default ON). The 16-point grid was
+// always a documented approximation of the frozen 1.30 x 1.05 m emitter
+// (flux-preserving quadrature, I = A*L_e/N); the grid-vs-area-light
+// discrepancy is a named term of the measured similarity gap (ARCHITECTURE
+// decision table). M5.0 replaces the transport itself: the shader evaluates
+// the exact visible-patch form factor (Arvo) under the analytic
+// backprojection visibility -- zero texture taps, zero march, zero jitter,
+// C1-continuous penumbrae, contact hardening, emitter-shape anisotropy, and
+// exact multi-blocker unions (scripts/check_area_model.py validates the
+// whole chain against float64 brute force; bench_tests pins the CPU mirror
+// to the same fixtures). The grid path stays byte-identical under
+// --area-light 0, which is where every M4.x replay pin lives.
+constexpr int kAreaLightDefault = 1;
 
 // --- M4.0.4 field REGISTRATION probes (frozen) -----------------------------
 // verifyField() proves the field's aggregate content (coverage %, top,
@@ -746,12 +804,50 @@ bool setupCornellScene(CornellScene& scene, int variantIndex,
             std::fprintf(stderr, "[Sandbox] cornell: %s: %s\n", path.c_str(),
                          model.warnings.c_str());
         }
+        // M4.0.9.1: accumulate the analytic occluder primitives from the
+        // SAME meshes the heightfield capture rasterizes (identity
+        // transform, so world AABB == mesh AABB). Boxes keep their AABB;
+        // "sphere_*" materials become spheres (center = AABB center,
+        // R = half the x-extent -- the generated spheres are uniform).
+        if (isOccluderMaterial(scene.def->meshes[i].material) &&
+            !model.vertices.empty()) {
+            float mnX = model.vertices[0].x, mxX = mnX;
+            float mnY = model.vertices[0].y, mxY = mnY;
+            float mnZ = model.vertices[0].z, mxZ = mnZ;
+            for (const engine::Vertex& v : model.vertices) {
+                if (v.x < mnX) mnX = v.x;
+                if (v.x > mxX) mxX = v.x;
+                if (v.y < mnY) mnY = v.y;
+                if (v.y > mxY) mxY = v.y;
+                if (v.z < mnZ) mnZ = v.z;
+                if (v.z > mxZ) mxZ = v.z;
+            }
+            if (std::strncmp(scene.def->meshes[i].material, "sphere_", 7) == 0) {
+                if (scene.occluders.sphereCount < kMaxShadowSpheres) {
+                    float* s = scene.occluders.sphere[scene.occluders.sphereCount];
+                    s[0] = 0.5f * (mnX + mxX);
+                    s[1] = 0.5f * (mnY + mxY);
+                    s[2] = 0.5f * (mnZ + mxZ);
+                    s[3] = 0.5f * (mxX - mnX);
+                    scene.occluders.sphereCount++;
+                }
+            } else if (scene.occluders.boxCount < kMaxShadowBoxes) {
+                float* mn = scene.occluders.boxMin[scene.occluders.boxCount];
+                float* mx = scene.occluders.boxMax[scene.occluders.boxCount];
+                mn[0] = mnX; mn[1] = mnZ; mn[2] = mnY; mn[3] = 0.0f;
+                mx[0] = mxX; mx[1] = mxZ; mx[2] = mxY; mx[3] = 0.0f;
+                scene.occluders.boxCount++;
+            }
+        }
         scene.meshLoaded[i] = scene.meshes[i].create(
             model.vertices.data(), static_cast<std::uint32_t>(model.vertices.size()),
             model.indices.data(), static_cast<std::uint32_t>(model.indices.size()));
         allOk = allOk && scene.meshLoaded[i];
         std::printf("[Sandbox] cornell: %s: %d triangles\n", file, model.triangleCount);
     }
+    std::printf("[Sandbox] cornell: occluder set: %d box(es), %d sphere(s) "
+                "(M4.0.9.1 lateral half-plane)\n",
+                scene.occluders.boxCount, scene.occluders.sphereCount);
 
     scene.emitterQuad = createEmitterQuad();
     scene.emitterReady = scene.emitterQuad.valid();
@@ -776,6 +872,8 @@ int main(int argc, char** argv) {
     int  shadowCentroid = kShadowCentroidDefault; // --shadow-centroid 0|1 (M4.0.9)
     float shadowLightSize = kShadowLightSize; // --shadow-light-size (M4.0.9, centroid path)
     int  shadowJitter = kShadowJitterDefault; // --shadow-jitter 0|1 (M4.0.9 diagnostic)
+    int  shadowLateral = kShadowLateralDefault; // --shadow-lateral 0|1 (M4.0.9.1, centroid path)
+    int  areaLight = kAreaLightDefault;       // --area-light 0|1 (M5.0 transport)
     bool marchStepOverridden = false;         // --shadow-step seen (binds BOTH paths)
     std::string dumpHeightfieldPrefix; // --dump-heightfield p: write <p>_hmax/_hmin.ppm
     int  shadowDebugMode = 0;          // --shadow-debug vis|field|uv (M4.0.5 instrument)
@@ -845,6 +943,26 @@ int main(int argc, char** argv) {
                              "(0 = deterministic lattice, 1 = per-pixel IGN "
                              "jitter of both march lattices, diagnostic only "
                              "-- needs TAA to converge)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-lateral") == 0 && i + 1 < argc) {
+            shadowLateral = std::atoi(argv[++i]);
+            if (shadowLateral < 0 || shadowLateral > 1) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-lateral: '%s' out of range "
+                             "(0 = exact M4.0.9 centroid march, 1 = analytic "
+                             "lateral half-plane grade, M4.0.9.1)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--area-light") == 0 && i + 1 < argc) {
+            areaLight = std::atoi(argv[++i]);
+            if (areaLight < 0 || areaLight > 1) {
+                std::fprintf(stderr,
+                             "[Sandbox] --area-light: '%s' out of range "
+                             "(1 = M5.0 true area-light transport, 0 = exact "
+                             "M4.0.9.1 grid transport, all replay pins)\n",
                              argv[i]);
                 return 1;
             }
@@ -1313,6 +1431,16 @@ int main(int argc, char** argv) {
 
             // M4 heightfield shadows (see shaders.h for the march contract).
             pbrShader.setInt("uShadowOn", shadowsActive ? 1 : 0);
+            // M5.0: the area-light transport flag + the frozen emitter patch.
+            // Consumed only when uShadowOn == 1 (the transport needs the
+            // occluder set and the verified-capture gate); the demo scene
+            // never reaches this branch.
+            pbrShader.setInt("uAreaOn", areaLight);
+            pbrShader.setFloat3("uAreaCenter",
+                                0.5f * (cornell::kEmitterMin[0] + cornell::kEmitterMax[0]),
+                                cornell::kEmitterMin[1],
+                                0.5f * (cornell::kEmitterMin[2] + cornell::kEmitterMax[2]));
+            pbrShader.setFloat("uAreaLe", cornell::kEmitterRadiance);
             // M4.0.5 debug instrument, independent of shadowsActive so the
             // panel stays readable even when the march is disabled. uShadowDebugNorm
             // is the frozen capture top (field-mode R normalizer).
@@ -1342,6 +1470,34 @@ int main(int argc, char** argv) {
                                     centroidPos[0], centroidPos[1], centroidPos[2]);
                 pbrShader.setFloat("uShadowLightSize", shadowLightSize);
                 pbrShader.setInt("uShadowJitter", shadowJitter);
+                // M4.0.9.1: analytic lateral half-plane set (centroid soft
+                // path). Array elements are addressed individually --
+                // "uShadowBoxMin[i]" is a valid uniform name -- so the
+                // existing setFloat4 covers the upload with zero new
+                // loader entry points (the GL surface-area discipline).
+                pbrShader.setInt("uShadowLateral", shadowLateral);
+                pbrShader.setInt("uShadowBoxCount", cornell.occluders.boxCount);
+                for (int b = 0; b < cornell.occluders.boxCount; ++b) {
+                    char uname[64];
+                    std::snprintf(uname, sizeof(uname), "uShadowBoxMin[%d]", b);
+                    const float* mn = cornell.occluders.boxMin[b];
+                    pbrShader.setFloat4(uname, mn[0], mn[1], mn[2], mn[3]);
+                    std::snprintf(uname, sizeof(uname), "uShadowBoxMax[%d]", b);
+                    const float* mx = cornell.occluders.boxMax[b];
+                    pbrShader.setFloat4(uname, mx[0], mx[1], mx[2], mx[3]);
+                }
+                pbrShader.setInt("uShadowSphereCount",
+                                 cornell.occluders.sphereCount);
+                for (int sp = 0; sp < cornell.occluders.sphereCount; ++sp) {
+                    char uname[64];
+                    std::snprintf(uname, sizeof(uname), "uShadowSphere[%d]", sp);
+                    const float* s = cornell.occluders.sphere[sp];
+                    pbrShader.setFloat4(uname, s[0], s[1], s[2], s[3]);
+                }
+                pbrShader.setFloat4("uEmitterHalf",
+                                    0.5f * (cornell::kEmitterMax[0] - cornell::kEmitterMin[0]),
+                                    0.5f * (cornell::kEmitterMax[2] - cornell::kEmitterMin[2]),
+                                    0.0f, 0.0f);
             }
         } else {
             pbrShader.setFloat3("uSunDirection", sun.direction);
@@ -1519,13 +1675,25 @@ int main(int argc, char** argv) {
                       : shadowsActive ? "on (heightfield march, field verified + registered)"
                                       : "off (capture failed, verify or registration FAILED)");
         if (cornellVariant >= 0 && shadowsEnabled && shadowsActive) {
-            if (shadowCentroid == 1) {
+            if (areaLight == 1) {
+                // M5.0 mode line: the transport replaced the grid entirely.
+                std::snprintf(lines[n++], 160,
+                              "shadow mode: area light backprojection (M5.0)  "
+                              "Le: %.2f  patch: %.2f x %.2f m  "
+                              "occluders: %d box(es) + %d sphere(s)  "
+                              "march: none (analytic, 0 taps)",
+                              cornell::kEmitterRadiance,
+                              cornell::kEmitterMax[0] - cornell::kEmitterMin[0],
+                              cornell::kEmitterMax[2] - cornell::kEmitterMin[2],
+                              cornell.occluders.boxCount,
+                              cornell.occluders.sphereCount);
+            } else if (shadowCentroid == 1) {
                 // M4.0.9 mode line (replaces the M4.0.7 penumbra line; the
                 // legacy line prints verbatim under --shadow-centroid 0).
                 std::snprintf(lines[n++], 160,
-                              "shadow mode: centroid march (M4.0.9)  "
+                              "shadow mode: centroid march (M4.0.9.1)  "
                               "light size: %.3f m (%s)  march step: %.3f m%s  "
-                              "refine: %s  jitter: %s",
+                              "refine: %s  jitter: %s  lateral: %s",
                               shadowLightSize,
                               shadowLightSize == 0.0f
                                   ? "0 = binary centroid march"
@@ -1537,14 +1705,19 @@ int main(int argc, char** argv) {
                                   ? " (override)"
                                   : " (centroid default)",
                               shadowRefine ? "on" : "off",
-                              shadowJitter ? "on (diagnostic grain)" : "off");
+                              shadowJitter ? "on (diagnostic grain)" : "off",
+                              (shadowLateral && shadowLightSize > 0.0f)
+                                  ? "analytic half-plane (M4.0.9.1)"
+                                  : "off (M4.0.9 A/B)");
             } else {
                 std::snprintf(lines[n++], 160,
                               "shadow penumbra: %.4f (%s)  march step: %.3f m%s  "
                               "refine: %s  jitter: %s",
                               shadowPenumbra,
                               shadowPenumbra > 0.0f
-                                  ? "soft parallax window (M4.0.9), scale = grid pitch"
+                                  ? (shadowPenumbra == kShadowPenumbra
+                                        ? "soft parallax window (M4.0.9), default scale (half pitch)"
+                                        : "soft parallax window (M4.0.9), override")
                                   : "0 = binary march (M4.0.6 regression mode)",
                               marchStepOverride,
                               marchStepOverride == kMarchStep ? " (default)" : " (override)",

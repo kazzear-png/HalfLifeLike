@@ -1,9 +1,68 @@
 # Shadow-edge quality: how shipped engines solve what our marcher hit
 
 **Status:** research verdict, M4.0.8; extended M4.0.9 (parallax window +
-the centroid rig-march experiment).
+the centroid rig-march experiment); extended M4.0.9.1 (the analytic
+lateral half-plane closes the centroid path's lateral blindness).
 **Question (user):** the blocky penumbra after the first lit march — no other
 engine shows that. Is it a bug, and how do other codebases avoid it?
+
+## M4.0.9.1 extension: the centroid path's remaining sharp edges were the LATERAL cliff
+
+Field verdict after the M4.0.9 hardware matrix: `--shadow-centroid 1
+--shadow-jitter 1` looks the best of the matrix, but the edges are still
+very sharp and shrinking the penumbra never smooths them. Both observations
+have ONE root cause. The M4.0.9 centroid grade is a half-plane model driven
+by the VERTICAL clearance of the columns the one trace touches; a receiver
+whose centroid ray skims PAST a footprint never touches a real column, so
+the grade never fires and the lateral silhouette jumps from fully lit
+(vis = 1) to pierce-dark in one pixel row — a cliff. No penumbra width
+fixes a cliff: `--shadow-light-size` sets the ramp's width, but a cliff
+has no ramp, which is exactly why "shorter penumbra" moved the edge
+without smoothing it. The in-plane band (the geometry the half-plane model
+sees) was already continuous and hardware-matched the 16-light path, so
+the surviving perceptual sharpness IS the pinned single-ray blindness (the
+hardware row's +1.2 edge RMSE) — now dominant because everything else is
+smooth.
+
+The M4.0.9.1 fix grades the LATERAL miss distance analytically against the
+occluder set itself (the same convex prisms/spheres the heightfield
+rasterizes — walls are not occluder materials), zero new texture taps:
+`g_lat = clamp(0.5 + r/(E_perp·min(t,tCap)), 0, 1)` with r the signed 2D
+ground distance to the nearest eligible primitive (box footprint SDF;
+sphere ground disk of radius `sqrt(R² − (|rayY−cy| + bias)²)`, which is
+algebraically the same "column interval contains rayY" the texture
+encodes), E_perp the emitter's exact lateral support along the trace
+perpendicular (`2·(hx·|px| + hz·|pz|)` — the 1.30 × 1.05 m patch's
+anisotropy falls out of the support function for free). Per sample the
+march takes `min(g_vertical, g_lat)` — conservative at block corners.
+Correctness rides along: the soft early-out now also requires
+`B(t) ≥ 0` (with B < 0 a future sample can still be occluder-eligible and
+the lateral grade can still undercut the vertical bound; B ≥ 0 puts every
+future sample above every top, so the old bound is exact again), and the
+march breaks once any grade hits 0. `--shadow-lateral 0` reproduces the
+M4.0.9 centroid march bit-for-bit. float64 validation: the M4.0.9 "blind"
+receiver (footprint miss) grades 0.5689 (hand-derived 0.5689 from the
+~0.056 m closest approach at t ≈ 0.50), sliding away 0.7172 — the cliff is
+now the ~1 m continuous band the rim rays physically produce.
+
+Adjudication of the two external repo reviews that triggered this
+milestone (kept here because the reasoning is load-bearing):
+(1) "the window has wrong asymptotics (`penumbra·traveled`), apply
+`t/(1−t)`" — STALE: that is the pushed M4.0.7 GitHub code; M4.0.9 already
+ships the parallax form with contact hardening, and the hardware matrix
+re-derived its scale. (2) "finish the measurement matrix first" — already
+done (ledger row closed with four pre-registered verdicts); both reviews
+read the stale push, not the local tree. (3) "fixed step count kills the
+seam" — a REAL secondary defect (`int steps` lattice-phase jumps, ~7%
+grade steps at wall distances), QUEUED, not mixed into this milestone.
+(4) "PCSS taps at the blocker depth" — rejected for this rig: testing
+occlusion only at the argmin depth drops every other occluder in
+shadow-overlap zones (tall + short block), breaking the exactness story
+the heightfield is built on. (5) "backprojection (clip the blocker's
+projected silhouette against the emitter rect)" — the exact end-state for
+convex occluders and the right M5 headline; these half-plane ramps are its
+per-axis 1D reductions. (6) "black block faces = missing GI" — correct,
+and the repo already says so (CBox-03, the M7/M8 slots); no ambient cheat.
 
 ## M4.0.9 extension: the blockiness after M4.0.8 was the WINDOW, not the march
 
@@ -74,6 +133,47 @@ nothing (its fps matched the default row exactly).
 Solution C (min-max mip hierarchy / cone stepping) remains the M4.1+
 candidate for the cadence ceiling; the M4.0.9 window work is orthogonal
 to it.
+
+## M4.0.9 hardware verdict (the A/B matrix measured)
+
+The full 8-row matrix ran on hardware (960×540, vs the 320-spp clean
+reference; md5s + GPU ms in the ledger row). The similarity axis:
+
+| Config | SSIM | edge/shadow RMSE | GPU ms |
+|---|---|---|---|
+| binary pin (0) | **0.52630** | **80.069** | 1.237 |
+| half pitch (0.1625) | 0.52479 | 80.182 | 2.141 |
+| full pitch (0.325, first default) | 0.52382 | 80.272 | 2.266 |
+| double pitch (0.65) | 0.52199 | 80.423 | 2.316 |
+| centroid S=1.175 | 0.52370 | 81.389 | 0.719 |
+| centroid binary | 0.52321 | 81.765 | 0.553 |
+
+Four verdicts, all pre-registered in the BASELINE protocol:
+
+1. **The emitter-extent window is falsified.** Similarity degrades
+   MONOTONICALLY with the window scale on every metric. Structural
+   reason: the 4x4 grid IS the emitter quadrature — the spread of its 16
+   hard edges already synthesizes the physical parallax band, so a
+   per-light window of that same extent double-counts it (composite band
+   ~ spread + w). The window's real job is de-quantizing each per-light
+   edge against the march cadence; the default re-derives to half pitch
+   (0.1625 ≈ 2× kMarchStep), the best SOFT row on every axis.
+2. **Binary is the metric king.** The SSIM axis cannot see the staircase
+   at this resolution under the GI gap (best-worst spread across all
+   rows = 0.43 similarity points; the raw-vs-clean MC-noise ceiling
+   alone sits at 54.32). The soft default is a perceptual-polish trade
+   (−0.15 similarity for the band the eye complained about) — recorded,
+   not hidden.
+3. **The centroid experiment closes without a similarity win** (the
+   pre-registered promotion rule): its pinned lateral-band blindness
+   measured +1.2 edge/shadow RMSE exactly as the bench contract
+   predicted. The ~16× tap cut is real (−42% GPU vs binary); the M5
+   per-pixel emitter integration slot retires the question.
+4. **Jitter measured SSIM-neutral** (+0.00001 on both lattices) — the
+   predicted grain regression does not exist at this metric's
+   granularity because the grade is continuous and absorbs a
+   half-spacing lattice shift; the TAA-payoff row reads zero. Default
+   stays OFF (no benefit without temporal accumulation, M8+).
 
 ## Verdict
 
@@ -186,7 +286,144 @@ M4.0.7 shipped 3, M4.0.8 ships 2.
    the physically correct near-black. The default window scale moves the
    ledger's tuning bracket to --shadow-penumbra 0.1625 / 0.65.
 4. M4.0.9: the centroid experiment's single-ray blindness (lateral
-   penumbra) is pinned in bench_tests as a contract; see the M4.0.9
-   section above. The pin protects the analysis: if a future change makes
-   the "blind" fixtures grade, the model changed and the ledger must
-   re-measure.
+   penumbra) was pinned in bench_tests as a contract; M4.0.9.1 CLOSED it
+   with the analytic lateral half-plane (the pin was rewritten to the new
+   continuous-band contract, and `--shadow-lateral 0` reproduces the old
+   cliff exactly). The pin still protects the analysis: if a future change
+   moves the graded band values, the model changed and the ledger must
+   re-measure. Residual: block CORNERS grade slightly dark (min of two
+   1D half-plane cuts is conservative at the corner), and the `int steps`
+   lattice-phase seam (~7% grade steps at wall distances) is queued.
+
+## M5.0: the area light retires the approximation entirely (the backprojection milestone)
+
+M4.0.7→M4.0.9.1 progressively de-quantized the 16-point-grid approximation
+of the area emitter: the window merged the 16-step superposition staircase,
+the bracket refinement killed the march-cadence aliasing, and the lateral
+half-plane closed the single-ray cliff. All of that work graded
+APPROXIMATIONS of one quantity — the fraction of the emitter patch visible
+from the receiver. M5.0 computes that quantity directly.
+
+**The method (Assarsson–Akenine-Möller / Bavoil backprojection family,
+adapted to the analytic occluder set instead of a shadow map).** For a
+receiver R, the set of emitter points p blocked by a convex occluder is
+exactly the central projection of that occluder from R onto the emitter
+plane. The transport therefore: starts from the emitter rect polygon;
+subtracts each occluder's projected region; and evaluates the DIFFUSE as
+the form factor of the surviving polygon — not the form factor of the
+rectangle times a scalar. Two structural consequences:
+
+1. **Unions are exact.** The subtraction is the first-outside-edge
+   decomposition: for blocker B with hull edges e_1..e_m,
+   `piece − B = ∪_i (piece ∩ outside(e_i) ∩ inside(e_1..e_{i−1}))`, each
+   term one Sutherland–Hodgman half-plane clip. SH clips are area- AND
+   form-factor-exact for any simple subject (the zero-width bridge edges
+   lie on the clip line and their Arvo edge contributions cancel exactly).
+   The naive per-blocker product the design started from over-darkened a
+   cbox03 overlap band by 18.4% — measured, then engineered away.
+2. **Boxes are exact, spheres are sampled.** A box's blocked region is the
+   radial sweep of its footprint between the two cap magnifications
+   m(h) = (Ly−Py)/(h−Py) — the convex hull of the two projected caps —
+   exact, and correct for floating geometry (the cbox03 baffle's under-pass
+   band survives: the sweep of the [ylo, yhi] band, not a filled hull of
+   one cap). A sphere's region is the section of its tangent cone; the
+   shipped 33-gon inscribes it (one-sided under-block ≤ ~9% of the local
+   fraction inside the transition band, ≤ 0.9% of K end-to-end, zero in the
+   umbra and the lit region). The sampling lives in DIRECTION space
+   (`d(θ) = cosα·Ĉ + sinα·ring`), which stays well-defined exactly where
+   the classical tangent-circle projection collapses: the frozen rig's
+   floor sphere + floor receiver sits ON the parabolic boundary, and a
+   receiver ON the sphere sends α → 90° while the tangent circle shrinks to
+   a point.
+
+**What this retires.** The parallax window (there is no march whose grade
+needs de-quantizing), the bracket refinement (no sampled minimum to
+re-locate), the lateral half-plane (no single trace to be blind — the
+projection through the receiver covers the full cone), the jitter (the
+transport is noise-free by construction), and the 16-superposition penumbra
+itself. Contact hardening is no longer a window artifact: a near blocker's
+projected region simply covers more of the patch. The emitter's 1.30 × 1.05
+anisotropy is the polygon's real shape, not a support-function ramp.
+
+**The validation discipline.** scripts/check_area_model.py pinned every
+formula against float64 brute force BEFORE the GLSL existed: Arvo's
+edge-sum structure and constant (1e-9), the box sweep identity (exact; the
+first hull8 implementation silently clipped wrong through a
+`max(denominator, ε)` guard that destroyed negative denominators — the
+brute force caught it), the direction-space sphere cone, the exact-union
+piece decomposition, and the VOS solid angle (1e-5 vs Monte Carlo). The
+float32 CPU mirror (AreaLight.h) is pinned in bench_tests to the same
+fixtures (worst 3.1e-4), and the verify harness carries its own float64
+port (`--self-test-area`).
+
+**Known residuals (documented, ledger-measured).** (1) The sphere's
+inscribed conic — one-sided, bounded, queued behind ledger evidence; the
+upgrade samples the conic at its rect-edge crossings. (2) The specular is a
+one-tap representative-point quadrature: energy-consistent, not
+shape-exact (a mirror sphere reflects one bright point, not the patch
+rectangle — the 16-grid's 16 dots were not closer to the reference's
+rectangle). (3) The `int steps` lattice-phase seam of the legacy paths is
+moot for the default transport but remains queued for the fallback. The
+`--area-light 0` fallback keeps every M4.x instrument and pin exactly as
+shipped.
+
+---
+
+## M5.0.1 — why the area transport cost 4x the march, and the exact-reject fix
+
+**Field report.** 0.5.0 on the user's box: ~110 fps vs the M4 variant's
+~475. The first attempt (a 0.5.1-draft inclusion-exclusion rewrite) was
+built, measured, and REJECTED: it read worse (float32 parity-sum
+cancellation in deep umbra) and ran worse (8-subset clip chains multiplied
+ALU; the two 56-vertex scratch polygons kept the dynamic-indexing local-
+memory pressure). The tree was reverted to 0.5.0 byte-for-byte before this
+section's design landed. Lesson of record: reformulating pinned math is a
+bet; eliminating provably-dead work is not.
+
+**Where the 0.5.0 cost actually was.** The piece carve ran unconditionally
+for every blocker x pixel: hull + one S-H chain pass per hull edge per
+piece, over ~9 KB of dynamically-indexed local arrays (GLSL: scratch
+memory). Two force multipliers: (1) a blocker whose region reaches nothing
+still fragments pieces — hull edges are infinite lines, and a piece they
+cross is "phantom-split" into area-equal parts (the union is unchanged;
+the work and the piece slots are not); (2) the sphere paid 33 sin/cos cone
+samples + a 33-point insertion-sort hull before the same carve. The waste
+then fed the 16-piece cap, which can drop REAL tail pieces — 0.5.0
+silently undercounted visible region in exactly those cases (fuzz
+adjudication: brute 0.013677, 0.5.0 0.005424, 0.5.0.1 0.013694).
+
+**The fix — five one-sided skips (GLSL only; AreaLight.h stays the plain
+reference).** Per-piece AABB bookkeeping (exact; min/max add no rounding)
+plus: box reject before hull+carve (8-point AABB axis-disjoint from every
+piece); sphere reject before the 33 samples (conservative disk bound
+`rFoot = (Cy−Py)(ca|ch.xz|+sa)/ymin`, valid exactly when no generator
+clamps — `ymin > 0`); sampled-cone AABB reject before hull+carve; in-carve
+copy-through of pieces whose AABB misses the blocker AABB; and the
+no-carve fast exit returning `kRect` (the final loop would sum exactly one
+Arvo over the rect — bit-identical by construction). Every skip is
+one-sided: an AABB contains its polygon, so a rejected blocker reaches no
+piece and the union cannot change.
+
+**Equivalence contract (check_area_model.py section 8).** 4000-iteration
+float64 fuzz (jittered boxes, floor + elevated spheres, high receivers):
+per-fired-reject SAT soundness; the no-region-loss direction
+(`K_skips ≥ K_ref − tol` — the only separating mechanism is the cap, and
+the skips only restore); brute-force adjudication of deviations (skips
+must be strictly closer); frozen-config agreement to 1e-12 relative (the
+reference's own phantom-split regrouping makes exact float equality
+unattainable BY CONSTRUCTION — 1e-15 dust). What remains on the GPU side
+is float32 regrouping of equivalently-decomposed regions, ~1e-7 relative —
+below display quantization by three orders.
+
+**Cascaded shadow maps — adjudicated (M5.0.1 research ask).** CSM is a
+DIRECTIONAL-sun technique: split the camera frustum into depth ranges and
+give each its own shadow-map projection to fight perspective aliasing of
+one depth buffer (Microsoft D3D docs, C4 Engine wiki, three.js CSM, Intel
+samples). This engine has zero shadow maps — the area transport is
+analytic backprojection in a frozen 5.5 m room — and no sun-shadow path to
+split. The reported problem is per-pixel ALU/local-memory cost, which CSM
+would only increase (more maps to render and sample). The transferable
+idea is distance-partitioned LOD, which this design does NOT take: LOD by
+any other name changes the pinned look. The rejects achieve the same
+outcome honestly — near-blocker pixels keep the full exact machinery;
+far/blocker-behind pixels pay almost nothing.

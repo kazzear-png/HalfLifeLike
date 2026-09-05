@@ -70,8 +70,10 @@ point: the ledger quantifies exactly what M5 (area-light integration), M6
 | M4.0.1 (first hardware attempt) | **51.32** | — | — | *not reported* | *not reported* | **REJECTED** (gate: 17/19 probes, 2 shadow probes FAIL). Shot md5 `5e549b5417311b93fe729e7989184aeb`, 960×540. Metrics: RMSE 71.88, MAE 46.13, SSIM 0.5132, ΔE2000 18.04, edge/shadow RMSE 80.03. **Diagnosis (M4.0.2):** both failing probes read byte-identical to the harness's UNSHADOWED model (umbra meas 50/6/5 vs unshadowed 51/4/2; penumbra meas 105/103/100 vs 105/103/101) — the march never blocked a single light in this run. Row kept as the honest pre-instrumentation measurement; re-measure with M4.0.2 (field verification + honest telemetry + harness failure diagnosis). |
 | M4.0.2 (verification instrument) | **51.32** | — | — | *not reported* | *not reported* | **REJECTED** (same gate) — image identical to M4.0.1 as the bug predicts: SSIM 0.51318, RMSE 71.875, edge RMSE 80.030. FPS at the 960×540 compare run: 1523.6. **Instrument value:** first hardware proof the CAPTURE works — console `field verify OK`: coverage 15.65 % ∈ [10.87, 20.87], top 3.299 m (expected 3.30), intervals valid. But the verdict never reached `shadowsActive` (the out-param was never written; fixed in M4.0.3), so the caller reported FAILED, the march stayed off, and the telemetry honestly said so. Re-measure with M4.0.3. |
 | M4.0.5 (march swizzle fix: first LIT march) | **52.62** | — | — | *to measure* | *to measure* | **ACCEPTED** (gate: 19 pass / 0 fail / 2 documented gaps M5+M8). Shot md5 `e830e543f6be06b9a2b58e6103fcd827`, 960×540: RMSE 72.25, MAE 45.37, SSIM 0.52622, ΔE2000 17.98, edge/shadow RMSE 80.00. FPS 1089.2 @ 960×540, 300 frames (GPU 0.583 ms avg, vsync off, warmup 30 discarded). **Root cause of the M4.0.1/M4.0.2 inert march:** `.xz` vs `.xy` swizzle on the packed footprint uniforms — uv.y went to ±inf and clamped to the field's empty edge rows, so every fetch returned an empty column forever. Capture verified again this run (coverage 15.65 %, top 3.299 m, registration probes 7/7, `--dump-heightfield` clean). Shadows now visibly land: tall-block umbra on the red wall, floor penumbra, harness shadow probes pass. **Known defect:** shadow boundaries quantized into staircase bands, pitch tracks the 0.16 m march cadence (7.4 field texels; samplers already GL_LINEAR, so filtering is ruled out) → M4.0.6 halves kMarchStep to 0.08 m as a single change. |
-| M4.0.9 (parallax penumbra window + centroid experiment) | *captures pending — re-run the matrix with the corrected `out/` protocol (the first pass's `/tmp` writes all failed on Windows)* | *pending* | *pending* | *to measure* | *to measure* | The DEFAULT soft window form is upgraded in place: `w(t) = pitch·t/(1−t)` (the adjacent grid lights' edge offset at blocker depth; scale re-derived = kLightPitch 0.325; derivation in docs/SHADOW_EDGE_REFERENCES.md) merges the 16-step superposition staircase into the physical area-emitter band (~1.62–1.96 m on the floor — the M4.0.7 grade spanned ~0.17 m); binary replay pins hold byte-exact (the span collapses to the legacy early-out at scale 0). **COST axis of the A/B matrix measured** (first hardware pass, Debug build, 960×540, 300 frames, GPU timer avg): binary pin **474.6 fps / 1.237 ms** · default parallax **314.7 / 2.266** · half-pitch **337.4 / 2.141** · double-pitch **304.6 / 2.316** · centroid S=1.175 **663.9 / 0.719** · centroid binary **612.9 / 0.553** · jitter row **INVALID as run** (the flag was centroid-only in that build; fps 312.9 ≈ the default row proves the no-op — jitter now shifts both lattices in shaders.h, telemetry prints the state on both mode lines; re-run). Readings: (1) the physical window's true cost is **+83 % GPU over binary** — soft visibility defeats the hard early-out AND tEnd extends the march past tCap; (2) window scale is nearly **cost-flat** (2.141 → 2.316 ms across 0.1625 → 0.65), so the default scale must be decided on **similarity alone**; (3) the centroid experiment delivers the promised ~16× tap cut as **−42 % GPU vs even the binary row** (0.719 vs 1.237 ms) and −68 % vs the default soft row, at the documented lateral-band blindness — its fate is decided by the pending SSIM cells, not by cost; (4) do NOT compare these FPS against the M4.0.5 row's 1089.2 (different build config) — GPU ms is the only cross-entry metric. |
+| M4.0.9 (parallax penumbra window + centroid experiment) | **52.48** (shipped default config; shot md5 `209fe2941ef779f65ca202a15ec480be`) | *to measure* (default-config runs on cornell02/03) | *to measure* | *to measure* | *to measure* | The DEFAULT soft window form was upgraded in place (`w(t) = pitch·t/(1−t)`), then its scale was **re-derived from the hardware matrix**: `kShadowPenumbra = 0.5·kLightPitch = 0.1625`. **Full 8-row matrix measured** (first hardware pass, Debug build, 960×540, 300 frames; similarity via `benchmark_compare` vs `cbox01_clean`, GPU timer avg). Similarity axis: binary pin **0.52630** / edge 80.069 (md5 `949d61ab…`, harness 19/0/2 ACCEPTED — the FIRST binary md5 ever recorded; M4.0.6–8 shipped no rows) · half-pitch **0.52479** / 80.182 · full-pitch 0.52382 / 80.272 · double-pitch 0.52199 / 80.423 · centroid S=1.175 0.52370 / 81.389 · centroid binary 0.52321 / 81.765 · jitter ±0.00001 vs its no-jitter twin (SSIM-neutral, both lattices). Cost axis: binary 1.237 ms GPU · half-pitch 2.141 · full-pitch 2.266 · double 2.316 · centroid 0.719 · centroid-binary 0.553. **Verdicts (pre-registered rules, docs/SHADOW_EDGE_REFERENCES.md):** (1) the emitter-extent window is FALSIFIED — similarity degrades monotonically with the scale because the 4×4 grid's own parallax already synthesizes the physical band; the window's job is de-quantizing each edge against the march cadence → default = half pitch ≈ 2× kMarchStep; (2) binary is the metric king — the SSIM axis cannot see the staircase under the GI gap (all-row spread 0.43 pts; raw-vs-clean noise ceiling 54.32), the soft default is a recorded perceptual-polish trade; (3) the centroid experiment closed WITHOUT a similarity win (+1.2 edge RMSE = the pinned lateral blindness, first hardware confirmation) despite −42% GPU — kept as the M5 prototype; (4) jitter is SSIM-neutral on a still image — kept default-OFF for the M8 TAA slot. History: the first hardware pass ran with the full-pitch default and POSIX-only `/tmp` capture paths (all images failed to write; ab5 measured nothing — jitter was centroid-only in that build). Do NOT compare FPS against the M4.0.5 row (different build config); GPU ms is the cross-entry metric. |
+| M4.0.9.1 (analytic lateral half-plane) | *pending hardware* | | | | | **What changed:** the centroid soft path gains the analytic lateral half-plane — the occluder set (the same convex prisms/spheres the heightfield rasterizes, built from the loaded meshes' AABBs) is passed as uniforms and each march sample grades the signed ground distance to the nearest eligible primitive: `g_lat = clamp(0.5 + r/(E_perp·min(t,tCap)), 0, 1)`, min-combined with the vertical grade. This CLOSES the pinned lateral blindness — the "very sharp edges" field verdict (the lateral silhouette was a full cliff: receivers whose centroid ray misses every real column never graded; no penumbra width fixes a cliff, which is why shorter penumbra never smoothed). Zero new texture taps (pure ALU), continuous at every width; the early-out gains the correctness-driven `B(t) ≥ 0` gate and a value-neutral vis==0 break. Float64 model: the M4.0.9 blind receiver grades 0.5689 (was exactly 1.0), monotone brightening to 0.7172 at z=1.30. Default transport byte-identical (binary pin `949d61ab…` and default pin `209fe294…` hold). **A/B lever:** `--shadow-lateral 0` reproduces the M4.0.9 centroid march bit-for-bit — its similarity cell MUST equal the M4.0.9 centroid row (0.52370 / edge 81.389) as a cross-build consistency check. Expected cost: ~0.72–0.80 ms GPU (≤ 4 boxes + ≤ 4 spheres of SDF ALU per sample, no fetches; deep-umbra pixels get cheaper from the vis==0 break). Adjudication of the two external reviews that triggered this milestone: window-asymptotics claim stale (already the M4.0.9 shipped form), PCSS-at-blocker rejected (drops non-argmin occluders in overlap zones), backprojection = the M5 headline, `int steps` lattice-phase seam queued. See docs/SHADOW_EDGE_REFERENCES.md, M4.0.9.1 section. |
 
+| M5.0 (true area light: exact visible-patch form factor + backprojection) | *pending hardware* | | | | | **What changed:** the transport itself — the emitter stops being the 16-point quadrature and becomes the frozen 1.30 × 1.05 m patch (L_e = 12). DIFFUSE = the Arvo form factor of the VISIBLE patch polygon (emitter rect minus each occluder's backprojected region — the occluder projected through the receiver onto the emitter plane — subtracted by the first-outside-edge piece decomposition; exact unions, no double-count). Box regions exact (the radial sweep of the [ylo,yhi] band; the cbox03 baffle's under-pass survives exactly); sphere regions = the tangent cone sampled by 33 direction-space directions (one-sided under-block ≤ 0.9% of K end-to-end, documented). SPECULAR = representative-point GGX with the VOS solid angle. Zero texture taps, zero march, zero jitter, C1-continuous penumbrae, contact hardening + emitter anisotropy for free. Validated against float64 brute force BEFORE any GLSL (scripts/check_area_model.py; the naive per-blocker product this design replaced over-darkened a cbox03 overlap band by 18.4%). CPU mirror pinned in bench_tests (197 → 225 checks). **A/B lever:** `--area-light 0` reproduces the exact M4.0.9.1 transport — ab9 MUST reproduce the default pin `209fe294…` byte-for-bit as the cross-build check. Expected cost: ≤ the centroid path (pure ALU; the 16-march and centroid transports both did hundreds of texture taps per pixel — this does zero), the first cost drop since the centroid experiment. Expect the similarity axis to move on the falloff (area integration vs point quadrature) — direction = toward the reference, magnitude measured, not assumed. See docs/SHADOW_EDGE_REFERENCES.md, M5.0 section. |
 ### Protocol (copy-paste)
 
 ```bash
@@ -136,12 +138,16 @@ python3 tools/benchmark_compare.py /tmp/cbox01.ppm \
 #   1. binary replay (regression pin): --shadow-penumbra 0 must byte-match
 #      the M4.0.6 binary run's md5 (the M4.0.9 span collapses to the legacy
 #      early-out at scale 0 -- structural, port-pinned);
-#   2. M4.0.9 default (parallax window, scale = grid pitch 0.325): the
-#      quality row -- expected to dominate every earlier soft row on
-#      edge/shadow RMSE (the window now spans the physical band the
-#      reference integrates over);
+#   2. M4.0.9 first default (parallax window, scale = grid pitch 0.325):
+#      SUPERSEDED after this matrix measured monotone degradation with the
+#      scale -- the shipped default is row 3a's half-pitch 0.1625 (0.325
+#      stays reachable via --shadow-penumbra 0.325). The original
+#      expectation ("dominates every earlier soft row on edge/shadow
+#      RMSE -- the window now spans the physical band the reference
+#      integrates over") was itself falsified: binary leads the edge axis;
 #   3. window bracket: --shadow-penumbra 0.1625 (half pitch) and 0.65
-#      (double pitch) -- decides the default scale on hardware;
+#      (double pitch) -- DECIDED the default scale on hardware (0.1625,
+#      monotone best);
 #   4. the centroid EXPERIMENT rows (--shadow-centroid 1; plus
 #      --shadow-light-size 0.65 / 2.0 brackets, and --shadow-centroid 1
 #      --shadow-light-size 0 for the binary-centroid cost row): measured
@@ -165,6 +171,49 @@ mkdir -p out                     # bash/WSL -- Windows cmd:  mkdir out
 ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-jitter 1                            --out out/m9_ab5_jitter.ppm
 ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 --shadow-centroid 1 --shadow-jitter 1        --out out/m9_ab5b_centroid_jitter.ppm
 ```
+
+```bash
+# M4.0.9.1 rows (the lateral half-plane; run whenever the centroid config is
+# next measured — no new matrix required). ab7 is the new default centroid
+# behavior; ab8 is the A/B lever and MUST reproduce the M4.0.9 centroid row's
+# similarity (0.52370 / 81.389) bit-for-bit as the cross-build check.
+#
+# ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 \
+#     --shadow-centroid 1                                        --out out/m91_ab7_centroid_lateral.ppm
+# ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 \
+#     --shadow-centroid 1 --shadow-lateral 0                     --out out/m91_ab8_centroid_409.ppm
+# python3 tools/verify_cornell_shot.py out/m91_ab7_centroid_lateral.ppm --shadow-centroid 1 --shadow-lateral 1
+# python3 tools/verify_cornell_shot.py out/m91_ab8_centroid_409.ppm    --shadow-centroid 1 --shadow-lateral 0
+# python3 tools/benchmark_compare.py out/m91_ab7_centroid_lateral.ppm benchmarks/cornell_box/reference/cbox01_clean.ppm
+# python3 tools/benchmark_compare.py out/m91_ab8_centroid_409.ppm    benchmarks/cornell_box/reference/cbox01_clean.ppm
+```
+
+```bash
+# M5.0 rows (the area-light transport; the first default-transport change
+# since M4.0.9). ab9 is the legacy cross-build check: --area-light 0 keeps
+# the M4.0.9.1 default transport and MUST reproduce the default pin
+# 209fe2941ef779f65ca202a15ec480be byte-for-bit. ab10 is the new default
+# (record its md5 as the M5.0 default pin). ab11/ab12 extend the similarity
+# axis to the other variants (cbox02 exercises the sphere cones).
+#
+# ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 #     --area-light 0                                             --out out/m50_ab9_legacy.ppm
+# ./build/bin/sandbox --scene cornell01 --benchmark 300 --width 960 --height 540 #                                                                --out out/m50_ab10_area.ppm
+# ./build/bin/sandbox --scene cornell02 --benchmark 300 --width 960 --height 540 #                                                                --out out/m50_ab11_area_c02.ppm
+# ./build/bin/sandbox --scene cornell03 --benchmark 300 --width 960 --height 540 #                                                                --out out/m50_ab12_area_c03.ppm
+# python3 tools/verify_cornell_shot.py out/m50_ab9_legacy.ppm  --area-light 0
+# python3 tools/verify_cornell_shot.py out/m50_ab10_area.ppm   --area-light 1
+# python3 tools/benchmark_compare.py out/m50_ab9_legacy.ppm  benchmarks/cornell_box/reference/cbox01_clean.ppm
+# python3 tools/benchmark_compare.py out/m50_ab10_area.ppm   benchmarks/cornell_box/reference/cbox01_clean.ppm
+# python3 tools/benchmark_compare.py out/m50_ab11_area_c02.ppm benchmarks/cornell_box/reference/cbox02_clean.ppm
+# python3 tools/benchmark_compare.py out/m50_ab12_area_c03.ppm benchmarks/cornell_box/reference/cbox03_clean.ppm
+```
+
+M5.0.1 update (exact-reject fast paths; transport math unchanged): the ab
+rows above remain the protocol, to be measured on an IDLE machine — the
+110-vs-475 field report was taken while the box was otherwise busy, so
+treat absolute fps as noise and the M5.0.1-vs-M5.0 A/B (same command, new
+build) as the signal. ab9's `--area-light 0` pin is untouched by 0.5.1
+(the legacy branch was not modified); ab10 records the M5.0.1 default pin.
 
 Row template:
 

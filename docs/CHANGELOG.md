@@ -6,6 +6,306 @@ sections Added / Changed / Removed / Deprecated / Fixed as needed.
 
 ---
 
+## 0.5.1 — M5.0.1: exact-reject fast paths for the area transport (revert of the 0.5.1-draft inclusion-exclusion experiment)
+
+Hardware field report on the 0.5.0 build: ~110 fps against the M4 variant's
+~475 on the same box. An inclusion-exclusion rewrite (the previous 0.5.1
+draft) was cut, built, and REJECTED on hardware — it read worse AND ran
+worse (the parity-sum cancellation put float32 noise into deep umbra, and
+the 8-subset clip chains multiplied ALU while the two 56-vertex scratch
+polygons kept the local-memory pressure). This release reverts the tree to
+the 0.5.0 transport byte-for-byte and attacks the actual cost with
+provable-dead-work elimination instead of reformulation.
+
+Diagnosis (from the 0.5.0 code, unchanged): the piece-decomposition carve
+runs for EVERY blocker x EVERY pixel unconditionally — hull + one
+Sutherland–Hodgman chain edge per blocker-polygon edge per surviving piece —
+over ~9 KB of dynamically-indexed local arrays (`gAreaPieces[16x28]`,
+`newV[16x28]`, `W/outP/inP[28]`, hull scratch), which GLSL places in scratch
+memory. Worse, a blocker whose region reaches nothing still fragments the
+piece list: its hull edges are INFINITE LINES and the chain "phantom-splits"
+any piece they cross (region-preserving, work-wasting), and the waste feeds
+the 16-piece cap, which can then drop REAL tail pieces (a silent
+undercount of visible region). The sphere path pays 33 sin/cos cone samples
++ a 33-point insertion-sort hull before the same treatment.
+
+### Added
+
+- **Exact-reject layers (GLSL transport only; the CPU reference in
+  `AreaLight.h` intentionally stays the plain 0.5.0 algorithm):**
+  per-piece AABB bookkeeping (`gAreaPieceMin2/Max2`, exact — min/max add no
+  rounding) feeds five one-sided skips: box blockers rejected before hull+carve
+  when their 8-point AABB is axis-disjoint from every piece; the sphere
+  rejected before its 33 cone samples by a conservative disk bound
+  (`rFoot = (Cy−Py)·(ca·|ch.xz|+sa)/ymin`, valid exactly when no generator
+  clamps); the sampled cone AABB checked before hull+carve; inside a carve,
+  pieces whose AABB misses the blocker AABB are copied through instead of
+  running the edge chain; and when nothing carved, the transport returns
+  `kRect` directly (the final loop would sum one `areaArvo` over the rect —
+  bit-identical by construction). Every skip is one-sided (an AABB contains
+  its polygon), so no occlusion is ever dropped.
+- **`check_area_model.py` section 8** — the reject logic's verification
+  gate: 4000-iteration float64 fuzz (jittered boxes, floor + elevated
+  spheres, receivers at floor/block/air heights) asserting per-fired-reject
+  SAT soundness (the blocker polygon is truly disjoint from every piece),
+  the no-region-loss direction (`K_skips >= K_ref − tol`), brute-force
+  adjudication of every deviation beyond float noise (the skips version
+  must be strictly closer), and frozen-config agreement to 1e-12 relative.
+
+### Fixed
+
+- **M5.0 piece-arena cap pressure (incidentally, by the rejects):** where
+  0.5.0's phantom splits consumed `kAreaMaxPieces` slots and dropped real
+  tail pieces (visible region undercounted — fuzz case adjudicated:
+  brute 0.013677, 0.5.0 0.005424, 0.5.0.1 0.013694), 0.5.0.1 avoids the
+  fragmentation and keeps the true union. Where the cap never binds, the
+  transport's result is the 0.5.0 value to float32 regrouping (~1e-7
+  relative, display-invisible; frozen fixture VALUES are unchanged — they
+  come from the reference model, and the bench suite passes 225/225
+  unmodified).
+
+### Changed
+
+- `areaBoxBlocker`/`areaSphereBlocker` split into point+AABB builders
+  (`areaBoxBlockerPts`/`areaSphereBlockerPts`) with hulling moved to the
+  caller so the reject tests run before the sort; `areaSubtractBlocker`
+  takes the blocker AABB and copy-throughs disjoint pieces; `main()`
+  untouched — `--area-light 0` remains byte-identical M4.x transport and
+  the ab9 pin (`209fe294…`) is unaffected.
+
+### Removed
+
+- The 0.5.1-draft inclusion-exclusion transport (shaders.h, AreaLight.h,
+  verify_cornell_shot.py, glsl_balance invariants, docs sections) —
+  reverted to the 0.5.0 state before this entry's changes were applied.
+
+## 0.5.0 — M5.0: the true area light (exact emitter-visibility transport replaces the grid approximation)
+
+M4.0.9.1 closed the M4.x shadow-quality thread (the user's verdict: "looks
+good enough"), and M5 lands the milestone the roadmap has named since M3: the
+Cornell emitter stops being a 4x4 point-light quadrature and becomes what the
+frozen standard says it is — a 1.30 x 1.05 m patch emitting uniform radiance
+L_e = 12.0. The transport evaluates the EXACT visible-patch form factor
+(diffuse) under the EXACT analytic backprojection visibility (the occluder's
+region projected through the receiver onto the emitter plane and subtracted
+from the patch polygon), with a representative-point GGX specular. The whole
+chain was validated against a float64 brute-force reference BEFORE any GLSL
+was written (scripts/check_area_model.py): Arvo's edge-sum form factor exact
+to 1e-9; box sweeps and multi-blocker unions exact to the brute grid pitch;
+the sphere's tangent-cone section the only approximation (a one-sided
+under-block ≤ 0.9% of K end-to-end). The naive per-blocker product this
+design REPLACED over-darkened a cbox03 overlap band by 18.4% — the shipped
+piece-decomposition union is exact.
+
+### Added
+
+- **`engine/src/rendering/AreaLight.h`** — the engine's first real light
+  object: the frozen patch (center, half-extents, L_e) plus the CPU
+  reference transport (form factor, hull, clip-split, piece subtraction,
+  box/sphere blocker polygons, VOS solid angle). Mirrors the GLSL line for
+  line; bench_tests pins the mirror to the float64 fixtures (28 new checks;
+  worst fixture deviation 3.1e-4, float32 vs float64).
+- **Area-light transport in the PBR shader (`uAreaOn == 1`, default ON)** —
+  diffuse `= kD · albedo/π · L_e · K_vis` where K_vis is the Arvo form
+  factor of the VISIBLE patch polygon (emitter rect minus every occluder's
+  backprojected region via the first-outside-edge piece decomposition —
+  Sutherland–Hodgman half-plane clips are area- and Arvo-exact for any
+  simple subject; the zero-width bridge edges carry no area and their edge
+  contributions cancel exactly). Box regions: the convex hull of the two
+  height-cap footprints projected through the receiver (the radial sweep of
+  the [ylo, yhi] band — the cbox03 baffle's under-pass survives exactly).
+  Sphere regions: the tangent-cone section `{angle(dir, Ĉ) ≤ asin(R/d)}`
+  sampled by 33 boundary directions in direction space (robust at the
+  receiver-on-surface degeneracy where the tangent circle collapses; floor
+  sphere + floor receiver sits exactly on the parabolic boundary),
+  sub-horizontal generators far-clamped at 50 m. Specular: the reflection
+  ray intersected with the emitter plane and clamped into the rect
+  (representative point), point GGX with radiance `L_e · Ω · vis`
+  (Ω = Van Oosterom–Strackee solid angle, exact to 1e-5 vs Monte Carlo).
+  Zero texture taps, zero march, zero jitter — noise-free by construction,
+  C1-continuous penumbrae in the receiver position, contact hardening and
+  emitter-shape anisotropy for free, exact multi-blocker unions.
+- **`--area-light 0|1`** (default 1) — the transport selector. `0` = the
+  exact M4.0.9.1 grid transport, byte-identical: **every M4.x replay pin
+  (binary `949d61ab…`, default-config `209fe294…`) lives under it.**
+  Telemetry gains the M5.0 mode line (patch size, L_e, occluder counts,
+  `march: none (analytic, 0 taps)`).
+- **`tools/verify_cornell_shot.py`** — the harness gains the float64 area
+  model (`--area-light`, default 1; `--self-test-area` validates the port
+  against the frozen fixtures) and the probes judge against the true-emitter
+  model. The emitter-unlit probe is transport-independent and keeps the grid
+  model; the penumbra probe needs NO centroid special case under area mode —
+  the backprojection sees the lateral penumbra by construction.
+
+### Changed
+
+- **The default Cornell transport** is now the area light: the 16-point grid
+  retires from the transport (it remains the documented fallback under
+  `--area-light 0`). This closes a named term of the measured similarity gap
+  (the grid-vs-area discrepancy, ARCHITECTURE decision table) and the
+  falloff quantization: the grid's 16 point sources became 16 hard-shadow
+  superpositions; the area patch integrates the visibility over the patch
+  area exactly.
+- **`scripts/glsl_balance.py`** — M5.0 invariants (Arvo constant form, VOS
+  abs, piece-list init/empty-guards, legacy else-wrap, clamped return).
+- **`bench_tests`** — 197 → 225 checks (+28: the M5.0 fixtures, the contact
+  grade band, the self-shadow exclusion contract, the VOS identity, and the
+  frozen-constant ride-along).
+
+### Preserved
+
+- The frozen standard: geometry, camera, lights' plane/flux model (now as
+  the fallback), exposure, and the 320-spp references untouched.
+- All M4.x replay pins under `--area-light 0` (byte-identical legacy
+  transport; the shader's legacy branch is textually unchanged).
+- The heightfield machinery: the capture, verify, and registration
+  instruments remain (the demo scene and every legacy mode still run them);
+  the area path simply does not consume the field — the analytic occluder
+  set it uses is built from the same meshes (M4.0.9.1), so the two cannot
+  disagree.
+
+### Fixed
+
+- **The shipped 0.5.0 fragment shader never compiled.** First hardware build
+  failed: `0(897) : error C1102: incompatible type for parameter #1 ("pts")`.
+  Root cause: `areaBoxBlocker()` declared its local sample array as
+  `vec2 pts[8]` and passed it whole to `areaHull2d(in vec2
+  pts[kAreaBlockVerts])` — GLSL requires an EXACT array-size match on array
+  arguments (no C++-style decay), so 8 != 33 is a compile error. The
+  glsl_balance.py regex lint cannot see type errors, and this environment
+  has no GPU, so the shader had never met any compiler before the user's
+  driver. Hotfix: size the local to `kAreaBlockVerts` (only the first 2*4
+  entries are ever written; the hull consumes the first `n`). Negative
+  control: reverting the fix reproduces the error under glslang at the same
+  call site.
+- **New mandatory gate: `tools/glsl_validate.py`** — extracts all ten
+  `R"GLSL` shader strings (shaders.h, Renderer.cpp, ShadowHeightfield.cpp)
+  and compiles them with the standalone Khronos glslang 16.5.0 binary (no
+  GPU, no context needed). Post-fix run: **10/10 PASS**. This closes the
+  gap that let a non-compiling shader ship: every future shader edit gets a
+  real compile before packaging, alongside the balance lint.
+
+### Known residuals (documented, ledger-measured)
+
+- Sphere visibility: the 33-gon inscribes the tangent-cone section — a
+  one-sided UNDER-block of ≤ ~9% of the local fraction inside the sphere's
+  transition band (≤ 0.9% of K end-to-end), zero in the umbra and the lit
+  region. Fix (M5.1 if the ledger flags it): sample the conic at its
+  rect-crossing points.
+- Specular is a one-tap representative-point quadrature — energy-consistent,
+  not shape-exact (a mirror sphere reflects one bright point, not the patch
+  rectangle; the 16-grid's 16 dots were no closer).
+- Receivers above the emitter plane receive nothing (one-sided patch;
+  unreachable in the frozen rig).
+
+---
+
+## 0.4.9.1 — M4.0.9.1: the analytic lateral half-plane (closing the centroid path's lateral blindness)
+
+User verdict after the M4.0.9 hardware matrix: `--shadow-centroid 1
+--shadow-jitter 1` "looks the best so far", but the shadows still have very
+sharp edges, and shrinking the penumbra does not smooth them. Root cause
+found in the shipped shader: the M4.0.9 centroid grade is exact IN-PLANE
+(the vertical half-plane model, hardware-validated) but structurally blind
+to the LATERAL penumbra — a receiver whose centroid ray skims PAST a
+footprint never touches a real column (`hMax > hMin` never fires), so the
+grade never engages and the lateral silhouette renders as a FULL CLIFF
+(1.0 → pierce-dark across one pixel row). This is exactly the pinned
+"single-ray blindness" (bench_tests; the hardware row's +1.2 edge/shadow
+RMSE) — and no penumbra width can fix a cliff, which is why "shorter
+penumbra" moved the edge but never smoothed it.
+
+### Added
+
+- **Analytic lateral half-plane grade (centroid soft path, default ON)** —
+  the M4.0.9.1 fix. The occluder set is passed to the shader as
+  primitives — the same convex prisms/spheres the heightfield rasterizes
+  (built at load from the occluder meshes' world AABBs, `OccluderSet` in
+  main.cpp; walls are not occluder materials; ≤ 4 boxes + ≤ 4 spheres) —
+  and each march sample additionally grades the signed 2D ground distance
+  r from its own position to the nearest ELIGIBLE primitive:
+  `g_lat = clamp(0.5 + r / (E_perp·min(t, tCap)), 0, 1)`. Eligibility
+  mirrors the texture interval exactly (box: `minH + bias < rayY <
+  maxH − bias`; sphere: the ground disk of radius
+  `sqrt(R² − (|rayY − cy| + bias)²)`, algebraically the same "column
+  interval contains rayY" test). E_perp is the emitter's EXACT lateral
+  support along the trace perpendicular (`2·(hx·|px| + hz·|pz|)` for the
+  1.30 × 1.05 m patch) — the area emitter's anisotropy falls out of the
+  support function for free, while the vertical grade keeps the
+  hardware-measured mean S. Zero new texture taps (pure ALU per sample),
+  continuous at every penumbra width — the lateral cliff becomes the
+  continuous band the rim rays produce. Combination is
+  `min(g_vertical, g_lat)` per sample (each is a 1D half-plane cut of the
+  emitter; block corners grade slightly dark — conservative).
+- **`--shadow-lateral 0|1` (default 1)** — the A/B lever: `0` reproduces
+  the exact M4.0.9 centroid march bit-for-bit (the ledger's 4.0.9.1
+  comparison row; verified value-identical in the float64 model).
+- **Early-out tightening (correctness-driven)** — the soft path's break
+  now additionally requires `B(t) = rayY − (maxHeight − bias) ≥ 0`: with
+  B < 0 a future sample can still be occluder-eligible and the lateral
+  grade (a ground distance, not a clearance) can still fall below the
+  vertical bound; B ≥ 0 proves every future sample is above every
+  occluder top, restoring the bound's exactness. Once any grade reaches 0
+  the march breaks immediately (min cannot go lower — value-neutral, a
+  cost win in deep umbra). The bracket refinement is skipped at
+  `vis == 0` (already the floor) and stays vertical-only (the lateral
+  ramp r(t) is continuous in the ground trace — no cadence aliasing to
+  refine).
+
+### Changed
+
+- **bench_tests contract**: the pinned blindness ("footprint miss → 1")
+  is REWRITTEN to the lateral contract — the same receiver now grades
+  strictly inside (0.5, 0.65) on the continuous ramp (float64 model:
+  0.5689), sliding away strictly brightens (z = 1.30 → 0.7172), the
+  pierce receiver stays exactly 0, and `lateral = 0` reproduces the old
+  1.0 pin bit-for-bit. 197 checks total (was 195).
+- **Telemetry**: the centroid mode line now prints
+  `lateral: analytic half-plane (M4.0.9.1)` / `off (M4.0.9 A/B)`; the
+  derived occluder set size prints at scene load.
+- **verify_cornell_shot.py**: the float64 model mirrors the lateral grade
+  and the early-out tightening exactly; `--shadow-lateral` mirrors the
+  sandbox flag; the model self-check validates (a) default-mode
+  invariance, (b) lateral-OFF ≡ M4.0.9, (c) the lateral ramp values
+  against the hand-derived band geometry. The penumbra-probe
+  absolute-dark special case under centroid mode REMAINS VALID (that
+  probe's centroid ray hard-pierces the block — a pierce is a pierce in
+  any direction), so its expectations are unchanged.
+
+### Preserved
+
+- The DEFAULT transport (16 per-light marches + the M4.0.9 half-pitch
+  parallax window) is byte-for-byte untouched — the binary pin
+  `949d61ab…` and the default-config pin `209fe294…` both hold.
+- The binary centroid march (`--shadow-light-size 0`) is untouched (the
+  lateral grade is soft-path only).
+- The vertical half-plane grade, the 2·step start zone, the march span,
+  and the jitter contract are unchanged.
+
+### Why not the alternatives (external-review adjudication)
+
+- **PCSS-style emitter taps at the blocker depth** (coarse march → tBest,
+  then K graded taps over the emitter rectangle at tBest only): breaks
+  the heightfield exactness story — occluders at depths OTHER than the
+  argmin blocker drop out of the visibility integral in shadow-overlap
+  zones (tall + short block overlap). The analytic per-sample lateral
+  grade integrates every eligible occluder at every depth instead, at
+  zero texture cost.
+- **Backprojection** (project the blocker silhouette through the
+  receiver, clip against the emitter rectangle, shoelace area — the
+  Assarsson–Akenine-Möller soft-shadow-volume family): the exact
+  end-state for convex occluders and the right M5 headline once real
+  `AreaLight` objects land; the half-plane ramps are its per-axis 1D
+  reductions and the natural stepping stone.
+- **Fixed step count** (the `int steps = int(horiz/step)+1` lattice-phase
+  seam the external review flagged): a real secondary defect class
+  (~7% grade steps at wall distances when the sample COUNT jumps),
+  queued for the next milestone with a world-anchored lattice; not mixed
+  into this one (one mechanism per milestone, and every centroid pin
+  would churn).
+
+---
+
 ## 0.4.9 — M4.0.9: the parallax penumbra window + the centroid rig-march experiment (the analytic SSSS adaptation)
 
 User verdict after M4.0.8: the penumbra still reads blocky on hardware. The
@@ -78,14 +378,18 @@ not (anymore) the binary quantization M4.0.7 fixed.
 
 - **The per-light soft window form (the DEFAULT path), in place**:
   M4.0.7's `graded = d / (scale · traveled)` becomes the PARALLAX form
-  `graded = d / (scale · t / (1 − t))` with the scale RE-DERIVED from the
-  grid pitch (`kShadowPenumbra = kLightPitch = 0.325`; was
-  0.5·pitch/height ≈ 0.0299). w(t) is the lateral offset between ADJACENT
-  GRID LIGHTS' shadow edges at blocker depth t — grading each light over
-  its neighbor's edge offset merges the 16-step superposition staircase
-  into the continuous band the area emitter produces. `--shadow-penumbra`
-  keeps its CLI role (0 = the exact binary march; the A/B brackets are now
-  0.1625 / 0.325 / 0.65).
+  `graded = d / (scale · t / (1 − t))`. First derivation: scale = the grid
+  pitch (`kShadowPenumbra = kLightPitch = 0.325`). HARDWARE VERDICT (the
+  M4.0.9 A/B matrix): FALSIFIED for the full pitch — the 4x4 grid's own
+  parallax already synthesizes the physical band, so an emitter-extent
+  window DOUBLE-COUNTS it and similarity degrades monotonically with the
+  scale (edge/shadow RMSE 80.069 / 80.182 / 80.272 / 80.423 at 0 /
+  0.1625 / 0.325 / 0.65). RE-DERIVED default:
+  `kShadowPenumbra = 0.5 · kLightPitch = 0.1625` (~2x the march cadence
+  the window exists to de-quantize; the best SOFT row on every axis, and
+  cheaper than the pitch default). `--shadow-penumbra` keeps its CLI role
+  (0 = the exact binary march AND the metric-king row; 0.325 = the
+  first-default, still reachable; 0.65 = the wide bracket).
 - **March span + window cap (both soft paths)**: the parallax window
   diverges as t → 1, so the march stops at `tEnd = tCap + wCap/(y1−y0)`
   (tCap = the ray's crossing of maxHeight − bias; wCap = the window there)
@@ -103,9 +407,10 @@ not (anymore) the binary quantization M4.0.7 fixed.
   supersession.
 - Telemetry: the shadow line is mode-aware — `shadow mode: centroid march
   (M4.0.9) light size: ... march step: ... refine: ... jitter: ...` for the
-  experiment, and the legacy `shadow penumbra: ...` line (now labeled
-  "soft parallax window (M4.0.9), scale = grid pitch") for the default
-  path. Report line count unchanged (14).
+  experiment, and the legacy `shadow penumbra: ...` line (labeled
+  "soft parallax window (M4.0.9), default scale (half pitch)" for the
+  default config, "... override" otherwise, plus a `jitter:` field on
+  both mode lines) for the default path. Report line count unchanged (14).
 - `tools/verify_cornell_shot.py` is mode-aware: its float64 march mirrors
   the M4.0.9 form (it was still the M4.0.5-era binary 0.16 m march), gains
   `--shadow-centroid/--shadow-light-size/--shadow-step/--shadow-penumbra`

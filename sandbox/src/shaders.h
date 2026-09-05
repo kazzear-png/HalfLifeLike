@@ -138,6 +138,101 @@ uniform int   uShadowJitter;        // M4.0.9 diagnostic (Solution A): per-pixel
                                     // needs temporal accumulation (TAA, M8+)
                                     // to converge -- default OFF, A/B only
 
+// --- M4.0.9.1 lateral half-plane (the analytic occluder set) ----------------
+// The M4.0.9 centroid grade is a HALF-PLANE model driven by the VERTICAL
+// clearance of the columns the one trace touches. A receiver whose centroid
+// ray skims PAST a footprint never touches a real column: every sample is
+// empty, the grade never fires, and the lateral silhouette renders as a
+// full cliff (1.0 -> pierce-dark across one pixel row) -- the hardware
+// A/B row's +1.2 edge RMSE and the field report "very sharp edges". The
+// M4.0.9.1 fix grades the LATERAL miss distance analytically against the
+// occluder set itself -- the same convex prisms/spheres the heightfield
+// rasterizes (walls are NOT occluder materials, isOccluderMaterial in
+// main.cpp) -- zero new texture taps, continuous at every penumbra width:
+//   g_lat = clamp(0.5 + r / (E_perp * min(t, tCap)), 0, 1)
+// r = signed 2D distance from the sample's ground position to the nearest
+// occluding region (negative inside): rect-footprint SDF for boxes, and
+// for spheres the disk of radius sqrt(R^2 - (|rayY - cy| + bias)^2) --
+// EXACTLY the ground region whose column interval [cy-w+bias, cy+w-bias]
+// contains rayY, i.e. the same eligibility the texture interval encodes.
+// A box is eligible iff minH + bias < rayY < maxH - bias (same interval
+// test as the vertical grade, height terms only). E_perp = the emitter's
+// exact lateral support along the trace perpendicular,
+// 2*(hx*|px| + hz*|pz|) for the 1.30 x 1.05 m patch -- the anisotropy the
+// external review flagged, for free; the VERTICAL grade keeps the derived
+// mean S (shipped, hardware-measured -- the M4.0.9 contract is untouched).
+// min(g_vertical, g_lat) is the conservative combination (each is a 1D
+// half-plane cut of the emitter; block corners grade slightly dark).
+// uShadowLateral == 0 reproduces the M4.0.9 centroid march bit-for-bit
+// (the ledger's A/B lever for the 4.0.9.1 row).
+uniform int   uShadowLateral;       // 1 = analytic lateral half-plane (M4.0.9.1
+                                    // default); 0 = exact M4.0.9 centroid march
+uniform int   uShadowBoxCount;      // analytic occluder boxes (<= 4)
+uniform vec4  uShadowBoxMin[4];     // (minX, minZ, minH, pad) per box
+uniform vec4  uShadowBoxMax[4];     // (maxX, maxZ, maxH, pad) per box
+uniform int   uShadowSphereCount;   // analytic occluder spheres (<= 4)
+uniform vec4  uShadowSphere[4];     // (cx, cy, cz, R) per sphere
+uniform vec4  uEmitterHalf;         // (hx, hz, pad, pad): emitter patch
+                                    // half-extents in meters (frozen standard)
+
+// --- M5.0 area-light transport (the milestone: the grid approximation
+// --- retires from the transport) -------------------------------------------
+// uAreaOn == 1 replaces the 16-point-grid transport with the TRUE area
+// emitter: every function here mirrors engine/src/rendering/AreaLight.h
+// line for line, and both mirror the float64 brute-force validator
+// scripts/check_area_model.py (end-to-end agreement 4e-4 worst case on the
+// frozen configs; the sphere's inscribed-conic bias is the one documented
+// approximation, one-sided under-block, <= 0.9% of K end-to-end).
+//
+//   diffuse  : K = -1/2 * sum_i gamma_i * (N . m_i) over the VISIBLE patch
+//              polygon's edges (Arvo's differential-to-polygon form factor;
+//              E_diffuse = L_e * K). The visible polygon starts as the
+//              emitter rect and each occluder SUBTRACTS its backprojected
+//              region -- the central projection of the occluder through the
+//              receiver onto the emitter plane, EXACT for convex occluders
+//              (the same exactness class as the heightfield interval).
+//              Subtraction = the first-outside-edge decomposition: each
+//              term is ONE Sutherland-Hodgman half-plane clip of the current
+//              piece (area- and Arvo-exact for any simple subject; the
+//              zero-width bridge edges carry no area and their edge
+//              contributions cancel exactly). This makes the multi-blocker
+//              union EXACT -- the naive per-blocker product over-darkened a
+//              cbox03 overlap band by 18.4% (measured in
+//              check_area_model.py section 4).
+//              Boxes: region = convex hull of the two height-cap footprints
+//              projected through the receiver (the radial sweep of the
+//              footprint between the cap magnifications m(h) = (Ly-Py)/(h-Py);
+//              floating geometry (the cbox03 baffle) works exactly -- the
+//              under-pass band survives because the region is the sweep of
+//              the [ylo, yhi] band, not a filled hull of one cap).
+//              Spheres: region = section of the tangent cone
+//              {angle(dir, C_hat) <= asin(R/d)}, sampled by 33 boundary
+//              directions in DIRECTION space (robust where the receiver sits
+//              ON the sphere and the tangent circle collapses; the floor
+//              sphere + floor receiver case sits exactly on the parabolic
+//              boundary), sub-horizontal generators far-clamped at 50 m
+//              (the room is 5.5 m, so the clamp chord cannot cut the rect).
+//   specular : representative point (reflection ray intersected with the
+//              emitter plane, clamped into the rect), point GGX with
+//              radiance L_e * Omega * vis, Omega = the patch's solid angle
+//              (Van Oosterom-Strackee) scaled by the form-factor visibility
+//              ratio -- a one-tap, energy-consistent quadrature of
+//              int brdf_s(omega) L cos(theta) domega.
+//
+// Properties the legacy paths cannot offer: zero texture taps, zero march,
+// zero jitter (noise-free by construction), C1-continuous penumbrae in the
+// receiver position (the projections move continuously), contact hardening
+// and emitter-shape anisotropy for free, exact multi-blocker unions.
+// Contract: convex, static occluders; receivers never inside one; the bias
+// guard skips a primitive within uShadowBias of the receiver's height (no
+// self-shadow, matching the heightfield's own-column semantics).
+// --area-light 0 reproduces the M4.0.9.1 transport bit-for-bit (all replay
+// pins live under it).
+uniform int   uAreaOn;              // 1 = M5.0 area-light transport (default)
+uniform vec3  uAreaCenter;          // emitter patch center on the plane
+uniform float uAreaLe;              // emitted radiance L_e (frozen 12.0)
+
+
 // --- M4.0.5 shadow-march debug instrument (temporary) ----------------------
 // --shadow-debug vis|field|uv, default OFF (0). All modes REPLACE the shaded
 // image, so they are diagnostic-only: never feed one to the similarity
@@ -472,8 +567,15 @@ float shadowVisibility(vec3 receiverPos, vec3 lightPos)
 //
 // Early-out (soft path): future samples' clearance is at least
 // B(t) = rayY - (maxHeight - bias) (column tops capped, ray rising), so the
-// future grade is at least 0.5 + B(t)/(S*t), which RISES with t (the
-// B0/t term decays); once it reaches vis, no future sample can lower vis.
+// future vertical grade is at least 0.5 + B(t)/(S*t), which RISES with t
+// (the B0/t term decays). M4.0.9.1 tightens the break with B(t) >= 0:
+// while B < 0 some future sample can still be occluder-eligible (rayY
+// inside a column interval) and the LATERAL grade -- a ground distance,
+// not a clearance -- can then still fall below the vertical bound; B >= 0
+// puts every future sample above every occluder top, so no primitive is
+// eligible, the lateral grade is identically 1 from here on, and the
+// vertical bound alone is again exact. Once any grade reaches 0 the march
+// breaks immediately (min cannot go lower; value-neutral, cost win).
 // Binary path (S == 0): legacy semantics -- first d < 0 returns the hard 0,
 // and the march breaks once the ray is above every occluder.
 //
@@ -492,7 +594,11 @@ float shadowVisibility(vec3 receiverPos, vec3 lightPos)
 // resolution, engaged only where the window fired (vis < 1). A refined
 // sample grading below the march value lowers vis (monotone-safe); there is
 // no hard-0 special case here because the half-plane grade IS the
-// contract -- a refined pierce simply grades dark.
+// contract -- a refined pierce simply grades dark. M4.0.9.1: skipped
+// entirely at vis == 0 (already the floor; the vis==0 march break lands
+// there), and the refinement itself stays vertical-only -- the lateral
+// ramp r(t) is continuous in the ground trace (no cadence aliasing to
+// refine).
 float shadowVisibilityCentroid(vec3 receiverPos, vec3 lightPos)
 {
     if (uShadowDebug != 0) {
@@ -547,6 +653,15 @@ float shadowVisibilityCentroid(vec3 receiverPos, vec3 lightPos)
                                     vec2(12.9898, 78.233))) * 43758.5453);
         jitterOff = noise - 0.5;   // +/- half a sample spacing
     }
+    // M4.0.9.1: the emitter's exact LATERAL support along this trace -- the
+    // support function of the [+-hx]x[+-hz] emitter patch along the trace
+    // perpendicular -- and the lateral active flag (soft path only;
+    // uShadowLateral == 0 reproduces M4.0.9 bit-for-bit).
+    vec2  dir2    = delta / horiz;
+    vec2  perp2   = vec2(-dir2.y, dir2.x);
+    float ePerp   = 2.0 * (uEmitterHalf.x * abs(perp2.x) +
+                           uEmitterHalf.y * abs(perp2.y));
+    bool  lateral = (uShadowLateral == 1) && (uShadowLightSize > 0.0);
     float vis   = 1.0;   // min of the per-sample grades (1 = fully lit)
     float tBest = -1.0;  // argmin sample, for the bracket refinement
     for (int s = 1; s <= steps; ++s) {
@@ -567,38 +682,86 @@ float shadowVisibilityCentroid(vec3 receiverPos, vec3 lightPos)
             }
             continue;
         }
-        // Soft path early-out (see the contract note above): the bound
-        // 0.5 + B(t)/(S*t) rises monotonically in t (the B0/t term decays),
-        // so once it reaches vis no future sample -- empty columns are
-        // skipped below -- can lower vis. y1 > y0 holds for the whole
-        // frozen rig; a descending ray simply marches to the end.
-        if (y1 > y0 &&
-            0.5 + (rayY - (uShadowMaxHeight - uShadowBias)) /
-                  max(uShadowLightSize * t, 1e-5) >= vis) {
+        // Soft path early-out (see the contract note above): the vertical
+        // bound 0.5 + B(t)/(S*t) rises monotonically in t (the B0/t term
+        // decays). M4.0.9.1 adds the B(t) >= 0 gate: with B < 0 a future
+        // sample can still be occluder-eligible and the lateral grade (a
+        // ground distance, not a clearance) can still fall below the
+        // vertical bound; B >= 0 means every future sample is above every
+        // occluder top, so the lateral grade is identically 1 onward and
+        // the vertical bound alone is exact again. With uShadowLateral == 0
+        // the gate is skipped and the break is the exact M4.0.9 form (the
+        // hoisted bBound is the same arithmetic in the same order).
+        // y1 > y0 holds for the whole frozen rig; a descending ray simply
+        // marches to the end.
+        float bBound = rayY - (uShadowMaxHeight - uShadowBias);
+        if (y1 > y0 && (uShadowLateral == 0 || bBound >= 0.0) &&
+            0.5 + bBound / max(uShadowLightSize * t, 1e-5) >= vis) {
             break;
         }
         float traveled = t * segLen;
-        if (traveled > 2.0 * uShadowStep && hMax > hMin) {
-            // Same 2*step start zone as the legacy path; and ONLY a real
-            // column interval grades -- an empty column has no edge to
-            // graze, and grading its huge clearance against the window
-            // would pull every far sample toward the half-lit 0.5.
-            // Window: the half-plane form capped at tCap (the band above
-            // the top edge grades against the occluder-bearing window).
-            float g = 0.5 + d / max(uShadowLightSize * min(t, tCap), 1e-5);
+        if (traveled > 2.0 * uShadowStep) {
+            // Same 2*step start zone as the legacy path (contact shadows
+            // crisp, no self-shade). Vertical grade: ONLY a real column
+            // interval grades -- an empty column has no edge to graze, and
+            // grading its huge clearance against the window would pull
+            // every far sample toward the half-lit 0.5. Window: the
+            // half-plane form capped at tCap (the band above the top edge
+            // grades against the occluder-bearing window).
+            float g = 1.0;
+            if (hMax > hMin) {
+                g = 0.5 + d / max(uShadowLightSize * min(t, tCap), 1e-5);
+            }
+            if (lateral) {
+                // M4.0.9.1 lateral half-plane: signed ground distance from
+                // this sample to the nearest occluding region (the union
+                // of the ELIGIBLE primitives' footprints/disks), ramped by
+                // the emitter's lateral support. Eligibility mirrors the
+                // texture interval exactly: height-inside terms only.
+                vec2 q = mix(p0, p1, t);
+                float rLat = 1e3;   // +clear / -inside the occluding region
+                for (int b = 0; b < uShadowBoxCount; ++b) {
+                    vec3 bmin = uShadowBoxMin[b].xyz;
+                    vec3 bmax = uShadowBoxMax[b].xyz;
+                    if (rayY <= bmin.z + uShadowBias ||
+                        rayY >= bmax.z - uShadowBias) {
+                        continue;   // ray height outside the column interval
+                    }
+                    vec2 dv = max(bmin.xy - q, q - bmax.xy);
+                    float outside = length(max(dv, vec2(0.0)));
+                    float inside  = min(max(dv.x, dv.y), 0.0);
+                    rLat = min(rLat, outside + inside);
+                }
+                for (int sp = 0; sp < uShadowSphereCount; ++sp) {
+                    vec4 sph = uShadowSphere[sp];
+                    float hOff = abs(rayY - sph.y) + uShadowBias;
+                    float rho2 = sph.w * sph.w - hOff * hOff;
+                    if (rho2 <= 0.0) {
+                        continue;   // the sphere never reaches this height
+                    }
+                    rLat = min(rLat, length(q - sph.xz) - sqrt(rho2));
+                }
+                float gLat = clamp(
+                    0.5 + rLat / max(ePerp * min(t, tCap), 1e-5), 0.0, 1.0);
+                g = min(g, gLat);
+            }
             g = clamp(g, 0.0, 1.0);
             if (g < vis) {
                 vis = g;     // min(), plus the argmin t for the refinement
                 tBest = t;
+            }
+            if (vis <= 0.0) {
+                break;   // M4.0.9.1: min cannot go lower (value-neutral)
             }
         }
     }
     // Bracket refinement (see the contract note above): two fetch pairs at
     // half-step offsets around the worst sample, same grade, same start
     // zone. A refined pierce grades dark; the refinement can only lower vis
-    // toward the true minimum, never raise it.
-    if (uShadowLightSize > 0.0 && uShadowRefine > 0.5 && vis < 1.0 &&
-        tBest >= 0.0) {
+    // toward the true minimum, never raise it. M4.0.9.1: not run at
+    // vis == 0 (already the floor).
+    if (uShadowLightSize > 0.0 && uShadowRefine > 0.5 && vis > 0.0 &&
+        vis < 1.0 && tBest >= 0.0) {
         float halfT = 0.5 / float(steps);
         for (int r = 0; r < 2; ++r) {
             float m = tBest + ((r == 0) ? -halfT : halfT);
@@ -621,6 +784,492 @@ float shadowVisibilityCentroid(vec3 receiverPos, vec3 lightPos)
         }
     }
     return vis;
+}
+
+// ===========================================================================
+// M5.0 area-light transport -- GLSL mirror of engine/src/rendering/AreaLight.h
+// (constants, formulas, and evaluation order identical; the float64 reference
+// is scripts/check_area_model.py, the fixtures live in bench_tests.cpp).
+// M5.0.1 adds EXACT-REJECT fast paths on the GPU side only: each blocker is
+// tested against the surviving pieces' AABBs before any hulling/carving and
+// provably-disjoint blockers are skipped (the union cannot change -- an AABB
+// contains its polygon). The float64 model + fixtures are unchanged; the
+// skip logic's soundness is fuzz-verified in check_area_model.py section 8.
+// ===========================================================================
+
+const int   kAreaRing        = 32;    // sphere cone boundary directions
+const int   kAreaBlockVerts  = kAreaRing + 1;   // + the conic-vertex sample
+const float kAreaFarClamp    = 50.0;  // sub-horizontal generator clamp (room 5.5 m)
+const int   kAreaMaxPieces   = 16;    // visible-region piece capacity
+const int   kAreaMaxPieceVerts = 28;  // per-piece vertex capacity
+
+// The visible region as a list of DISJOINT polygons on the emitter plane
+// (union = what is still lit). Shader-scope state, rebuilt per invocation.
+vec2 gAreaPieces[kAreaMaxPieces * kAreaMaxPieceVerts];
+int  gAreaPieceN[kAreaMaxPieces];
+int  gAreaPieceCount = 0;
+
+// M5.0.1 exact-reject bookkeeping: per-piece AABB in emitter-plane xz.
+// Feeds ONLY the reject tests below; it never touches a shaded value, so
+// the transport math is unchanged (SHADOW_EDGE_REFERENCES M5.0.1 carries
+// the equivalence argument and the fuzz gate).
+vec2 gAreaPieceMin2[kAreaMaxPieces];
+vec2 gAreaPieceMax2[kAreaMaxPieces];
+
+// True iff the blocker AABB [bmin2, bmax2] is axis-disjoint from EVERY
+// surviving piece. AABBs contain their polygons, so then no piece region
+// meets the blocker region and the subtract chain would be dead work
+// (at worst it phantom-splits pieces by edge lines without changing the
+// union) -> the caller skips hull and carve entirely.
+bool areaPiecesClearOf(vec2 bmin2, vec2 bmax2)
+{
+    for (int p = 0; p < gAreaPieceCount; ++p) {
+        if (bmax2.x >= gAreaPieceMin2[p].x && bmin2.x <= gAreaPieceMax2[p].x
+         && bmax2.y >= gAreaPieceMin2[p].y && bmin2.y <= gAreaPieceMax2[p].y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Same disjointness test for a conservative DISK bound (center c, radius r):
+// closest point of each piece AABB vs the disk. Used to reject the sphere
+// BEFORE its 33-direction cone sampling.
+bool areaDiskClearOf(vec2 c, float r)
+{
+    float r2 = r * r;
+    for (int p = 0; p < gAreaPieceCount; ++p) {
+        vec2 cl = clamp(c, gAreaPieceMin2[p], gAreaPieceMax2[p]);
+        vec2 dv = c - cl;
+        if (dot(dv, dv) <= r2) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Arvo differential-to-polygon form factor: K = -1/2 * sum gamma_i (N . m_i).
+// Vertex order contract = the frozen rect winding (validated positive by
+// check_area_model.py section 1 to 1e-9 against brute force).
+float areaArvo(vec3 P, vec3 N, vec2 poly[kAreaMaxPieceVerts], int n)
+{
+    if (n < 3) {
+        return 0.0;
+    }
+    float sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        int j = (i + 1) % n;
+        vec3 ua = vec3(poly[i].x - P.x, uAreaCenter.y - P.y, poly[i].y - P.z);
+        vec3 ub = vec3(poly[j].x - P.x, uAreaCenter.y - P.y, poly[j].y - P.z);
+        float la = length(ua);
+        float lb = length(ub);
+        if (la < 1e-12 || lb < 1e-12) {
+            continue;
+        }
+        vec3 a = ua / la;
+        vec3 b = ub / lb;
+        vec3 cr = cross(a, b);
+        float ln = length(cr);
+        if (ln < 1e-12) {
+            continue;
+        }
+        float ca = clamp(dot(a, b), -1.0, 1.0);
+        float gamma = acos(ca);
+        sum += gamma * dot(N, cr / ln);
+    }
+    return -0.5 * sum;
+}
+
+// Van Oosterom-Strackee solid angle of the frozen rect (fan of 2 triangles);
+// the magnitude is winding-signed -> abs() (validated to 1e-5 vs Monte Carlo).
+float areaSolidAngleRect(vec3 P)
+{
+    vec2 c[4];
+    c[0] = uAreaCenter.xz + vec2(-uEmitterHalf.x, -uEmitterHalf.y);
+    c[1] = uAreaCenter.xz + vec2( uEmitterHalf.x, -uEmitterHalf.y);
+    c[2] = uAreaCenter.xz + vec2( uEmitterHalf.x,  uEmitterHalf.y);
+    c[3] = uAreaCenter.xz + vec2(-uEmitterHalf.x,  uEmitterHalf.y);
+    vec3 v[4];
+    for (int i = 0; i < 4; ++i) {
+        v[i] = normalize(vec3(c[i].x - P.x, uAreaCenter.y - P.y, c[i].y - P.z));
+    }
+    float om = 0.0;
+    for (int k = 1; k <= 2; ++k) {
+        vec3 cr = cross(v[k], v[k + 1]);
+        float num = dot(v[0], cr);
+        float den = 1.0 + dot(v[0], v[k]) + dot(v[k], v[k + 1])
+                        + dot(v[k + 1], v[0]);
+        om += 2.0 * atan(num, den);
+    }
+    return abs(om);
+}
+
+// 2D convex hull (monotone chain over an insertion sort). Mirrors the CPU.
+int areaHull2d(in vec2 pts[kAreaBlockVerts], in int n,
+               out vec2 hull[kAreaBlockVerts])
+{
+    for (int i = 1; i < n; ++i) {
+        vec2 v = pts[i];
+        int j = i - 1;
+        while (j >= 0 && (pts[j].x > v.x ||
+               (pts[j].x == v.x && pts[j].y > v.y))) {
+            pts[j + 1] = pts[j];
+            --j;
+        }
+        pts[j + 1] = v;
+    }
+    vec2 uniq[kAreaBlockVerts];
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+        if (m == 0 || pts[i] != uniq[m - 1]) {
+            uniq[m++] = pts[i];
+        }
+    }
+    if (m < 3) {
+        for (int i = 0; i < m; ++i) {
+            hull[i] = uniq[i];
+        }
+        return m;
+    }
+    vec2 lower[kAreaBlockVerts];
+    int lk = 0;
+    for (int i = 0; i < m; ++i) {
+        while (lk >= 2) {
+            vec2 o = lower[lk - 2];
+            vec2 a = lower[lk - 1];
+            float cr = (a.x - o.x) * (uniq[i].y - o.y)
+                     - (a.y - o.y) * (uniq[i].x - o.x);
+            if (cr <= 0.0) { --lk; } else { break; }
+        }
+        lower[lk++] = uniq[i];
+    }
+    vec2 upper[kAreaBlockVerts];
+    int uk = 0;
+    for (int i = m - 1; i >= 0; --i) {
+        while (uk >= 2) {
+            vec2 o = upper[uk - 2];
+            vec2 a = upper[uk - 1];
+            float cr = (a.x - o.x) * (uniq[i].y - o.y)
+                     - (a.y - o.y) * (uniq[i].x - o.x);
+            if (cr <= 0.0) { --uk; } else { break; }
+        }
+        upper[uk++] = uniq[i];
+    }
+    int h = 0;
+    for (int i = 0; i < lk - 1; ++i) {
+        hull[h++] = lower[i];
+    }
+    for (int i = 0; i < uk - 1; ++i) {
+        hull[h++] = upper[i];
+    }
+    return h;
+}
+
+// Box blocker footprint POINTS: the hull inputs of the two height-cap
+// footprints projected through the receiver -- the exact radial sweep of the
+// [ylo, yhi] band. Hulling is the CALLER's job so the exact-reject test can
+// run before the O(n log n) sort. Occluder uniform pack:
+// (minX, minZ, minH, pad) -> .xy = (x, z), .z = height.
+// Returns the point count (0 = ineligible); bmin2/bmax2 = their exact AABB
+// (the hull can never leave it; min/max are exact ops).
+int areaBoxBlockerPts(vec3 P, vec4 bmin, vec4 bmax,
+                      out vec2 pts[kAreaBlockVerts],
+                      out vec2 bmin2, out vec2 bmax2)
+{
+    bmin2 = vec2(0.0);
+    bmax2 = vec2(0.0);
+    float ylo2 = max(bmin.z, P.y + uShadowBias);
+    float yhi2 = min(bmax.z, uAreaCenter.y - uShadowBias);
+    if (ylo2 >= yhi2 || yhi2 <= P.y + uShadowBias) {
+        return 0;   // ineligible: receiver at/above the top, or degenerate
+    }
+    float mIn  = (uAreaCenter.y - P.y) / (yhi2 - P.y);   // top cap (inner)
+    float mOut = (uAreaCenter.y - P.y) / (ylo2 - P.y);   // bottom cap (outer)
+    vec2 c[4];
+    c[0] = vec2(bmin.x, bmin.y);
+    c[1] = vec2(bmax.x, bmin.y);
+    c[2] = vec2(bmax.x, bmax.y);
+    c[3] = vec2(bmin.x, bmax.y);
+    // Sized to kAreaBlockVerts, not 8: GLSL requires an EXACT array-size
+    // match when passing whole arrays to a sized array parameter
+    // (areaHull2d's pts[33]); a size mismatch is a compile error (C1102),
+    // not a decay like C++. Only the first 2*4 entries are ever written.
+    int n = 0;
+    for (int k = 0; k < 4; ++k) {
+        vec2 pin  = P.xz + mIn  * (c[k] - P.xz);
+        vec2 pout = P.xz + mOut * (c[k] - P.xz);
+        pts[n++] = pin;
+        pts[n++] = pout;
+    }
+    bmin2 = pts[0];
+    bmax2 = pts[0];
+    for (int i = 1; i < n; ++i) {
+        bmin2 = min(bmin2, pts[i]);
+        bmax2 = max(bmax2, pts[i]);
+    }
+    return n;
+}
+
+// Sphere blocker footprint POINTS: 33 boundary directions of the tangent
+// cone {angle(dir, C_hat) <= asin(R/d)}, projected through the receiver onto
+// the emitter plane; sub-horizontal generators clamp at kAreaFarClamp along
+// their xz azimuth (the parabolic/exterior boundary case -- floor sphere +
+// floor receiver sits exactly on it). Direction-space sampling stays
+// well-defined where the tangent circle collapses (receiver ON the sphere).
+// Returns the point count (0 = ineligible/rejected); bmin2/bmax2 = the
+// sampled points' exact AABB (the hull can never leave it).
+int areaSphereBlockerPts(vec3 P, vec4 sph, out vec2 pts[kAreaBlockVerts],
+                         out vec2 bmin2, out vec2 bmax2)
+{
+    bmin2 = vec2(0.0);
+    bmax2 = vec2(0.0);
+    if (sph.y + sph.w <= P.y + uShadowBias) {
+        return 0;   // sphere entirely below the receiver
+    }
+    vec3 g = sph.xyz - P;
+    float d = length(g);
+    if (d * d < (sph.w - uShadowBias) * (sph.w - uShadowBias)) {
+        // receiver deep inside the occluder: full-block sentinel triangle
+        // (unreachable in the frozen rig; conservative)
+        pts[0] = vec2(-1e3, -1e3);
+        pts[1] = vec2( 1e3, -1e3);
+        pts[2] = vec2( 0.0,  1e3);
+        bmin2 = min(min(pts[0], pts[1]), pts[2]);
+        bmax2 = max(max(pts[0], pts[1]), pts[2]);
+        return 3;
+    }
+    vec3 ch = g / d;
+    float sa = min(sph.w / d, 1.0);
+    float ca = sqrt(1.0 - sa * sa);
+    vec3 e1 = (abs(ch.y) < 0.9)
+        ? normalize(cross(ch, vec3(0.0, 1.0, 0.0)))
+        : normalize(cross(ch, vec3(1.0, 0.0, 0.0)));
+    vec3 e2 = cross(ch, e1);
+    float thv = atan(e2.y, e1.y);   // the ring's max-d.y direction: conic vertex
+    // M5.0.1 exact-reject (pre-disk): every tangent-cone direction satisfies
+    //   dir.y >= ymin = ca*ch.y - sa*sqrt(1-ch.y^2)   (m.y range for m _|_ ch)
+    //   |dir.xz| <= ca*|ch.xz| + sa                    (|m.xz| <= 1)
+    // and the plane hit is q = P.xz + (Cy-Py)*dir.xz/dir.y, so the WHOLE
+    // footprint fits in disk(P.xz, rFoot). ymin > 0 <=> no generator is
+    // sub-horizontal <=> the kAreaFarClamp branch never runs. If the disk
+    // misses every piece AABB, the cone provably reaches no piece: skip the
+    // 33 sin/cos samples, the hull, and the carve.
+    float ymin = ca * ch.y - sa * sqrt(max(1.0 - ch.y * ch.y, 0.0));
+    if (ymin > 1e-4) {
+        float rFoot = (uAreaCenter.y - P.y) * (ca * length(ch.xz) + sa) / ymin;
+        if (areaDiskClearOf(P.xz, rFoot)) {
+            return 0;
+        }
+    }
+    int n = 0;
+    for (int k = 0; k <= kAreaRing; ++k) {
+        float th = (k < kAreaRing)
+            ? (6.28318530718 * float(k) / float(kAreaRing))
+            : thv;
+        float ct = cos(th);
+        float st = sin(th);
+        vec3 dir = ca * ch + sa * (e1 * ct + e2 * st);
+        if (dir.y > 1e-6) {
+            float s = (uAreaCenter.y - P.y) / dir.y;
+            vec2 pt = P.xz + s * dir.xz;
+            pts[n++] = pt;
+            bmin2 = (n == 1) ? pt : min(bmin2, pt);
+            bmax2 = (n == 1) ? pt : max(bmax2, pt);
+        } else {
+            float hxz = length(dir.xz);
+            if (hxz > 1e-9) {
+                vec2 pt = P.xz + kAreaFarClamp * (dir.xz / hxz);
+                pts[n++] = pt;
+                bmin2 = (n == 1) ? pt : min(bmin2, pt);
+                bmax2 = (n == 1) ? pt : max(bmax2, pt);
+            }
+        }
+    }
+    if (n < 3) {
+        bmin2 = vec2(0.0);
+        bmax2 = vec2(0.0);
+    }
+    return n;
+}
+
+// First-outside-edge subtraction of the convex blocker B from every piece:
+//   piece - B = U_i (piece n outside(e_i) n inside(e_1..e_{i-1}))
+// each term = one Sutherland-Hodgman half-plane clip (area- and Arvo-exact
+// for any simple subject; bridges lie on the clip line, carry no area, and
+// their edge contributions cancel exactly in the Arvo sum). The leftover
+// piece n B is dropped (fully blocked). Union over blockers stays EXACT.
+void areaSubtractBlocker(in vec2 B[kAreaBlockVerts], in int bn,
+                         in vec2 bmin2, in vec2 bmax2)
+{
+    vec2 newV[kAreaMaxPieces * kAreaMaxPieceVerts];
+    int  newN[kAreaMaxPieces];
+    int  newCount = 0;
+    for (int p = 0; p < gAreaPieceCount; ++p) {
+        int base = p * kAreaMaxPieceVerts;
+        // M5.0.1 exact-reject: a piece whose AABB misses B's AABB keeps its
+        // whole region -- the edge chain could only phantom-split it into
+        // area-equal parts (bridges carry no area; the union is unchanged),
+        // so copy it through bit-for-bit and skip the bn-edge chain.
+        if (bmax2.x < gAreaPieceMin2[p].x || bmin2.x > gAreaPieceMax2[p].x
+         || bmax2.y < gAreaPieceMin2[p].y || bmin2.y > gAreaPieceMax2[p].y) {
+            if (newCount < kAreaMaxPieces) {
+                int dst = newCount * kAreaMaxPieceVerts;
+                for (int v = 0; v < gAreaPieceN[p]; ++v) {
+                    newV[dst + v] = gAreaPieces[base + v];
+                }
+                newN[newCount] = gAreaPieceN[p];
+                ++newCount;
+            }
+            continue;
+        }
+        vec2 W[kAreaMaxPieceVerts];
+        int wn = gAreaPieceN[p];
+        for (int i = 0; i < wn; ++i) {
+            W[i] = gAreaPieces[base + i];
+        }
+        for (int i = 0; i < bn && wn >= 3; ++i) {
+            vec2 a = B[i];
+            vec2 b = B[(i + 1) % bn];
+            vec2 outP[kAreaMaxPieceVerts];
+            int  outN = 0;
+            vec2 inP[kAreaMaxPieceVerts];
+            int  inN = 0;
+            for (int v = 0; v < wn; ++v) {
+                int w2 = (v + 1) % wn;
+                vec2 pt = W[v];
+                vec2 qt = W[w2];
+                float sp = (b.x - a.x) * (pt.y - a.y) - (b.y - a.y) * (pt.x - a.x);
+                float sq = (b.x - a.x) * (qt.y - a.y) - (b.y - a.y) * (qt.x - a.x);
+                bool inPside = sp <= 0.0;   // right of a->b = outside the hull
+                bool inQside = sq <= 0.0;
+                if (inPside && outN < kAreaMaxPieceVerts) {
+                    outP[outN++] = pt;
+                }
+                if (!inPside && inN < kAreaMaxPieceVerts) {
+                    inP[inN++] = pt;
+                }
+                if (inPside != inQside) {
+                    float t = sp / (sp - sq);
+                    vec2 xing = pt + t * (qt - pt);
+                    if (outN < kAreaMaxPieceVerts) {
+                        outP[outN++] = xing;
+                    }
+                    if (inN < kAreaMaxPieceVerts) {
+                        inP[inN++] = xing;
+                    }
+                }
+            }
+            if (outN >= 3 && newCount < kAreaMaxPieces) {
+                int dst = newCount * kAreaMaxPieceVerts;
+                for (int v = 0; v < outN; ++v) {
+                    newV[dst + v] = outP[v];
+                }
+                newN[newCount] = outN;
+                ++newCount;
+            }
+            wn = inN;
+            for (int v = 0; v < inN; ++v) {
+                W[v] = inP[v];
+            }
+        }
+        // W = piece n B: fully blocked, dropped
+    }
+    gAreaPieceCount = newCount;
+    for (int p = 0; p < newCount; ++p) {
+        int src = p * kAreaMaxPieceVerts;
+        vec2 lo = newV[src];
+        vec2 hi = newV[src];
+        for (int v = 0; v < newN[p]; ++v) {
+            vec2 pv = newV[src + v];
+            gAreaPieces[src + v] = pv;
+            lo = min(lo, pv);   // exact (min/max add no rounding)
+            hi = max(hi, pv);
+        }
+        gAreaPieceMin2[p] = lo;   // shipped piece's exact AABB, for the
+        gAreaPieceMax2[p] = hi;   // next blocker's reject tests
+        gAreaPieceN[p] = newN[p];
+    }
+}
+
+// THE transport: subtract every occluder's backprojected region from the
+// emitter rect, then form-factor the surviving pieces. kRect (out) = the
+// unshadowed rect form factor (also the specular visibility denominator).
+// M5.0.1 exact-reject fast paths: each blocker is tested against the
+// surviving pieces' AABBs BEFORE any hulling/carving (box: after the 8
+// corner transforms; sphere: a conservative disk bound, then the sampled
+// cone's AABB). A blocker that provably reaches no piece is skipped -- the
+// union is unchanged, only dead decomposition work disappears. If NO
+// blocker carved, the piece list is still exactly the rect and the
+// transport returns kRect directly (the final loop would sum one areaArvo
+// over rectP, which is bit-identical to kRect by construction).
+float areaLightVisibility(vec3 P, vec3 N, out float kRect)
+{
+    vec2 rectP[kAreaMaxPieceVerts];
+    rectP[0] = uAreaCenter.xz + vec2(-uEmitterHalf.x, -uEmitterHalf.y);
+    rectP[1] = uAreaCenter.xz + vec2( uEmitterHalf.x, -uEmitterHalf.y);
+    rectP[2] = uAreaCenter.xz + vec2( uEmitterHalf.x,  uEmitterHalf.y);
+    rectP[3] = uAreaCenter.xz + vec2(-uEmitterHalf.x,  uEmitterHalf.y);
+    kRect = areaArvo(P, N, rectP, 4);
+    if (kRect <= 0.0) {
+        return 0.0;   // receiver at/above the plane or backfacing
+    }
+    gAreaPieceCount = 1;
+    gAreaPieceN[0] = 4;
+    gAreaPieces[0] = rectP[0];
+    gAreaPieces[1] = rectP[1];
+    gAreaPieces[2] = rectP[2];
+    gAreaPieces[3] = rectP[3];
+    gAreaPieceMin2[0] = rectP[0];   // the rect is axis-aligned: corners
+    gAreaPieceMax2[0] = rectP[2];   // 0 and 2 are its exact AABB
+    bool carved = false;
+    for (int b = 0; b < uShadowBoxCount; ++b) {
+        vec2 pts[kAreaBlockVerts];
+        vec2 bmin2, bmax2;
+        int n = areaBoxBlockerPts(P, uShadowBoxMin[b], uShadowBoxMax[b],
+                                  pts, bmin2, bmax2);
+        if (n < 3 || areaPiecesClearOf(bmin2, bmax2)) {
+            continue;   // ineligible/degenerate, or provably reaches no piece
+        }
+        vec2 B[kAreaBlockVerts];
+        int bn = areaHull2d(pts, n, B);
+        if (bn >= 3) {
+            areaSubtractBlocker(B, bn, bmin2, bmax2);
+            carved = true;
+            if (gAreaPieceCount == 0) {
+                return 0.0;
+            }
+        }
+    }
+    for (int s = 0; s < uShadowSphereCount; ++s) {
+        vec2 pts[kAreaBlockVerts];
+        vec2 bmin2, bmax2;
+        int n = areaSphereBlockerPts(P, uShadowSphere[s], pts, bmin2, bmax2);
+        if (n < 3 || areaPiecesClearOf(bmin2, bmax2)) {
+            continue;   // ineligible/degenerate, or provably reaches no piece
+        }
+        vec2 B[kAreaBlockVerts];
+        int bn = areaHull2d(pts, n, B);
+        if (bn >= 3) {
+            areaSubtractBlocker(B, bn, bmin2, bmax2);
+            carved = true;
+            if (gAreaPieceCount == 0) {
+                return 0.0;
+            }
+        }
+    }
+    if (!carved) {
+        return kRect;   // pieces == [rect] exactly; skip the final Arvo loop
+    }
+    float k = 0.0;
+    for (int p = 0; p < gAreaPieceCount; ++p) {
+        int base = p * kAreaMaxPieceVerts;
+        vec2 poly[kAreaMaxPieceVerts];
+        for (int v = 0; v < gAreaPieceN[p]; ++v) {
+            poly[v] = gAreaPieces[base + v];
+        }
+        k += areaArvo(P, N, poly, gAreaPieceN[p]);
+    }
+    return clamp(k, 0.0, kRect);   // visibility can only remove light
 }
 
 // Single-light Cook-Torrance evaluation. radiance = color * intensity * falloff.
@@ -736,6 +1385,58 @@ void main()
     // M4.0.9 centroid mode: ONE march to the emitter centroid is shared by
     // the whole rig -- the per-light BRDF quadrature (falloff, NoL, GGX) is
     // UNCHANGED, only the shadow transport collapses 16 marches into 1.
+    // M5.0: when uAreaOn == 1 the WHOLE grid loop is replaced by the true
+    // area-light transport above (exact visible-patch form factor + analytic
+    // backprojection visibility + representative-point specular). The legacy
+    // branch below is untouched, so --area-light 0 reproduces the M4.0.9.1
+    // transport bit-for-bit and every replay pin lives under it.
+    if (uAreaOn == 1 && uShadowOn == 1) {
+        float kRect = 0.0;
+        float kVis  = 0.0;
+        if (uAreaCenter.y > vWorldPos.y) {
+            kVis = areaLightVisibility(vWorldPos, N, kRect);
+        }
+        if (kRect > 0.0 && kVis > 0.0) {
+            // DIFFUSE: the exact form factor of the VISIBLE patch region
+            // (irradiance = L_e * K), split with the engine's ambient
+            // convention kD = (1 - F_amb)(1 - metalness) -- metals get no
+            // diffuse from the area light, exactly as from the point grid.
+            color += kD * albedo / PI * (uAreaLe * kVis);
+            // SPECULAR: representative point on the patch -- the reflection
+            // ray intersected with the emitter plane, clamped into the rect
+            // -- evaluated with the point GGX and radiance L_e * Omega * vis
+            // (Omega = the patch's solid angle; the ratio scales it by the
+            // form-factor visibility -- energy-consistent one-tap quadrature).
+            vec3 Rv = reflect(-V, N);
+            vec3 Lrep;
+            if (Rv.y > 1e-4) {
+                vec3 Q = vWorldPos + Rv * ((uAreaCenter.y - vWorldPos.y) / Rv.y);
+                Q.x = clamp(Q.x, uAreaCenter.x - uEmitterHalf.x,
+                                 uAreaCenter.x + uEmitterHalf.x);
+                Q.z = clamp(Q.z, uAreaCenter.z - uEmitterHalf.y,
+                                 uAreaCenter.z + uEmitterHalf.y);
+                Lrep = normalize(Q - vWorldPos);
+            } else {
+                Lrep = normalize(uAreaCenter - vWorldPos);
+            }
+            float NoLrep = dot(N, Lrep);
+            if (NoLrep > 0.0) {
+                float omegaVis = areaSolidAngleRect(vWorldPos) * (kVis / kRect);
+                vec3  H = V + Lrep;
+                H = (dot(H, H) > 1e-8) ? normalize(H) : N;
+                float NoVr = clamp(dot(N, V), 1e-4, 1.0);
+                float NoHr = clamp(dot(N, H), 0.0, 1.0);
+                float VoHr = clamp(dot(V, H), 0.0, 1.0);
+                vec3 spec = D_GGX(NoHr, alpha)
+                          * F_Schlick(VoHr, f0)
+                          * V_SmithGGXCorrelated(NoVr, NoLrep, alpha);
+                color += spec * (uAreaLe * omegaVis) * NoLrep;
+            }
+            if (uShadowDebug != 0) {
+                g_dbgMinVis = min(g_dbgMinVis, kVis / kRect);   // instrument
+            }
+        }
+    } else {
     float rigVis     = 1.0;
     bool  rigMarched = false;
     for (int i = 0; i < 16; ++i) {
@@ -768,6 +1469,7 @@ void main()
         vec3  radiance = uPointRadiance[i] / max(dist * dist, 1e-4);
         color += shadeLight(N, V, L, radiance, albedo, alpha, f0, uMetalness) * vis;
     }
+    } // end legacy 16-grid transport branch (M4.x, byte-identical)
 
     // --- flashlight (smooth-edged cone on the camera) ---
     if (uSpotOn == 1) {

@@ -19,7 +19,9 @@ after every milestone that touches build / window / input / rendering / assets
       - `math_tests` — **73 checks, 0 failure(s)**
       - `obj_tests` — **24 checks, 0 failure(s)**
       - `brdf_tests` — **38 checks, 0 failure(s)** (M3.2: reference-value suite)
-      - `bench_tests` — **195 checks, 0 failure(s)** (M3.3 frozen pins + M3.3.1 orientation pins + M4 shadow-march/capture-matrix/field-verify pins + M4.0.4 world→texel registration pins + M4.0.7 soft-penumbra graded-path pins + M4.0.8 bracket-refinement pins + M4.0.9 centroid-march / parallax-window / jitter / vertical-column pins)
+      - `bench_tests` — **225 checks, 0 failure(s)** (M3.3 frozen pins + M3.3.1 orientation pins + M4 shadow-march/capture-matrix/field-verify pins + M4.0.4 world→texel registration pins + M4.0.7 soft-penumbra graded-path pins + M4.0.8 bracket-refinement pins + M4.0.9 centroid-march / parallax-window / jitter / vertical-column pins + M4.0.9.1 analytic-lateral-half-plane pins + M5.0 area-light transport pins: the float64 fixture set for the exact visible-patch form factor and backprojection visibility (box sweeps, multi-blocker unions, the sphere cone), the contact-grade band, the self-shadow exclusion contract, the VOS solid-angle identity, and the frozen-constant ride-along)
+      - `glsl_validate` — **10 shaders compiled, 0 errors** (M5.0 hotfix gate: every `R"GLSL` string in shaders.h / Renderer.cpp / ShadowHeightfield.cpp compiled by standalone Khronos glslang 16.5.0; created after the first hardware build caught a C1102 array-size mismatch no regex lint could see)
+      - `check_area_model` — **8 sections, ALL OK** (M5.0.1 gate: the float64 model battery + the exact-reject equivalence fuzz — 4000 iterations of jittered rigs asserting per-fired-reject SAT soundness, the no-region-loss direction, brute-force adjudication of any deviation (skips must be strictly closer), and frozen-config agreement to 1e-12 relative)
 - [ ] (Windows) Double-clicking `engine_math_tests.exe` / `engine_obj_tests.exe`
       in Explorer runs the suite and holds the console open with
       "Press Enter to close..." — results stay readable; `ctest` runs are

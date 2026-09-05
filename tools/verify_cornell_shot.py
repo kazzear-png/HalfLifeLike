@@ -87,8 +87,22 @@ SPHERES = (  # (cx, cz, r, floor_y) -- column interval is exact for convex solid
 MARCH_STEP = 0.08        # sandbox per-light default (kMarchStep, M4.0.6)
 MARCH_STEP_CENTROID = 0.04  # sandbox centroid default (kCentroidMarchStep, M4.0.9)
 MARCH_BIAS = 0.01
-PENUMBRA = 0.325         # kShadowPenumbra (M4.0.9 parallax window scale = grid pitch)
+PENUMBRA = 0.1625        # kShadowPenumbra (M4.0.9 default = half grid pitch;
+                         # re-derived after the hardware A/B matrix -- the
+                         # full-pitch first default double-counted the 4x4
+                         # grid's own parallax; --shadow-penumbra overrides)
 LIGHT_SIZE = 1.175       # kShadowLightSize (M4.0.9 centroid half-plane S, emitter mean)
+EMITTER_HALF = (0.65, 0.525)  # the frozen patch's half-extents (M4.0.9.1
+                              # lateral support; EMITTER_MIN/MAX / 2)
+LATERAL_DEFAULT = 1      # kShadowLateralDefault (M4.0.9.1 analytic lateral
+                         # half-plane; 0 = exact M4.0.9 centroid march)
+AREA_LIGHT_DEFAULT = 1   # kAreaLightDefault (M5.0 true area-light transport;
+                         # 0 = the exact M4.0.9.1 grid transport, all pins)
+LE = 12.0                # kEmitterRadiance (frozen standard)
+
+# M5.0 area-model constants (mirror the shader / AreaLight.h exactly).
+AREA_FAR_CLAMP = 50.0    # sub-horizontal generator clamp (the room is 5.5 m)
+AREA_RING = 32           # sphere cone boundary directions (+1 vertex sample)
 
 # M4.0.9 shadow-mode arguments (must mirror the sandbox flags used for the
 # shot; the defaults track the sandbox defaults). The float64 march below is
@@ -96,12 +110,15 @@ LIGHT_SIZE = 1.175       # kShadowLightSize (M4.0.9 centroid half-plane S, emitt
 # honest under every mode.
 class ShadowMode:
     def __init__(self, centroid=False, light_size=LIGHT_SIZE,
-                 step=None, penumbra=PENUMBRA):
+                 step=None, penumbra=PENUMBRA, lateral=LATERAL_DEFAULT,
+                 area=AREA_LIGHT_DEFAULT):
         self.centroid = centroid
         self.light_size = light_size
         self.step = step if step is not None else \
             (MARCH_STEP_CENTROID if centroid else MARCH_STEP)
         self.penumbra = 0.0 if centroid and light_size <= 0.0 else penumbra
+        self.lateral = lateral
+        self.area = area
 MAXH_BOXES = 3.30
 MAXH_BAFFLE = 5.40
 
@@ -125,6 +142,24 @@ def solid_intervals(variant):
     if variant == "cornell03":
         solids += [box_interval(*BAFFLE)]
     return solids
+
+
+def occluder_primitives(variant):
+    """M4.0.9.1: the analytic occluder set for the lateral half-plane grade --
+    the SAME solids solid_intervals() rasterizes, as primitive data:
+    ("box", (minX, minZ, minH, maxX, maxZ, maxH)) or
+    ("sphere", (cx, cy, cz, r)). Mirrors the sandbox's OccluderSet (built
+    from the loaded meshes' AABBs; walls are not occluder materials)."""
+    def box_prim(geom):
+        (x0, x1), (z0, z1), y0, y1 = geom
+        return ("box", (x0, z0, y0, x1, z1, y1))
+    prims = [box_prim(TALL_BLOCK), box_prim(SHORT_BLOCK)]
+    if variant == "cornell02":
+        for cx, cz, r, fy in SPHERES:
+            prims.append(("sphere", (cx, fy + r, cz, r)))
+    if variant == "cornell03":
+        prims.append(box_prim(BAFFLE))
+    return prims
 
 
 def march_visibility(px, py, pz, lx, ly, lz, solids, max_h,
@@ -198,10 +233,17 @@ def march_visibility(px, py, pz, lx, ly, lz, solids, max_h,
 
 def march_visibility_centroid(px, py, pz, cx, cy, cz, solids, max_h,
                               step=MARCH_STEP_CENTROID, bias=MARCH_BIAS,
-                              light_size=LIGHT_SIZE, refine=True):
-    """float64 port of the shader's shadowVisibilityCentroid (M4.0.9):
-    ONE march to the emitter centroid shared by the rig, graded per sample
-    by the half-plane area model g = clamp(0.5 + d/(S*t), 0, 1)."""
+                              light_size=LIGHT_SIZE, refine=True,
+                              lateral=LATERAL_DEFAULT, prims=(),
+                              emitter_half=EMITTER_HALF):
+    """float64 port of the shader's shadowVisibilityCentroid (M4.0.9 + the
+    M4.0.9.1 lateral half-plane): ONE march to the emitter centroid shared
+    by the rig, graded per sample by the half-plane area model
+    g = clamp(0.5 + d/(S*t), 0, 1), min-combined with the lateral ramp
+    g_lat = clamp(0.5 + r/(E_perp*min(t, tCap)), 0, 1) where r is the signed
+    ground distance to the nearest ELIGIBLE primitive (height interval
+    mirrors the texture column semantics; lateral = 0 is the exact M4.0.9
+    march)."""
     dx, dz = cx - px, cz - pz
     horiz = math.sqrt(dx * dx + dz * dz)
     if horiz < 1e-4:
@@ -211,6 +253,11 @@ def march_visibility_centroid(px, py, pz, cx, cy, cz, solids, max_h,
             d_v = max(d_v, max(h_min + bias - max(py, cy),
                                min(py, cy) - (h_max - bias)))
         return 0.0 if d_v < 0.0 else 1.0
+    # M4.0.9.1: the emitter's exact lateral support along this trace.
+    perp_x, perp_z = -dz / horiz, dx / horiz
+    e_perp = 2.0 * (emitter_half[0] * abs(perp_x) +
+                    emitter_half[1] * abs(perp_z))
+    lateral_active = bool(lateral) and light_size > 0.0
     if cy > py:
         t_cap = (max_h - bias - py) / (cy - py)
         t_cap = min(1.0, max(0.0, t_cap))
@@ -241,16 +288,53 @@ def march_visibility_centroid(px, py, pz, cx, cy, cz, solids, max_h,
             if d < 0.0:
                 return 0.0
             continue
-        if cy > py and 0.5 + (ray_y - (max_h - bias)) / \
-                max(light_size * t, 1e-5) >= vis:
+        # M4.0.9.1 early-out: the vertical bound alone is exact only once
+        # the ray has cleared the global top (b_bound >= 0) -- before that
+        # a future sample can still be occluder-eligible and the lateral
+        # grade (a ground distance) can still fall below the bound.
+        b_bound = ray_y - (max_h - bias)
+        if cy > py and (not lateral_active or b_bound >= 0.0) and \
+                0.5 + b_bound / max(light_size * t, 1e-5) >= vis:
             break
         traveled = t * seg_len
-        if traveled > 2.0 * step and solid:
-            g = min(1.0, max(0.0,
-                    0.5 + d / max(light_size * min(t, t_cap), 1e-5)))
+        if traveled > 2.0 * step:
+            g = 1.0
+            if solid:
+                g = 0.5 + d / max(light_size * min(t, t_cap), 1e-5)
+            if lateral_active:
+                # M4.0.9.1 lateral half-plane: signed ground distance to
+                # the nearest ELIGIBLE primitive, ramped by the emitter's
+                # lateral support (mirrors the shader exactly).
+                r_lat = 1e3
+                for prim in prims:
+                    if prim[0] == "box":
+                        bx0, bz0, bh0, bx1, bz1, bh1 = prim[1]
+                        if ray_y <= bh0 + bias or ray_y >= bh1 - bias:
+                            continue
+                        dvx = max(bx0 - x, x - bx1)
+                        dvz = max(bz0 - z, z - bz1)
+                        outside = math.sqrt(max(dvx, 0.0) ** 2 +
+                                            max(dvz, 0.0) ** 2)
+                        inside = min(max(dvx, dvz), 0.0)
+                        r_lat = min(r_lat, outside + inside)
+                    else:
+                        scx, scy, scz, sr = prim[1]
+                        h_off = abs(ray_y - scy) + bias
+                        rho2 = sr * sr - h_off * h_off
+                        if rho2 <= 0.0:
+                            continue
+                        r_lat = min(r_lat,
+                                    math.sqrt((x - scx) ** 2 + (z - scz) ** 2)
+                                    - math.sqrt(rho2))
+                g_lat = min(1.0, max(0.0,
+                            0.5 + r_lat / max(e_perp * min(t, t_cap), 1e-5)))
+                g = min(g, g_lat)
+            g = min(1.0, max(0.0, g))
             if g < vis:
                 vis, t_best = g, t
-    if light_size > 0.0 and refine and vis < 1.0 and t_best >= 0.0:
+            if vis <= 0.0:
+                break   # min cannot go lower (value-neutral)
+    if light_size > 0.0 and refine and 0.0 < vis < 1.0 and t_best >= 0.0:
         half_t = 0.5 / steps
         for r in range(2):
             m = t_best + (-half_t if r == 0 else half_t)
@@ -323,22 +407,234 @@ def project_all(points, w, h):
 
 
 # ---------------------------------------------------------------------------
+# M5.0 area-light transport model (float64 port of the shader's area path,
+# which mirrors rendering/AreaLight.h; the whole chain is validated against
+# brute force by scripts/check_area_model.py -- end-to-end worst 0.9% of K on
+# the frozen configs, exact for boxes and multi-blocker unions).
+# ---------------------------------------------------------------------------
+def area_arvo(px, py, pz, n, poly):
+    """K = -1/2 * sum gamma_i (N . m_i) over the polygon's (x, z) vertices
+    on the emitter plane (Arvo; exact -- check_area_model.py section 1)."""
+    if len(poly) < 3:
+        return 0.0
+    ly = EMITTER_MIN[1]
+    s = 0.0
+    m = len(poly)
+    for i in range(m):
+        ax, az = poly[i]
+        bx, bz = poly[(i + 1) % m]
+        ux, uy, uz = ax - px, ly - py, az - pz
+        vx, vy, vz = bx - px, ly - py, bz - pz
+        ul = math.sqrt(ux * ux + uy * uy + uz * uz)
+        vl = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if ul < 1e-12 or vl < 1e-12:
+            continue
+        a = (ux / ul, uy / ul, uz / ul)
+        b = (vx / vl, vy / vl, vz / vl)
+        cr = (a[1] * b[2] - a[2] * b[1],
+              a[2] * b[0] - a[0] * b[2],
+              a[0] * b[1] - a[1] * b[0])
+        ln = math.sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2])
+        if ln < 1e-12:
+            continue
+        ca = max(-1.0, min(1.0, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]))
+        s += math.acos(ca) * (n[0] * cr[0] + n[1] * cr[1] + n[2] * cr[2]) / ln
+    return -0.5 * s
+
+
+def area_hull2d(pts):
+    """Monotone chain convex hull over (x, z) tuples (CCW, no dup last)."""
+    pts = sorted(set(pts))
+    if len(pts) <= 2:
+        return pts
+    def half(ps):
+        out = []
+        for p in ps:
+            while len(out) >= 2:
+                (ox, oz), (ax, az) = out[-2], out[-1]
+                if (ax - ox) * (p[1] - oz) - (az - oz) * (p[0] - ox) <= 1e-15:
+                    out.pop()
+                else:
+                    break
+            out.append(p)
+        return out
+    lower = half(pts)
+    upper = half(pts[::-1])
+    return lower[:-1] + upper[:-1]
+
+
+def area_clip_split(poly, a, b):
+    """One Sutherland-Hodgman pass against a->b: returns (right, left).
+    Hull interior is on the LEFT of each CCW hull edge -> right = outside."""
+    right, left = [], []
+    m = len(poly)
+    ex, ez = b[0] - a[0], b[1] - a[1]
+    for i in range(m):
+        p, q = poly[i], poly[(i + 1) % m]
+        sp = ex * (p[1] - a[1]) - ez * (p[0] - a[0])
+        sq = ex * (q[1] - a[1]) - ez * (q[0] - a[0])
+        inp = sp <= 0.0
+        inq = sq <= 0.0
+        if inp:
+            right.append(p)
+        if not inp:
+            left.append(p)
+        if inp != inq:
+            t = sp / (sp - sq)
+            xing = (p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1]))
+            right.append(xing)
+            left.append(xing)
+    return right, left
+
+
+def area_box_blocker(p, box):
+    """Convex hull of the two height-cap footprints projected through the
+    receiver (the exact radial sweep of the [ylo, yhi] band). box prim:
+    (x0, z0, y0, x1, z1, y1)."""
+    x0, z0, ylo, x1, z1, yhi = box
+    py = p[1]
+    ylo2 = max(ylo, py + MARCH_BIAS)
+    yhi2 = min(yhi, EMITTER_MIN[1] - MARCH_BIAS)
+    if ylo2 >= yhi2 or yhi2 <= py + MARCH_BIAS:
+        return None
+    def m(h):
+        return (EMITTER_MIN[1] - py) / (h - py)
+    m_in, m_out = m(yhi2), m(ylo2)
+    px, pz = p[0], p[2]
+    pts = []
+    for (cx, cz) in ((x0, z0), (x1, z0), (x1, z1), (x0, z1)):
+        for mm in (m_in, m_out):
+            pts.append((px + mm * (cx - px), pz + mm * (cz - pz)))
+    hull = area_hull2d(pts)
+    return hull if len(hull) >= 3 else None
+
+
+def area_sphere_blocker(p, sph):
+    """Section of the tangent cone {angle(dir, C_hat) <= asin(R/d)}, sampled
+    by 33 boundary directions in direction space (robust at the receiver-
+    on-surface degeneracy), sub-horizontal generators far-clamped. sph prim:
+    (cx, cy, cz, r)."""
+    cx, cy, cz, r = sph
+    px, py, pz = p
+    if cy + r <= py + MARCH_BIAS:
+        return None
+    gx, gy, gz = cx - px, cy - py, cz - pz
+    d = math.sqrt(gx * gx + gy * gy + gz * gz)
+    if d * d < (r - MARCH_BIAS) * (r - MARCH_BIAS):
+        return [(-1e3, -1e3), (1e3, -1e3), (0.0, 1e3)]   # full-block sentinel
+    ch = (gx / d, gy / d, gz / d)
+    sa = min(r / d, 1.0)
+    ca = math.sqrt(1.0 - sa * sa)
+    helper = (0.0, 1.0, 0.0) if abs(ch[1]) < 0.9 else (1.0, 0.0, 0.0)
+    e1raw = (ch[1] * helper[2] - ch[2] * helper[1],
+             ch[2] * helper[0] - ch[0] * helper[2],
+             ch[0] * helper[1] - ch[1] * helper[0])
+    e1l = math.sqrt(e1raw[0] ** 2 + e1raw[1] ** 2 + e1raw[2] ** 2)
+    e1 = (e1raw[0] / e1l, e1raw[1] / e1l, e1raw[2] / e1l)
+    e2 = (ch[1] * e1[2] - ch[2] * e1[1],
+          ch[2] * e1[0] - ch[0] * e1[2],
+          ch[0] * e1[1] - ch[1] * e1[0])
+    thv = math.atan2(e2[1], e1[1])   # the ring's max-d.y direction: conic vertex
+    pts = []
+    for k in range(AREA_RING + 1):
+        th = (2.0 * math.pi * k / AREA_RING) if k < AREA_RING else thv
+        ct, st = math.cos(th), math.sin(th)
+        dx = ca * ch[0] + sa * (e1[0] * ct + e2[0] * st)
+        dy = ca * ch[1] + sa * (e1[1] * ct + e2[1] * st)
+        dz = ca * ch[2] + sa * (e1[2] * ct + e2[2] * st)
+        if dy > 1e-6:
+            s = (EMITTER_MIN[1] - py) / dy
+            pts.append((px + s * dx, pz + s * dz))
+        else:
+            hxz = math.sqrt(dx * dx + dz * dz)
+            if hxz > 1e-9:
+                pts.append((px + AREA_FAR_CLAMP * dx / hxz,
+                            pz + AREA_FAR_CLAMP * dz / hxz))
+    if len(pts) < 3:
+        return None
+    hull = area_hull2d(pts)
+    return hull if len(hull) >= 3 else None
+
+
+def area_subtract(pieces, B):
+    """First-outside-edge subtraction of the convex blocker B from every
+    piece (exact union; bridges cancel in the Arvo edge sum)."""
+    out = []
+    for piece in pieces:
+        W = piece
+        for i in range(len(B)):
+            a, b = B[i], B[(i + 1) % len(B)]
+            outside, W = area_clip_split(W, a, b)
+            if len(outside) >= 3:
+                out.append(outside)
+            if len(W) < 3:
+                break
+    return out
+
+
+def area_emitter_visibility(p, n, prims):
+    """(K_vis, K_rect): the exact visible-patch form factor after subtracting
+    every occluder's backprojected region from the emitter rect."""
+    ly = EMITTER_MIN[1]
+    hx, hz = EMITTER_HALF
+    rect = [(0.0 - hx, 0.0 - hz), (0.0 + hx, 0.0 - hz),
+            (0.0 + hx, 0.0 + hz), (0.0 - hx, 0.0 + hz)]
+    k_rect = area_arvo(p[0], p[1], p[2], n, rect)
+    if k_rect <= 0.0:
+        return 0.0, k_rect
+    pieces = [rect]
+    for prim in prims:
+        if prim[0] == "box":
+            B = area_box_blocker(p, prim[1])
+        else:
+            B = area_sphere_blocker(p, prim[1])
+        if B is None:
+            continue
+        pieces = area_subtract(pieces, B)
+        if not pieces:
+            return 0.0, k_rect
+    k = 0.0
+    for piece in pieces:
+        k += area_arvo(p[0], p[1], p[2], n, piece)
+    return min(max(k, 0.0), k_rect), k_rect
+
+
+def expected_byte_area(p, n, albedo, prims):
+    """M5.0 frozen direct lighting at a probe: the TRUE area emitter --
+    E_diffuse = albedo/pi * L_e * K_vis (same Lambert convention as the grid
+    model; specular omitted, absorbed by the acceptance band)."""
+    k_vis, _k_rect = area_emitter_visibility(p, n, prims)
+    e = LE * k_vis
+    inv_pi = 1.0 / math.pi
+    return (to_bytes(e * albedo[0] * inv_pi),
+            to_bytes(e * albedo[1] * inv_pi),
+            to_bytes(e * albedo[2] * inv_pi))
+
+
+# ---------------------------------------------------------------------------
 # Frozen direct lighting: point-light grid, Lambert exitance (float64).
 # Specular is intentionally omitted: walls are roughness 0.90 dielectrics,
 # the add is small, and the acceptance band absorbs it (documented above).
 # ---------------------------------------------------------------------------
-def expected_byte(p, n, albedo, solids=(), max_h=MAXH_BOXES, mode=None):
+def expected_byte(p, n, albedo, solids=(), max_h=MAXH_BOXES, mode=None,
+                  prims=()):
     """Frozen direct lighting at a probe: the 4x4 flux-preserving grid
     (Lambert exitance) with the M4.0.9 shadow transport -- per-light soft
     parallax-window marches (default), or ONE centroid march shared by the
-    rig when mode.centroid is set. Specular is intentionally omitted (the
+    rig when mode.centroid is set (M4.0.9.1: the lateral half-plane grade
+    runs against prims). M5.0: when mode.area is set the grid is REPLACED by
+    the true area emitter (exact visible-patch form factor under the
+    analytic backprojection). Specular is intentionally omitted (the
     acceptance band absorbs it)."""
     mode = mode or ShadowMode()
+    if mode.area:
+        return expected_byte_area(p, n, albedo, prims)
     centroid_vis = None
     if mode.centroid:
         centroid_vis = march_visibility_centroid(
             p[0], p[1], p[2], 0.0, GRID_Y, 0.0, solids, max_h,
-            step=mode.step, light_size=mode.light_size)
+            step=mode.step, light_size=mode.light_size,
+            lateral=mode.lateral, prims=prims)
     er, eg, eb = 0.0, 0.0, 0.0
     for gx in GRID_XS:
         for gz in GRID_ZS:
@@ -480,7 +776,8 @@ class Report:
         return fails
 
 
-def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES, mode=None):
+def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES, mode=None,
+                 prims=()):
     """World-space probes: expected value from the frozen lighting model
     (direct grid + heightfield shadow march)."""
     # Physical albedo per shadow probe, used ONLY by the failure diagnosis
@@ -530,12 +827,24 @@ def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES, mode=None):
         if q is None or not (0.0 <= q[0] < 1.0 and 0.0 <= q[1] < 1.0):
             rep.add("FAIL", label, "probe projects outside the frame -- camera pin broken")
             continue
-        exp = expected_byte(p, n, alb, solids, max_h, mode)
-        # M4.0.9 centroid mode: the documented single-ray blindness puts the
-        # penumbra probe's centroid ray INSIDE the block (hard pierce ->
-        # expected 0), which would turn its band [0.5*exp, 2*exp] inside
-        # out. When the mode's model expects black here, judge absolute-dark
-        # instead -- the same contract the umbra probe already uses.
+        # M5.0: the emitter probe reads the UNLIT quad's raw radiance -- its
+        # expectation is transport-independent, so it always uses the grid
+        # model regardless of mode.area.
+        probe_mode = mode
+        if mode.area and label.startswith("emitter (unlit"):
+            probe_mode = ShadowMode(centroid=mode.centroid,
+                                    light_size=mode.light_size,
+                                    step=mode.step, penumbra=mode.penumbra,
+                                    lateral=mode.lateral, area=False)
+        exp = expected_byte(p, n, alb, solids, max_h, probe_mode, prims)
+        # M4.0.9/4.0.9.1 centroid mode: the penumbra probe's centroid ray
+        # HARD-PIERCES the block (the receiver sits behind it relative to
+        # the emitter centroid), so the vertical grade saturates to 0 no
+        # matter what the lateral band does -- a pierce is a pierce in any
+        # direction. That expected 0 would turn the probe's band
+        # [0.5*exp, 2*exp] inside out, so when the mode's model expects
+        # black here, judge absolute-dark instead -- the same contract the
+        # umbra probe already uses.
         eff_abs_hi = abs_hi
         if (mode.centroid and label == "tall block penumbra (floor)"
                 and max(exp) <= 2.0):
@@ -589,7 +898,8 @@ def check_probes(rep, img, w, h, solids=(), max_h=MAXH_BOXES, mode=None):
 
 def main():
     ap = argparse.ArgumentParser(description="M3.3 Cornell acceptance harness")
-    ap.add_argument("shot", help="deterministic screenshot (PPM, from sandbox --frames/--out)")
+    ap.add_argument("shot", nargs="?", default=None,
+                    help="deterministic screenshot (PPM, from sandbox --frames/--out)")
     ap.add_argument("--variant", default="cornell01",
                     choices=["cornell01", "cornell02", "cornell03"])
     ap.add_argument("--shadow-centroid", type=int, default=0, choices=[0, 1],
@@ -604,9 +914,51 @@ def main():
     ap.add_argument("--shadow-penumbra", type=float, default=PENUMBRA,
                     help="parallax window scale (mirrors --shadow-penumbra; "
                          "0 = the exact binary march)")
+    ap.add_argument("--shadow-lateral", type=int, default=LATERAL_DEFAULT,
+                    choices=[0, 1],
+                    help="centroid-path lateral half-plane (mirrors "
+                         "--shadow-lateral; 0 = the exact M4.0.9 centroid "
+                         "march)")
+    ap.add_argument("--area-light", type=int, default=AREA_LIGHT_DEFAULT,
+                    choices=[0, 1],
+                    help="shadow transport of the shot: 1 = M5.0 true "
+                         "area-light transport (sandbox default), 0 = the "
+                         "exact M4.0.9.1 grid transport (all replay pins)")
+    ap.add_argument("--self-test-area", action="store_true",
+                    help="validate the float64 area model against the frozen "
+                         "check_area_model.py fixtures and exit")
     ap.add_argument("--expect-md5", default=None,
                     help="fail if the shot's md5 differs (determinism pin for the ledger)")
     args = ap.parse_args()
+
+    if not args.self_test_area and not args.shot:
+        ap.error("the following arguments are required: shot")
+
+    if args.self_test_area:
+        # Validate THIS harness's float64 area port against the same frozen
+        # fixtures bench_tests pins (check_area_model.py section 7 output).
+        prims01 = occluder_primitives("cornell01")
+        prims02 = occluder_primitives("cornell02")
+        prims03 = occluder_primitives("cornell03")
+        fixtures = [
+            ("c01 floor mid   ", (0.0, 0.0, 2.3), (0.0, 1.0, 0.0), prims01, 0.032497),
+            ("c01 floor center", (0.0, 0.0, 0.0), (0.0, 1.0, 0.0), prims01, 0.044600),
+            ("c01 adjacent    ", (-0.70, 0.0, 0.55), (0.0, 1.0, 0.0), prims01, 0.031218),
+            ("c03 under both  ", (-0.80, 0.0, 0.60), (0.0, 1.0, 0.0), prims03, 0.016727),
+            ("c02 sphere band ", (0.0, 0.0, 1.70), (0.0, 1.0, 0.0),
+             [pr for pr in prims02 if pr[0] == "sphere" or pr == prims02[0]], 0.034376),
+            ("lit open floor  ", (2.20, 0.0, 2.20), (0.0, 1.0, 0.0), prims01, 0.022582),
+        ]
+        bad = 0
+        for label, p, n, prims, expected in fixtures:
+            k_vis, _ = area_emitter_visibility(p, n, prims)
+            rel = abs(k_vis - expected) / max(expected, 1e-12)
+            okk = rel <= 5e-3
+            bad += 0 if okk else 1
+            print("  %s K_vis=%.6f (fixture %.6f, rel %.2e) %s"
+                  % (label, k_vis, expected, rel, "OK" if okk else "FAIL"))
+        print("area model self-test: %s" % ("ALL OK" if bad == 0 else "%d FAILURE(S)" % bad))
+        return 0 if bad == 0 else 1
 
     w, h, img = read_ppm_p6(args.shot)
     with open(args.shot, "rb") as f:
@@ -670,11 +1022,14 @@ def main():
     # -- probes ---------------------------------------------------------------
     solids = solid_intervals(args.variant)
     max_h = MAXH_BAFFLE if args.variant == "cornell03" else MAXH_BOXES
+    prims = occluder_primitives(args.variant)
     mode = ShadowMode(centroid=bool(args.shadow_centroid),
                       light_size=args.shadow_light_size,
                       step=args.shadow_step,
-                      penumbra=args.shadow_penumbra)
-    check_probes(rep, img, w, h, solids, max_h, mode)
+                      penumbra=args.shadow_penumbra,
+                      lateral=bool(args.shadow_lateral),
+                      area=bool(args.area_light))
+    check_probes(rep, img, w, h, solids, max_h, mode, prims)
     # -- color dominance (redundant with probes, but stated as the criterion) --
     q_l = project((BOX[0] * -1 + 0.01, 2.75, -0.6), w, h)
     q_r = project((BOX[0] - 0.01, 2.75, -0.6), w, h)
@@ -696,15 +1051,14 @@ def main():
             "ceiling direct-dark (GI gap pin)", "ceiling median R=%d G=%d B=%d must stay <=55 until M8 "
             "indirect lands (only bounce light reaches it; a fake ambient would show here first)" % pc)
     rep.add("GAP", "indirect color bounce (criterion)", "no GI until M8; similarity axis quantifies it vs the reference")
-    rep.add("GAP", "area-light penumbra quality (criterion)", "the 4x4 light-grid quadrature + M4.0.9 parallax-window "
-            "grades approximate the penumbra (the M4.0.9 centroid experiment, "
-            "--shadow-centroid 1, is the analytic-SSSS prototype); true "
-            "per-pixel emitter integration is the M5 slot -- the similarity "
-            "axis measures the residue")
+    rep.add("GAP", "area-light residuals (criterion)", "M5.0 transport: exact for boxes and unions; documented "
+            "residuals are the sphere's inscribed-conic under-block (<=0.9% "
+            "of K, one-sided), the representative-point specular, and the "
+            "similarity axis measures them vs the reference")
     rep.add("INFO", "cornell02/03 extras", "spheres/baffle probes intentionally via the SSIM similarity axis, not this harness")
 
     fails = rep.print()
-    print("verdict: %s" % ("ACCEPTED -- record this shot (md5 + similarity vs the clean reference) as the M4 ledger row" if fails == 0 else "REJECTED"))
+    print("verdict: %s" % ("ACCEPTED -- record this shot (md5 + similarity vs the clean reference) as the milestone ledger row" if fails == 0 else "REJECTED"))
     return 0 if fails == 0 else 1
 
 

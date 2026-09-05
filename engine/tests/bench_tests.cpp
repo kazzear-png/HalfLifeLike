@@ -14,6 +14,7 @@
 #include "cornell_scene_gen.h"
 
 #include "assets/OBJ.h"
+#include "rendering/AreaLight.h"
 #include "rendering/Lighting.h"
 #include "rendering/ShadowHeightfield.h"
 
@@ -445,17 +446,41 @@ struct MarchParams {
     float lightSize = 0.0f;   // S in the half-plane window (centroid path)
     int jitter = 0;           // M4.0.9 diagnostic: per-pixel lattice jitter
     float noise = 0.0f;       // the deterministic "pixel noise" in [0, 1]
+    // M4.0.9.1: analytic lateral half-plane grade (centroid soft path).
+    // 1 = grade the signed ground distance to the primitive set below (the
+    // shader's default); 0 = the exact M4.0.9 centroid march. The set
+    // mirrors the sandbox's OccluderSet (AABB boxes + spheres) and MUST be
+    // populated for fixtures that exercise the lateral band -- an empty set
+    // leaves the lateral grade inert (r = +1e3 -> g_lat = 1), which is how
+    // every pre-4.0.9.1 fixture keeps its exact semantics.
+    int lateral = 1;
+    int boxCount = 0;
+    float boxMin[4][4] = {};   // (minX, minZ, minH, pad)
+    float boxMax[4][4] = {};   // (maxX, maxZ, maxH, pad)
+    int sphereCount = 0;
+    float sphere[4][4] = {};   // (cx, cy, cz, R)
+    float emitterHalfX = 0.65f;   // the frozen emitter patch half-extents
+    float emitterHalfZ = 0.525f;  // (cornell::kEmitterMin/Max / 2)
 };
 
-// Mirrors shadowVisibilityCentroid() in shaders.h (M4.0.9): one march to the
+// Mirrors shadowVisibilityCentroid() in shaders.h (M4.0.9 + the M4.0.9.1
+// lateral half-plane): one march to the
 // emitter centroid shared by the rig, graded per sample by the half-plane
 // area model g = clamp(0.5 + d/(S*t), 0, 1), min-accumulated. The `light`
 // arguments are the CENTROID's coordinates. Binary path (lightSize == 0):
 // first d < 0 returns the hard 0; break once above every occluder. Soft
 // path: the early-out compares the future grade lower bound
-// 0.5 + B(t)/(S*t) (B = global clearance bound, rising in t) against vis;
-// near-receiver samples saturate the grade exactly like the legacy 2*step
-// start zone. Vertical rays (horiz < 1e-4): exact column-interval test --
+// 0.5 + B(t)/(S*t) (B = global clearance bound, rising in t) against vis --
+// M4.0.9.1 additionally requires B >= 0 (with B < 0 a future sample can
+// still be occluder-eligible and the LATERAL grade -- a ground distance --
+// can still fall below the vertical bound); near-receiver samples saturate
+// the grade exactly like the legacy 2*step start zone. M4.0.9.1 lateral
+// grade: signed 2D distance from the sample's ground position to the
+// nearest ELIGIBLE primitive (height interval mirrors the texture column
+// semantics exactly), ramped by the emitter's exact lateral support
+// ePerp = 2*(hx*|perp.x| + hz*|perp.z|), min-combined with the vertical
+// grade; once any grade reaches 0 the march breaks (value-neutral).
+// Vertical rays (horiz < 1e-4): exact column-interval test --
 // the centroid hangs INSIDE the cbox03 baffle footprint, so the vertical
 // case is reachable and must not silently return 1. Jitter shifts the
 // lattice by (noise - 0.5) spacings (deterministic in the port; the shader
@@ -502,6 +527,15 @@ float marchVisibilityCentroidPort(const SceneFields& scene,
         const float dy = ly - ry;
         tEnd = (dy > 0.0f) ? std::min(tCap + wCap / dy, 1.0f) : 1.0f;
     }
+    // M4.0.9.1: the emitter's exact lateral support along this trace (the
+    // patch's support function along the trace perpendicular) + the active
+    // flag (soft path only; lateral == 0 reproduces M4.0.9 bit-for-bit).
+    const float invHoriz = 1.0f / horiz;
+    const float perpX = -(dz * invHoriz);
+    const float perpZ = (dx * invHoriz);
+    const float ePerp = 2.0f * (pm.emitterHalfX * std::fabs(perpX) +
+                                pm.emitterHalfZ * std::fabs(perpZ));
+    const bool lateral = (pm.lateral != 0) && (pm.lightSize > 0.0f);
     float vis = 1.0f;    // min of the per-sample grades
     float tBest = -1.0f; // argmin sample, for the bracket refinement
     for (int s = 1; s <= steps; ++s) {
@@ -529,34 +563,91 @@ float marchVisibilityCentroidPort(const SceneFields& scene,
             }
             continue;
         }
-        // Soft path early-out: the grade lower bound 0.5 + B(t)/(S*t) rises
-        // monotonically in t (the B0/t term decays), so once it reaches vis
-        // no future sample -- empty columns are skipped below -- can lower
-        // vis. Descending rays march to the end (cannot happen in the
-        // frozen rig; the guard keeps the port total).
-        if (ly > ry &&
-            0.5f + (rayY - (pm.maxHeight - pm.bias)) /
-                       std::max(pm.lightSize * t, 1e-5f) >= vis) {
+        // Soft path early-out: the vertical grade lower bound
+        // 0.5 + B(t)/(S*t) rises monotonically in t (the B0/t term decays).
+        // M4.0.9.1 adds the B >= 0 gate: with B < 0 a future sample can
+        // still be occluder-eligible and the lateral grade can still fall
+        // below the vertical bound; B >= 0 means every future sample is
+        // above every occluder top, so the lateral grade is identically 1
+        // onward and the vertical bound alone is exact again. With
+        // lateral == 0 the gate is skipped (the exact M4.0.9 form; the
+        // hoisted bBound is the same arithmetic in the same order).
+        // Descending rays march to the end (cannot happen in the frozen
+        // rig; the guard keeps the port total).
+        const float bBound = rayY - (pm.maxHeight - pm.bias);
+        if (ly > ry && (pm.lateral == 0 || bBound >= 0.0f) &&
+            0.5f + bBound / std::max(pm.lightSize * t, 1e-5f) >= vis) {
             break;
         }
         const float traveled = t * segLen;
-        if (traveled > 2.0f * pm.step && anySolid) {
-            // ONLY a real column interval grades (mirrors the shader's
-            // hMax > hMin skip); window capped at the occluder-bearing
-            // lightSize * tCap.
-            float g = 0.5f + d / std::max(pm.lightSize * std::min(t, tCap),
-                                          1e-5f);
+        if (traveled > 2.0f * pm.step) {
+            // Vertical grade: ONLY a real column interval grades (mirrors
+            // the shader's hMax > hMin skip); window capped at the
+            // occluder-bearing lightSize * tCap.
+            float g = 1.0f;
+            if (anySolid) {
+                g = 0.5f + d / std::max(pm.lightSize * std::min(t, tCap),
+                                        1e-5f);
+            }
+            if (lateral) {
+                // M4.0.9.1 lateral half-plane: signed ground distance to
+                // the nearest ELIGIBLE primitive (union of regions),
+                // ramped by the emitter's lateral support.
+                float rLat = 1e3f;
+                for (int b = 0; b < pm.boxCount; ++b) {
+                    const float bminX = pm.boxMin[b][0];
+                    const float bminZ = pm.boxMin[b][1];
+                    const float bminH = pm.boxMin[b][2];
+                    const float bmaxX = pm.boxMax[b][0];
+                    const float bmaxZ = pm.boxMax[b][1];
+                    const float bmaxH = pm.boxMax[b][2];
+                    if (rayY <= bminH + pm.bias || rayY >= bmaxH - pm.bias) {
+                        continue;   // ray height outside the column interval
+                    }
+                    const float dvx = std::max(bminX - px, px - bmaxX);
+                    const float dvz = std::max(bminZ - pz, pz - bmaxZ);
+                    const float ox = std::max(dvx, 0.0f);
+                    const float oz = std::max(dvz, 0.0f);
+                    const float outside = std::sqrt(ox * ox + oz * oz);
+                    const float inside = std::min(std::max(dvx, dvz), 0.0f);
+                    rLat = std::min(rLat, outside + inside);
+                }
+                for (int sp = 0; sp < pm.sphereCount; ++sp) {
+                    const float scx = pm.sphere[sp][0];
+                    const float scy = pm.sphere[sp][1];
+                    const float scz = pm.sphere[sp][2];
+                    const float sr = pm.sphere[sp][3];
+                    const float hOff = std::fabs(rayY - scy) + pm.bias;
+                    const float rho2 = sr * sr - hOff * hOff;
+                    if (rho2 <= 0.0f) {
+                        continue;   // the sphere never reaches this height
+                    }
+                    const float gx = px - scx, gz = pz - scz;
+                    rLat = std::min(rLat, std::sqrt(gx * gx + gz * gz) -
+                                              std::sqrt(rho2));
+                }
+                const float gLat = std::clamp(
+                    0.5f + rLat /
+                        std::max(ePerp * std::min(t, tCap), 1e-5f),
+                    0.0f, 1.0f);
+                g = std::min(g, gLat);
+            }
             g = std::clamp(g, 0.0f, 1.0f);
             if (g < vis) {
                 vis = g;     // min(), plus the argmin t for the refinement
                 tBest = t;
             }
+            if (vis <= 0.0f) {
+                break;   // M4.0.9.1: min cannot go lower (value-neutral)
+            }
         }
     }
     // Bracket refinement: two fetch pairs at half-step offsets around the
     // worst sample, same grade, same start zone; a refined pierce grades
-    // dark. Monotone-safe: vis can only decrease.
-    if (pm.lightSize > 0.0f && pm.refine > 0 && vis < 1.0f && tBest >= 0.0f) {
+    // dark. Monotone-safe: vis can only decrease. M4.0.9.1: not run at
+    // vis == 0 (already the floor).
+    if (pm.lightSize > 0.0f && pm.refine > 0 && vis > 0.0f && vis < 1.0f &&
+        tBest >= 0.0f) {
         const float halfT = 0.5f / static_cast<float>(steps);
         for (int r = 0; r < 2; ++r) {
             const float m = tBest + ((r == 0) ? -halfT : halfT);
@@ -894,8 +985,10 @@ void testSoftPenumbraMarch() {
 
     MarchParams pm;              // binary path (penumbra = 0)
     MarchParams pmSoft = pm;
-    pmSoft.penumbra = 0.325f;    // the sandbox's derived default (the grid
-                                 // pitch; M4.0.9 parallax window scale)
+    pmSoft.penumbra = 0.325f;    // fixed contract scale: the M4.0.9
+                                 // first-default (full grid pitch); the
+                                 // sandbox default moved to half-pitch
+                                 // after the hardware A/B matrix
     MarchParams pmWide = pm;
     pmWide.penumbra = 0.65f;     // 2x window: strictly softer
 
@@ -961,7 +1054,8 @@ void testBracketRefinement() {
 
     MarchParams pmBase;              // binary reference (penumbra = 0)
     MarchParams pmSoft = pmBase;
-    pmSoft.penumbra = 0.325f;        // the sandbox's derived default (M4.0.9)
+    pmSoft.penumbra = 0.325f;        // fixed contract scale (the M4.0.9
+                                     // first-default, now an override)
     MarchParams pmSoftNoRefine = pmSoft;
     pmSoftNoRefine.refine = 0;       // the exact M4.0.8 soft march (pre-M4.0.9 window)
 
@@ -1063,11 +1157,13 @@ void testBracketRefinement() {
 // Centroid contract: hard outcomes exact in the binary path (lightSize = 0),
 // graded values monotone in the light size S, the west-wall top-edge band
 // grades smoothly (the geometry the half-plane model CAN see), the z-side
-// floor band stays binary (the documented single-ray blindness: rim rays
-// passing BESIDE the block are invisible to one ray), the vertical-ray
-// column test is exact (the centroid hangs inside the cbox03 baffle
-// footprint), refinement stays monotone-safe, and jitter changes graded
-// values without breaking any binary verdict.
+// floor band grades through the M4.0.9.1 ANALYTIC LATERAL half-plane (the
+// M4.0.9 single-ray blindness -- rim rays passing BESIDE the block are
+// invisible to one trace -- is now closed by the occluder-set distance
+// ramp; --shadow-lateral 0 / lateral = 0 reproduces the old cliff exactly),
+// the vertical-ray column test is exact (the centroid hangs inside the
+// cbox03 baffle footprint), refinement stays monotone-safe, and jitter
+// changes graded values without breaking any binary verdict.
 // ---------------------------------------------------------------------------
 void testCentroidRigMarch() {
     std::printf("[bench] centroid rig march + parallax window (M4.0.9 contract pins)\n");
@@ -1130,19 +1226,46 @@ void testCentroidRigMarch() {
     expectTrue(bandLit == 1.0f,
                "centroid band: clearing receivers stay exactly 1");
 
-    // 4) The documented single-ray blindness, pinned so it can never be
-    //    silently "fixed": on the z-side floor band the centroid ray either
-    //    pierces the footprint (deep, -> 0) or misses it entirely (-> 1);
-    //    the lateral rim-ray penumbra is structurally absent from one ray.
-    //    This is why the centroid path is an EXPERIMENT and the default
-    //    transport keeps the 16 per-light rays.
-    expectTrue(marchVisibilityPort(g_tallScene, pmS, -1.05f, 0.0f, 0.60f,
+    // 4) M4.0.9.1 lateral half-plane: the z-side floor band -- the geometry
+    //    the M4.0.9 single trace was structurally blind to (the pinned
+    //    blindness cliff). The z = 0.80 receiver's centroid ray misses the
+    //    footprint entirely (every column empty, vertical grade never
+    //    fires), but its closest ground approach to the footprint is
+    //    ~0.056 m at t ~ 0.5, so the lateral ramp grades it strictly
+    //    inside (0.5, 0.65) -- the cliff becomes the continuous band the
+    //    rim rays produce. Sliding away (z = 1.30, approach ~0.22 m)
+    //    strictly brightens. The pierce receiver stays exactly 0, and the
+    //    lateral-OFF lever reproduces the exact M4.0.9 blindness pin.
+    MarchParams pmLat = pmS;     // soft centroid + analytic lateral set
+    pmLat.boxCount = 1;          // mirrors the g_tall interval field exactly:
+    pmLat.boxMin[0][0] = -1.55f; // x [-1.55, -0.55]
+    pmLat.boxMin[0][1] = -2.05f; // z [-2.05,  0.35]
+    pmLat.boxMin[0][2] =  0.00f; // y [ 0.00,  3.30]
+    pmLat.boxMax[0][0] = -0.55f;
+    pmLat.boxMax[0][1] =  0.35f;
+    pmLat.boxMax[0][2] =  3.30f;
+    MarchParams pmLatOff = pmLat;
+    pmLatOff.lateral = 0;        // exact M4.0.9 centroid march (A/B lever)
+    const float latNear = marchVisibilityPort(g_tallScene, pmLat,
+                                              -1.05f, 0.0f, 0.80f,
+                                              0.0f, 5.44f, 0.0f);
+    const float latFar  = marchVisibilityPort(g_tallScene, pmLat,
+                                              -1.05f, 0.0f, 1.30f,
+                                              0.0f, 5.44f, 0.0f);
+    expectTrue(latNear > 0.5f && latNear < 0.65f,
+               "centroid lateral: z-side floor point with footprint miss "
+               "grades strictly inside (0.5, 0.65) -- the M4.0.9 blindness "
+               "cliff is now the continuous lateral band");
+    expectTrue(latFar > latNear && latFar < 0.8f,
+               "centroid lateral: sliding away from the footprint strictly "
+               "brightens (continuous ramp, no cliff)");
+    expectTrue(marchVisibilityPort(g_tallScene, pmLat, -1.05f, 0.0f, 0.60f,
                                    0.0f, 5.44f, 0.0f) == 0.0f,
-               "centroid blindness: z-side floor point with footprint pierce -> 0");
-    expectTrue(marchVisibilityPort(g_tallScene, pmS, -1.05f, 0.0f, 0.80f,
+               "centroid lateral: footprint pierce still returns exactly 0");
+    expectTrue(marchVisibilityPort(g_tallScene, pmLatOff, -1.05f, 0.0f, 0.80f,
                                    0.0f, 5.44f, 0.0f) == 1.0f,
-               "centroid blindness: z-side floor point with footprint miss -> 1 "
-               "(the lateral penumbra a single ray cannot see)");
+               "centroid lateral OFF: the exact M4.0.9 blindness pin "
+               "(footprint miss -> 1) reproduces bit-for-bit");
 
     // 5) Window monotonicity in S on the CLEAR side of the band (receiver
     //    y_w = 1.95, sampled clearance ~0.21 m): a wider emitter extent is
@@ -1221,7 +1344,7 @@ void testCentroidRigMarch() {
     //    the grid). The divergence is bounded by the tCap-capped window, so
     //    the value stays a positive grade, never negative.
     MarchParams pmDeep;          // per-light legacy path (centroid = 0)
-    pmDeep.penumbra = 0.325f;    // the sandbox's derived default (M4.0.9)
+    pmDeep.penumbra = 0.325f;    // fixed contract scale (M4.0.9 first-default)
     const float deepGraze = marchVisibilityPort(g_box1mScene, pmDeep,
                                                 0.0f, 1.02f, 0.55f,
                                                 0.0f, 1.02f, -0.55f);
@@ -1352,6 +1475,113 @@ void testWorldToTexelMapping() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M5.0 area-light transport: the CPU mirror (rendering/AreaLight.h) pinned to
+// the float64 brute-force fixtures generated by scripts/check_area_model.py
+// (section 7). Every fixture value below is machine-emitted, not hand-tuned;
+// tolerances reflect the float32-vs-float64 gap measured on this mirror
+// (worst 3.1e-4 relative across all fixtures).
+// ---------------------------------------------------------------------------
+void testAreaLightTransport() {
+    std::printf("[bench] area-light transport: exact visible-patch form factor + "
+                "backprojection (M5.0 fixtures)\n");
+
+    using engine::arealight::OccluderBox;
+    using engine::arealight::OccluderSphere;
+    // Frozen occluders (generate_cornell.py r2 provenance, mirrors the field
+    // probes' comment block in sandbox/src/main.cpp).
+    const OccluderBox TALL  { -1.55f, -0.55f, -2.05f,  0.35f, 0.0f, 3.30f };
+    const OccluderBox SHORT {  0.40f,  1.40f, -0.70f,  1.70f, 0.0f, 1.65f };
+    const OccluderBox BAFFLE{ -1.00f,  1.00f, -0.10f,  0.10f, 3.4f, 5.40f };
+    const OccluderSphere GOLD { 0.0f, 0.55f, 0.90f, 0.55f };
+
+    const float HX = engine::arealight::kEmitterHalfX;   // 0.65
+    const float HZ = engine::arealight::kEmitterHalfZ;   // 0.525
+
+    struct VisCase {
+        const char* label;
+        float px, py, pz;
+        const OccluderBox* boxes; int nb;
+        const OccluderSphere* spheres; int ns;
+        double kRect, kVis;
+        float relTol;
+    };
+    const OccluderBox c01[2] = { TALL, SHORT };
+    const OccluderBox c03[2] = { TALL, BAFFLE };
+    const OccluderBox c01t[1] = { TALL };
+    const OccluderSphere c02s[1] = { GOLD };
+
+    const VisCase visCases[] = {
+        // label              P                     boxes   spheres       kRect     kVis      tol
+        { "c01 floor mid   ",   0.00f, 0.00f,  2.30f, c01, 2, nullptr, 0, 0.032497, 0.032497, 2e-3f },
+        { "c01 floor center",   0.00f, 0.00f,  0.00f, c01, 2, nullptr, 0, 0.044600, 0.044600, 2e-3f },
+        { "tall block top  ",  -1.05f, 3.30f, -0.85f, c01, 2, nullptr, 0, 0.147575, 0.147575, 2e-3f },
+        { "c01 adjacent    ",  -0.70f, 0.00f,  0.55f, c01, 2, nullptr, 0, 0.042411, 0.031218, 2e-3f },
+        { "c03 under both  ",  -0.80f, 0.00f,  0.60f, c03, 2, nullptr, 0, 0.041864, 0.016727, 2e-3f },
+        { "c02 sphere band ",   0.00f, 0.00f,  1.70f, c01t, 1, c02s, 1, 0.037293, 0.034376, 5e-3f },
+        { "c01 block top   ",   0.90f, 1.65f,  0.50f, c01, 2, nullptr, 0, 0.078761, 0.078761, 2e-3f },
+        { "lit open floor  ",   2.20f, 0.00f,  2.20f, c01, 2, nullptr, 0, 0.025863, 0.022582, 2e-3f },
+    };
+    for (const VisCase& c : visCases) {
+        float kr = -1.0f;
+        const float kv = engine::arealight::visibleFormFactor(
+            c.px, c.py, c.pz, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, HX, HZ, c.boxes, c.nb, c.spheres, c.ns, kr);
+        const double rkr = kr > 0.0 ? std::fabs(kr - c.kRect) / c.kRect : 1.0;
+        const double rkv = kv > 0.0 ? std::fabs(kv - c.kVis) / c.kVis : 1.0;
+        expectTrue(rkr <= c.relTol, (std::string(c.label) + ": K_rect matches the float64 fixture").c_str());
+        expectTrue(rkv <= c.relTol, (std::string(c.label) + ": K_vis matches the float64 fixture").c_str());
+        expectTrue(kv <= kr + 1e-6f * kr,
+                   (std::string(c.label) + ": visibility never raises the form factor").c_str());
+    }
+
+    // Contact-shadow grade: the receiver at the tall block's +x face keeps
+    // most of the emitter visible (graded penumbra, not a cliff) -- pin the
+    // float64 sweep's ratio band (check_area_model.py section 7).
+    {
+        float kr = -1.0f;
+        const float kv = engine::arealight::visibleFormFactor(
+            -0.7f, 0.0f, 0.5f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, HX, HZ, c01, 2, nullptr, 0, kr);
+        const float ratio = kv / kr;
+        expectTrue(ratio > 0.60f && ratio < 0.75f,
+                   "contact-shadow grade at the tall block face sits in the pinned band (0.60, 0.75)");
+    }
+
+    // Self-shadow exclusion: a receiver ON the short block's top face must
+    // not be shaded by its own column (the bias guard skips the primitive),
+    // so K_vis == K_rect there -- the heightfield's own-column contract.
+    {
+        float kr = -1.0f;
+        const float kv = engine::arealight::visibleFormFactor(
+            0.9f, 1.65f, 0.5f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, HX, HZ, &SHORT, 1, nullptr, 0, kr);
+        expectTrue(std::fabs(kv - kr) <= 1e-6f * kr,
+                   "receiver on the occluder top is not self-shaded (bias guard)");
+    }
+
+    // Specular support: the VOS solid angle of the rect, on-axis closed form
+    // Omega = 4*atan(hx*hz / (d*sqrt(d^2+hx^2+hz^2))) -- exact identity.
+    {
+        const float om = engine::arealight::solidAngleRect(
+            0.0f, 0.0f, 0.0f, 0.0f, 0.0f, HX, HZ);
+        const float d = engine::arealight::kEmitterY;
+        const float ref = 4.0f * std::atan(HX * HZ
+            / (d * std::sqrt(d * d + HX * HX + HZ * HZ)));
+        expectTrue(std::fabs(om - ref) <= 1e-5f * ref,
+                   "VOS rect solid angle matches the on-axis closed form");
+    }
+
+    // Frozen constants ride along with the object (the mirror must not drift
+    // from the frozen standard).
+    expectTrue(engine::arealight::kEmitterHalfX == 0.65f
+            && engine::arealight::kEmitterHalfZ == 0.525f
+            && engine::arealight::kEmitterY == cornell::kEmitterMin[1]
+            && engine::arealight::kEmitterLe == cornell::kEmitterRadiance
+            && engine::arealight::kBias == 0.01f,
+            "AreaLight frozen constants match cornell-box/1.0 (half extents, plane y, L_e, bias)");
+}
+
 } // namespace
 
 int main() {
@@ -1364,6 +1594,7 @@ int main() {
     testSoftPenumbraMarch();
     testBracketRefinement();
     testCentroidRigMarch();
+    testAreaLightTransport();
     testShadowCaptureMatrix();
     testWorldToTexelMapping();
 
