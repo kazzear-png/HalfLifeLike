@@ -369,7 +369,7 @@ shipped.
 
 ---
 
-## M5.0.1 — why the area transport cost 4x the march, and the exact-reject fix
+## M5.1 — why the area transport cost 4x the march, and the exact-reject fix
 
 **Field report.** 0.5.0 on the user's box: ~110 fps vs the M4 variant's
 ~475. The first attempt (a 0.5.1-draft inclusion-exclusion rewrite) was
@@ -389,33 +389,125 @@ cross is "phantom-split" into area-equal parts (the union is unchanged;
 the work and the piece slots are not); (2) the sphere paid 33 sin/cos cone
 samples + a 33-point insertion-sort hull before the same carve. The waste
 then fed the 16-piece cap, which can drop REAL tail pieces — 0.5.0
-silently undercounted visible region in exactly those cases (fuzz
-adjudication: brute 0.013677, 0.5.0 0.005424, 0.5.0.1 0.013694).
+silently undercounted visible region in exactly those cases (the fuzz's
+exact-baseline tally: total cap error 0.5.0 2.796e-1 vs M5.1 8.700e-3, a
+32× reduction; worst single case: brute 0.013677, 0.5.0 0.005424, M5.1
+0.013694).
 
-**The fix — five one-sided skips (GLSL only; AreaLight.h stays the plain
+**The fix — seven one-sided skips (GLSL only; AreaLight.h stays the plain
 reference).** Per-piece AABB bookkeeping (exact; min/max add no rounding)
 plus: box reject before hull+carve (8-point AABB axis-disjoint from every
 piece); sphere reject before the 33 samples (conservative disk bound
 `rFoot = (Cy−Py)(ca|ch.xz|+sa)/ymin`, valid exactly when no generator
-clamps — `ymin > 0`); sampled-cone AABB reject before hull+carve; in-carve
+clamps — `ymin > 0`); the L7 frustum reject for the regime the disk cannot
+cover (below); sampled-cone AABB reject before hull+carve; in-carve
 copy-through of pieces whose AABB misses the blocker AABB; and the
 no-carve fast exit returning `kRect` (the final loop would sum exactly one
 Arvo over the rect — bit-identical by construction). Every skip is
 one-sided: an AABB contains its polygon, so a rejected blocker reaches no
 piece and the union cannot change.
 
-**Equivalence contract (check_area_model.py section 8).** 4000-iteration
-float64 fuzz (jittered boxes, floor + elevated spheres, high receivers):
-per-fired-reject SAT soundness; the no-region-loss direction
-(`K_skips ≥ K_ref − tol` — the only separating mechanism is the cap, and
-the skips only restore); brute-force adjudication of deviations (skips
-must be strictly closer); frozen-config agreement to 1e-12 relative (the
-reference's own phantom-split regrouping makes exact float equality
-unattainable BY CONSTRUCTION — 1e-15 dust). What remains on the GPU side
-is float32 regrouping of equivalently-decomposed regions, ~1e-7 relative —
-below display quantization by three orders.
+**L6 — restrict the blocker hull to the rect before the carve
+(`areaClipBlockerToRect`).** The deeper cut, and still exact. The
+piece-subset invariant: every piece starts as the rect and is only ever
+cut by half-plane clips (or copied through), so every piece ⊆ E forever;
+therefore for every piece `piece ∩ B = piece ∩ (B ∩ E)` — restricting B
+to the rect removes the SAME region from every piece, and the only edges
+it deletes are edges that could never cut a piece (they live outside the
+rect; they only phantom-split the decomposition). One S-H keep-inside
+clip of the convex hull against the four rect lines, per blocker, once,
+before the piece loop: wall/floor footprints that dwarf the 1.30 × 1.05 m
+patch (the dominant occluded case) shrink from up-to-33-edge chains to
+the few edges crossing the rect (fuzz's showcase: a 517 m² box hull →
+0.80 m² inside the rect, 6 edges → 5; far-clamped sphere generators
+collapse onto the rect boundary), the per-piece AABB reject tightens
+(restricted AABB), and the final Arvo loop runs fewer pieces. Kept
+vertices pass through bit-for-bit; new vertices are lerps on the rect
+lines — the same arithmetic class the carve itself uses. Scratch sizing:
+a convex n-gon gains ≤ 1 vertex per half-plane pass, 4 passes →
+`kAreaClipVerts = kAreaBlockVerts + 4` (glslang enforces the exact array
+sizes at both call sites — the C1102 gate working for us). Cost class:
+clear-sight pixels pay NOTHING (the L1/L2 rejects and the fast exit fire
+before any hull, as before); only pixels whose blocker actually reaches
+a piece pay the four passes — and save multiples of that on the chain.
+Why this is not the IE trap: inclusion-exclusion REFORMULATED the pinned
+sum (a bet that lost to float32 cancellation); L6 only deletes edges that
+cannot participate — the surviving computation is the pinned computation,
+proved region-identical in float64 (below).
 
-**Cascaded shadow maps — adjudicated (M5.0.1 research ask).** CSM is a
+**L7 — the sphere frustum reject: closing the sub-horizontal hole in the
+skip stack.** The L2 disk bound is valid exactly when no generator clamps
+(`ymin > 0`, fuzz gate `1e-4`), and the frozen rig's signature blocker —
+the floor sphere seen by floor receivers — sits EXACTLY on the boundary
+(`ymin = 0` in real arithmetic: the horizon plane through the receiver is
+tangent to the sphere). So the disk test never fires there, and every
+floor ring near the sphere paid 33 samples + a 33-point hull + the rect
+restrict for a carve that usually could not happen. The observation that
+fixes it: the disk bound tests the SPHERE'S footprint against the PIECES,
+but the reachability question is a cone–cone test — does any ray from P
+through the emitter rect touch the sphere? If ONE side half-space of the
+pyramid conv(P, E) separates the sphere strictly beyond the plane by more
+than R, then every such ray misses the closed sphere (the pyramid is
+inside the half-space; every point of the half-space is > R from the
+sphere's center), so the true shadow region F and E are disjoint — and
+the sampled hull cannot carve: conic samples lie on F's boundary, chords
+between them stay in F (F is a convex conic region), and the far clamps
+sit at radius `kAreaFarClamp = 50`, an order of magnitude beyond the
+rect's reach from P.xz. Implementation is sqrt-free
+(`d > R·|n|` as `d² > R²·(n·n)`, both sides non-negative) and fires
+before ANY sampling; plane polarity is fixed once per invocation from the
+rect center (the frozen rect winding makes all four `q_i × q_{i+1}`
+normals consistent — the wrong sign could only suppress or falsely fire,
+and the per-fire fuzz assert would catch the latter). Why it wins on THIS
+rig: a floor sphere only shadows the ceiling rect for receivers within
+roughly a meter behind it (its cone must reach the rect's 77°–90°
+elevation band); for every other floor ring the frustum test now PROVES
+the miss instead of sampling it — 2179 of 4000 fuzz iterations rejected
+outright, including the off-axis and behind-sphere cases the disk bound
+never covered. What it deliberately does not cover: spheres whose cone
+can reach the rect cone (then the carve is real and sampling proceeds),
+and no box path changes (boxes have no trig to save).
+
+**L8 — the 32 ring angles are constants; treat them like one.** The
+sphere's ring directions are θk = 2πk/32 for k = 0..31 — compile-time
+constants computed at RUNTIME with two SFU trig calls each (64 per sampled
+sphere), only for the driver to (maybe) fold them after unrolling.
+`kRingCS[32]` stores the (cos, sin) pairs explicitly (float32 nearest the
+float64 value); the sample loop reads the table and only the conic-vertex
+angle `thv` pays runtime trig (atan + cos + sin). This is constant
+folding, not reformulation: in the float64 model nothing changes at all.
+The one real perturbation is the pre-L8 formula's pi literal
+(6.28318530718) vs 2π — ≤ 3.1e-13 relative in θ — and it is MEASURED
+through the whole pipeline (new section 9): worst-case 3.9e-14 relative on
+the frozen configs, four orders under the 1.4e-5 fixture tolerance.
+
+**Equivalence contract (check_area_model.py section 8, restructured for
+L6, extended for L7).** 4000-iteration float64 fuzz (jittered boxes,
+floor + elevated + FLOATING spheres — the floating configs put the tangent
+cone below the horizon with clamps on BOTH azimuth sides, the L7 stress
+case the parabolic floor rig cannot exercise — and receivers at
+floor/block/air heights), TWO comparisons: (a) UNCAPPED equivalence
+(`MAX_PIECES=4096`) — ref and skips must agree two-sided to 1e-9 relative;
+they tile the SAME region, so this is the L1–L7 exactness proof (4000/4000
+pass); (b) the SHIPPED cap (16) — cap-free iterations asserted dust-equal;
+cap-pressured iterations have NO pointwise ordering (L6 re-tiles the
+carve, so the two paths drop DIFFERENT tail pieces — the old
+no-region-loss assert held pre-L6 only because both sides shared the same
+hulls), so they are scored against the EXACT uncapped baseline
+(Monte-Carlo-free; the old N=300 brute adjudication carried ~1e-3 noise of
+its own) under a net-better gate: on the L7-extended generator, total cap
+error ref 2.996e-1 vs skips 5.675e-3 (L6-era trajectory: 2.796e-1 vs
+8.700e-3) — the layers hold ~50× more real region in the same 16 slots.
+Plus per-fired-reject soundness — L7's is the strongest in the stack:
+each fired reject re-runs the FULL sampled pipeline (33 samples, hull,
+rect restrict) and asserts the restricted hull is EMPTY — and
+frozen-config agreement to 1e-12 relative — 12/12 configs, the shipped
+scene never reaches cap pressure, so L7/L8 are display-invisible where
+they ship. What remains on the GPU side is float32 regrouping of
+equivalently-decomposed regions, ~1e-7 relative — below display
+quantization by three orders.
+
+**Cascaded shadow maps — adjudicated (M5.1 research ask).** CSM is a
 DIRECTIONAL-sun technique: split the camera frustum into depth ranges and
 give each its own shadow-map projection to fight perspective aliasing of
 one depth buffer (Microsoft D3D docs, C4 Engine wiki, three.js CSM, Intel

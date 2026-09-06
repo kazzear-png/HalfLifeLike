@@ -6,7 +6,7 @@ Renders a physically based, HDR-lit scene through a real 3D pipeline
 Wavefront OBJ models at runtime, and ships with an event-driven input system
 and an FPS-style fly camera.
 
-**Current milestone:** M5.0.1 — *the true area light (M5.0) plus exact-reject fast paths: blockers that provably reach no piece skip hull + carve entirely, so clear-sight pixels pay near-march cost while shadowed pixels keep the full exact machinery (CSM adjudicated not-applicable; the 0.5.1-draft IE rewrite rejected on hardware and reverted)*.
+**Current milestone:** M5.1 — *the true area light (M5.0) plus exact-reject fast paths, the L6 rect restriction, the L7 sphere frustum reject, and the L8 ring-trig constant table: blockers that provably reach no piece skip hull + carve entirely, blocker hulls are clipped to the emitter rect before the carve (region-exact by the piece-subset invariant — only edges that could never cut a piece disappear), and the floor-sphere regime — where the disk bound can never fire — now rejects via a cone-vs-cone half-space test before any of the 33 samples run, whose 32 ring angles are compile-time table constants (so clear-sight pixels pay near-march cost while shadowed pixels keep the full exact machinery; CSM adjudicated not-applicable; the 0.5.1-draft IE rewrite rejected on hardware and reverted)*.
 
 **Research direction:** *"How far can a small renderer push perceptual realism
 through intelligent approximation rather than brute-force computation?"*
@@ -324,10 +324,15 @@ the BRDF). Nothing shading-related ships before its reference exists.
   (225 checks). `--area-light 0` keeps the exact M4.0.9.1 transport and
   every replay pin. Residuals documented in the ledger row (sphere conic
   sampling, representative-point specular).
-- **M5.1** — the scene/material abstraction the AreaLight object started:
+- **M5.2** — the scene/material abstraction the AreaLight object started:
   `MeshInstance`/`Scene` objects, a real `scene.json` loader retiring the
   generated Cornell header, and general omnidirectional shadowing
   (cube/point maps) for non-heightfield scenes.
+- **M5.3** — the lighting contribution contract: every term (direct, area,
+  ambient, baked) returns incident radiance split through the shared
+  kD/Fresnel conventions into one accumulation point; hoists the duplicated
+  NoV/reflect evaluations. Pure refactor — the gate is byte-identical
+  replay pins.
 - **M6** — Light probes / irradiance: environment map, irradiance,
   prefiltered specular, BRDF LUT — retires the ambient-gradient placeholder
   wholesale (the old M5 IBL slot folds in here).

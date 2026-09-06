@@ -6,7 +6,7 @@ sections Added / Changed / Removed / Deprecated / Fixed as needed.
 
 ---
 
-## 0.5.1 — M5.0.1: exact-reject fast paths for the area transport (revert of the 0.5.1-draft inclusion-exclusion experiment)
+## 0.5.1 — M5.1: exact-reject fast paths for the area transport (revert of the 0.5.1-draft inclusion-exclusion experiment)
 
 Hardware field report on the 0.5.0 build: ~110 fps against the M4 variant's
 ~475 on the same box. An inclusion-exclusion rewrite (the previous 0.5.1
@@ -34,30 +34,92 @@ undercount of visible region). The sphere path pays 33 sin/cos cone samples
 - **Exact-reject layers (GLSL transport only; the CPU reference in
   `AreaLight.h` intentionally stays the plain 0.5.0 algorithm):**
   per-piece AABB bookkeeping (`gAreaPieceMin2/Max2`, exact — min/max add no
-  rounding) feeds five one-sided skips: box blockers rejected before hull+carve
+  rounding) feeds SEVEN one-sided skips: box blockers rejected before hull+carve
   when their 8-point AABB is axis-disjoint from every piece; the sphere
   rejected before its 33 cone samples by a conservative disk bound
   (`rFoot = (Cy−Py)·(ca·|ch.xz|+sa)/ymin`, valid exactly when no generator
-  clamps); the sampled cone AABB checked before hull+carve; inside a carve,
-  pieces whose AABB misses the blocker AABB are copied through instead of
-  running the edge chain; and when nothing carved, the transport returns
-  `kRect` directly (the final loop would sum one `areaArvo` over the rect —
-  bit-identical by construction). Every skip is one-sided (an AABB contains
-  its polygon), so no occlusion is ever dropped.
+  clamps) or, in the sub-horizontal regime the disk cannot cover, by the L7
+  frustum reject below; the sampled cone AABB checked before hull+carve;
+  inside a carve, pieces whose AABB misses the blocker AABB are copied
+  through instead of running the edge chain; and when nothing carved, the
+  transport returns `kRect` directly (the final loop would sum one `areaArvo`
+  over the rect — bit-identical by construction). Every skip is one-sided
+  (an AABB contains its polygon), so no occlusion is ever dropped.
+  SEVEN skips as of L7 (below).
+- **L6 — blocker hulls restricted to the emitter rect before the carve**
+  (`areaClipBlockerToRect`): one Sutherland–Hodgman keep-inside clip per
+  blocker hull against the four rect boundary lines. EXACT by the
+  piece-subset invariant — every piece starts as the rect and only ever gets
+  half-plane-clipped, so every piece ⊆ E and `piece ∩ B = piece ∩ (B ∩ E)`;
+  the removed region is identical and only dead edges disappear (edges
+  outside the rect could never cut a piece — they only phantom-split the
+  decomposition). Wall/floor footprints that dwarf the 1.30 × 1.05 m patch
+  carve with the few edges that actually cross it (the fuzz's dominant case:
+  a 517 m² box hull restricted to 0.80 m², 6 edges → 5; far-clamped sphere
+  generators collapse onto the rect boundary), the per-piece AABB reject
+  tightens, and the final Arvo loop runs fewer pieces. Kept vertices pass
+  through bit-for-bit; new vertices are lerps on the rect lines (the same
+  arithmetic class the carve itself uses, ~1e-7 relative).
+- **L7 — sphere frustum reject (the sub-horizontal regime's missing
+  pre-sample skip)**: the L2 disk bound is valid exactly when no generator
+  clamps (`ymin > 1e-4`) — so the floor-sphere + floor-receiver rig, which
+  sits EXACTLY on the parabolic boundary (`ymin = 0` in real arithmetic:
+  the horizon plane through the receiver is tangent to the sphere), always
+  paid the 33 cone samples + hull + rect-restrict on every ring. But the
+  rect cone and the tangent cone are still testable against each other:
+  if ONE side half-space of the pyramid conv(P, E) separates the sphere
+  strictly beyond the plane by more than R, then EVERY ray from P through
+  the emitter rect misses the closed sphere (the pyramid lies inside that
+  half-space, all of whose points are > R from the center), so the true
+  shadow region F and the rect are disjoint — and the samples cannot
+  carve: conic samples lie on F's boundary, chords between them stay in F
+  (F is a convex conic region), and the far clamps sit at radius
+  `kAreaFarClamp = 50`, an order of magnitude beyond the rect's reach from
+  P.xz. Sqrt-free (`d > R·|n|` tested as `d² > R²·(n·n)`, both sides
+  non-negative); plane polarity is fixed ONCE per invocation from the rect
+  center (the frozen rect winding makes all four `q_i × q_{i+1}` normals
+  consistent). Fires before ANY sampling; per the fuzz it rejected 2179 of
+  the 4000 iterations' sphere tests outright. Elevation arithmetic, not
+  magic: a floor sphere only shadows the ceiling rect for receivers within
+  ~1 m behind it — everywhere else its cone tops out below the rect's
+  elevation band, and the test now PROVES that instead of sampling it.
+- **L8 — ring-direction constant folding** (`kRingCS[32]`): the 32 ring
+  sample angles θk = 2πk/32 are compile-time constants; their (cos, sin)
+  pairs now live in a const table (float32 nearest the float64 value),
+  removing 64 SFU trig calls per sampled sphere. Only the conic-vertex
+  angle `thv` stays runtime (atan + cos + sin). The float64 model is
+  unchanged; the pre-L8 runtime formula's pi literal (6.28318530718)
+  differs from 2π by ≤ 3.1e-13 relative — measured through the WHOLE
+  pipeline at 3.9e-14 worst-case relative on the frozen configs (new
+  section 9), four orders below the 1.4e-5 fixture tolerance.
 - **`check_area_model.py` section 8** — the reject logic's verification
-  gate: 4000-iteration float64 fuzz (jittered boxes, floor + elevated
-  spheres, receivers at floor/block/air heights) asserting per-fired-reject
-  SAT soundness (the blocker polygon is truly disjoint from every piece),
-  the no-region-loss direction (`K_skips >= K_ref − tol`), brute-force
-  adjudication of every deviation beyond float noise (the skips version
-  must be strictly closer), and frozen-config agreement to 1e-12 relative.
+  gate, restructured with L6 and extended with L7: 4000-iteration float64
+  fuzz (jittered boxes, floor + elevated + FLOATING spheres — the floating
+  configs put the tangent cone below the horizon with clamps on both
+  azimuth sides, the L7 stress case the parabolic floor rig cannot
+  exercise — and receivers at floor/block/air heights) running
+  TWO comparisons. UNCAPPED equivalence (`MAX_PIECES=4096`, the L1–L7
+  exactness proof): ref and skips must agree two-sided to 1e-9 relative —
+  they tile the SAME region. Capped run (the shipped 16-piece cap):
+  cap-free iterations asserted dust-equal; cap-pressured iterations scored
+  against the EXACT uncapped baseline (Monte-Carlo-free — the old N=300
+  brute adjudication carried ~1e-3 noise of its own) with a net-better gate
+  and per-case tally: on the L7-extended generator the layers cut the
+  total cap error 52× (ref 2.996e-1 vs skips 5.675e-3; L6-era trajectory:
+  32×, 2.796e-1 vs 8.700e-3). Plus per-fired-reject soundness — L7's is
+  the strongest in the stack (each fired reject re-runs the FULL sampled
+  pipeline and asserts its restricted hull is EMPTY) — and frozen-config
+  agreement to 1e-12 relative (the shipped scene never reaches cap
+  pressure). Section 9 (new) is the L8 receipt: the θ-literal impact gate.
 
 ### Fixed
 
 - **M5.0 piece-arena cap pressure (incidentally, by the rejects):** where
   0.5.0's phantom splits consumed `kAreaMaxPieces` slots and dropped real
-  tail pieces (visible region undercounted — fuzz case adjudicated:
-  brute 0.013677, 0.5.0 0.005424, 0.5.0.1 0.013694), 0.5.0.1 avoids the
+  tail pieces (visible region undercounted — the fuzz's exact-baseline
+  tally: total cap error 0.5.0 2.796e-1 vs M5.1 8.700e-3, a 32× reduction;
+  worst single fuzz case: brute 0.013677, 0.5.0 0.005424, M5.1 0.013694),
+  M5.1 avoids the
   fragmentation and keeps the true union. Where the cap never binds, the
   transport's result is the 0.5.0 value to float32 regrouping (~1e-7
   relative, display-invisible; frozen fixture VALUES are unchanged — they
@@ -69,7 +131,13 @@ undercount of visible region). The sphere path pays 33 sin/cos cone samples
 - `areaBoxBlocker`/`areaSphereBlocker` split into point+AABB builders
   (`areaBoxBlockerPts`/`areaSphereBlockerPts`) with hulling moved to the
   caller so the reject tests run before the sort; `areaSubtractBlocker`
-  takes the blocker AABB and copy-throughs disjoint pieces; `main()`
+  takes the blocker AABB and copy-throughs disjoint pieces; the hull
+  destination and subtract input are sized `kAreaClipVerts =
+  kAreaBlockVerts + 4` (a convex n-gon gains ≤ 1 vertex per half-plane
+  pass; 4 rect passes); `areaSphereBlockerPts` gains the L7 frustum
+  pre-test (before the sample loop) and the L8 `kRingCS` const table (the
+  sample loop's per-k cos/sin become table reads; only `thv` pays runtime
+  trig); `main()`
   untouched — `--area-light 0` remains byte-identical M4.x transport and
   the ab9 pin (`209fe294…`) is unaffected.
 
@@ -190,7 +258,7 @@ piece-decomposition union is exact.
 - Sphere visibility: the 33-gon inscribes the tangent-cone section — a
   one-sided UNDER-block of ≤ ~9% of the local fraction inside the sphere's
   transition band (≤ 0.9% of K end-to-end), zero in the umbra and the lit
-  region. Fix (M5.1 if the ledger flags it): sample the conic at its
+  region. Fix (M5.2 if the ledger flags it): sample the conic at its
   rect-crossing points.
 - Specular is a one-tap representative-point quadrature — energy-consistent,
   not shape-exact (a mirror sphere reflects one bright point, not the patch

@@ -790,11 +790,28 @@ float shadowVisibilityCentroid(vec3 receiverPos, vec3 lightPos)
 // M5.0 area-light transport -- GLSL mirror of engine/src/rendering/AreaLight.h
 // (constants, formulas, and evaluation order identical; the float64 reference
 // is scripts/check_area_model.py, the fixtures live in bench_tests.cpp).
-// M5.0.1 adds EXACT-REJECT fast paths on the GPU side only: each blocker is
+// M5.1 adds EXACT-REJECT fast paths on the GPU side only: each blocker is
 // tested against the surviving pieces' AABBs before any hulling/carving and
 // provably-disjoint blockers are skipped (the union cannot change -- an AABB
 // contains its polygon). The float64 model + fixtures are unchanged; the
 // skip logic's soundness is fuzz-verified in check_area_model.py section 8.
+// M5.1 L6 (rect restriction): the blocker hull is S-H-clipped to the emitter
+// rect before the carve -- every piece is a subset of the rect (they start
+// as the rect and only get half-plane-clipped), so piece ∩ B = piece ∩ (B ∩ E)
+// and restricting B is region-exact; wall/floor footprints that dwarf the
+// rect carve with the few edges that actually cross it.
+// M5.1 L7 (sphere frustum reject): when ymin <= 1e-4 the L2 footprint disk
+// explodes and can never reject, so the floor-sphere regime pays the 33
+// samples on every ring. There the RECT cone and the tangent cone are still
+// testable against each other: a side half-space of conv(P, E) that
+// separates the sphere strictly beyond the plane by more than R proves no
+// ray from P through the rect touches the sphere, so the true shadow region
+// and the rect are disjoint and the samples cannot carve. Sqrt-free, fires
+// before any sampling; soundness fuzz-asserted per fire (section 8).
+// M5.1 L8 (ring-direction constant folding): the 32 ring sample directions
+// theta_k = 2*pi*k/32 are compile-time constants; their (cos, sin) pairs
+// live in a const table (kRingCS), removing 64 SFU trig calls per sampled
+// sphere. Only the conic-vertex angle thv stays runtime.
 // ===========================================================================
 
 const int   kAreaRing        = 32;    // sphere cone boundary directions
@@ -802,6 +819,10 @@ const int   kAreaBlockVerts  = kAreaRing + 1;   // + the conic-vertex sample
 const float kAreaFarClamp    = 50.0;  // sub-horizontal generator clamp (room 5.5 m)
 const int   kAreaMaxPieces   = 16;    // visible-region piece capacity
 const int   kAreaMaxPieceVerts = 28;  // per-piece vertex capacity
+const int   kAreaClipVerts    = kAreaBlockVerts + 4;
+// S-H keep-inside capacity bound: a convex n-gon gains at most ONE vertex
+// per half-plane pass (its boundary crosses the clip LINE at most twice),
+// and the rect restriction runs 4 passes over a hull of <= kAreaBlockVerts.
 
 // The visible region as a list of DISJOINT polygons on the emitter plane
 // (union = what is still lit). Shader-scope state, rebuilt per invocation.
@@ -809,9 +830,9 @@ vec2 gAreaPieces[kAreaMaxPieces * kAreaMaxPieceVerts];
 int  gAreaPieceN[kAreaMaxPieces];
 int  gAreaPieceCount = 0;
 
-// M5.0.1 exact-reject bookkeeping: per-piece AABB in emitter-plane xz.
+// M5.1 exact-reject bookkeeping: per-piece AABB in emitter-plane xz.
 // Feeds ONLY the reject tests below; it never touches a shaded value, so
-// the transport math is unchanged (SHADOW_EDGE_REFERENCES M5.0.1 carries
+// the transport math is unchanged (SHADOW_EDGE_REFERENCES M5.1 carries
 // the equivalence argument and the fuzz gate).
 vec2 gAreaPieceMin2[kAreaMaxPieces];
 vec2 gAreaPieceMax2[kAreaMaxPieces];
@@ -905,8 +926,11 @@ float areaSolidAngleRect(vec3 P)
 }
 
 // 2D convex hull (monotone chain over an insertion sort). Mirrors the CPU.
+// The hull destination is sized kAreaClipVerts so the caller can restrict
+// it to the rect in place (a convex n-gon gains <= 1 vertex per half-plane
+// pass; 4 passes -> kAreaBlockVerts + 4).
 int areaHull2d(in vec2 pts[kAreaBlockVerts], in int n,
-               out vec2 hull[kAreaBlockVerts])
+               out vec2 hull[kAreaClipVerts])
 {
     for (int i = 1; i < n; ++i) {
         vec2 v = pts[i];
@@ -965,6 +989,61 @@ int areaHull2d(in vec2 pts[kAreaBlockVerts], in int n,
     return h;
 }
 
+// L6 -- Sutherland-Hodgman keep-inside clip of the CONVEX blocker hull
+// against the four emitter-rect boundary lines; the output region is B ∩ E.
+// WHY THIS CANNOT CHANGE THE RESULT (the piece-subset invariant): every
+// piece starts as the rect and is only ever cut by half-plane clips (or
+// copied through), so every piece is a subset of E; therefore for every
+// piece: piece ∩ B = piece ∩ (B ∩ E) -- subtracting the restricted polygon
+// removes exactly the same region. The edges this deletes could never cut a
+// piece (pieces live inside the rect); they could only phantom-split the
+// decomposition. Wall/floor blockers backproject to footprints that dwarf
+// the 1.30 x 1.05 m rect: their clip chains shrink from up to 33 edges to
+// the few that cross it, and far-clamped sphere generators collapse onto
+// the rect boundary. Kept vertices pass through bit-for-bit; new vertices
+// are lerps on the rect lines (the same arithmetic class the carve itself
+// uses, ~1e-7 relative). Returns the new count (0..2 = nothing left inside;
+// the caller then skips the blocker entirely).
+int areaClipBlockerToRect(inout vec2 B[kAreaClipVerts], in int bn)
+{
+    vec2 lo = uAreaCenter.xz - vec2(uEmitterHalf.x, uEmitterHalf.y);
+    vec2 hi = uAreaCenter.xz + vec2(uEmitterHalf.x, uEmitterHalf.y);
+    // passes: keep x >= lo.x, x <= hi.x, y >= lo.y, y <= hi.y
+    // (the polygon's .y is world z). No dynamic component indexing.
+    for (int pass = 0; pass < 4 && bn >= 3; ++pass) {
+        bool  keepX  = (pass < 2);
+        bool  keepGe = (pass == 0 || pass == 2);
+        float plane  = keepX ? ((pass == 0) ? lo.x : hi.x)
+                             : ((pass == 2) ? lo.y : hi.y);
+        vec2 outV[kAreaClipVerts];
+        int  on = 0;
+        for (int v = 0; v < bn; ++v) {
+            int  w = (v + 1) % bn;
+            vec2 pt = B[v];
+            vec2 qt = B[w];
+            float fp = keepX ? ((keepGe) ? (pt.x - plane) : (plane - pt.x))
+                             : ((keepGe) ? (pt.y - plane) : (plane - pt.y));
+            float fq = keepX ? ((keepGe) ? (qt.x - plane) : (plane - qt.x))
+                             : ((keepGe) ? (qt.y - plane) : (plane - qt.y));
+            bool inP = fp >= 0.0;
+            bool inQ = fq >= 0.0;
+            if (inP && on < kAreaClipVerts) {
+                outV[on++] = pt;
+            }
+            if (inP != inQ && on < kAreaClipVerts) {
+                float t = fp / (fp - fq);
+                outV[on++] = vec2(pt.x + t * (qt.x - pt.x),
+                                  pt.y + t * (qt.y - pt.y));
+            }
+        }
+        bn = on;
+        for (int v = 0; v < on; ++v) {
+            B[v] = outV[v];
+        }
+    }
+    return bn;
+}
+
 // Box blocker footprint POINTS: the hull inputs of the two height-cap
 // footprints projected through the receiver -- the exact radial sweep of the
 // [ylo, yhi] band. Hulling is the CALLER's job so the exact-reject test can
@@ -1010,6 +1089,49 @@ int areaBoxBlockerPts(vec3 P, vec4 bmin, vec4 bmax,
     return n;
 }
 
+// L8: the ring directions theta_k = 2*pi*k/32 (k = 0..31) are compile-time
+// constants, so their (cos, sin) pairs fold into this table -- float32
+// nearest to the float64 values. Per sampled sphere this removes 64 SFU
+// trig calls (32 cos + 32 sin); the conic-vertex angle thv stays runtime
+// (atan + cos + sin). The float64 model is unchanged: theta_k is the same
+// constant there, and the shipped GLSL literal 6.28318530718 differs from
+// 2*pi by <= 3e-13 relative -- measured through the whole pipeline at
+// < 1e-12 relative on the frozen configs (check_area_model.py section 8).
+const vec2 kRingCS[32] = vec2[32](
+    vec2(1.0, 0.0),
+    vec2(0.98078525, 0.19509032),
+    vec2(0.9238795, 0.38268343),
+    vec2(0.8314696, 0.55557024),
+    vec2(0.70710677, 0.70710677),
+    vec2(0.55557024, 0.8314696),
+    vec2(0.38268343, 0.9238795),
+    vec2(0.19509032, 0.98078525),
+    vec2(6.123234e-17, 1.0),
+    vec2(-0.19509032, 0.98078525),
+    vec2(-0.38268343, 0.9238795),
+    vec2(-0.55557024, 0.8314696),
+    vec2(-0.70710677, 0.70710677),
+    vec2(-0.8314696, 0.55557024),
+    vec2(-0.9238795, 0.38268343),
+    vec2(-0.98078525, 0.19509032),
+    vec2(-1.0, 1.2246469e-16),
+    vec2(-0.98078525, -0.19509032),
+    vec2(-0.9238795, -0.38268343),
+    vec2(-0.8314696, -0.55557024),
+    vec2(-0.70710677, -0.70710677),
+    vec2(-0.55557024, -0.8314696),
+    vec2(-0.38268343, -0.9238795),
+    vec2(-0.19509032, -0.98078525),
+    vec2(-1.8369701e-16, -1.0),
+    vec2(0.19509032, -0.98078525),
+    vec2(0.38268343, -0.9238795),
+    vec2(0.55557024, -0.8314696),
+    vec2(0.70710677, -0.70710677),
+    vec2(0.8314696, -0.55557024),
+    vec2(0.9238795, -0.38268343),
+    vec2(0.98078525, -0.19509032)
+);
+
 // Sphere blocker footprint POINTS: 33 boundary directions of the tangent
 // cone {angle(dir, C_hat) <= asin(R/d)}, projected through the receiver onto
 // the emitter plane; sub-horizontal generators clamp at kAreaFarClamp along
@@ -1046,7 +1168,7 @@ int areaSphereBlockerPts(vec3 P, vec4 sph, out vec2 pts[kAreaBlockVerts],
         : normalize(cross(ch, vec3(1.0, 0.0, 0.0)));
     vec3 e2 = cross(ch, e1);
     float thv = atan(e2.y, e1.y);   // the ring's max-d.y direction: conic vertex
-    // M5.0.1 exact-reject (pre-disk): every tangent-cone direction satisfies
+    // M5.1 exact-reject (pre-disk): every tangent-cone direction satisfies
     //   dir.y >= ymin = ca*ch.y - sa*sqrt(1-ch.y^2)   (m.y range for m _|_ ch)
     //   |dir.xz| <= ca*|ch.xz| + sa                    (|m.xz| <= 1)
     // and the plane hit is q = P.xz + (Cy-Py)*dir.xz/dir.y, so the WHOLE
@@ -1060,14 +1182,71 @@ int areaSphereBlockerPts(vec3 P, vec4 sph, out vec2 pts[kAreaBlockVerts],
         if (areaDiskClearOf(P.xz, rFoot)) {
             return 0;
         }
+    } else {
+        // M5.1 L7 (frustum reject, sub-horizontal regime): with ymin <= 1e-4
+        // the L2 bound rFoot ~ h/ymin explodes and can never reject -- the
+        // floor-sphere regime pays the 33 samples on every ring. But the
+        // RECT cone and the tangent cone are still testable: if ONE side
+        // half-space of the pyramid conv(P, E) separates the sphere strictly
+        // beyond the plane by more than R, then EVERY ray from P through the
+        // rect misses the closed sphere (the pyramid is inside that
+        // half-space, whose points are all > R from the center), so the
+        // true shadow region F and E are disjoint. The samples then cannot
+        // carve: conic samples lie on F's boundary and chords between them
+        // stay in F (F is a convex conic region), and the sub-horizontal
+        // clamps sit at radius kAreaFarClamp = 50 -- an order of magnitude
+        // beyond the rect's reach from P.xz. The operational statement (the
+        // full sampled pipeline's restricted hull is empty) is fuzz-asserted
+        // per fired reject in check_area_model.py section 8.
+        // sqrt-free: d > R*|n| with d > 0 is tested as d*d > R*R*dot(n,n).
+        // Polarity: the frozen rect winding makes all four q_i x q_{i+1}
+        // normals consistent, so ONE sign from the rect center (qc, strictly
+        // inside the pyramid) orients them all OUTWARD; a wrong sign could
+        // only suppress or falsely fire, so the fuzz assert guards it.
+        vec3 q0 = vec3(uAreaCenter.x - uEmitterHalf.x - P.x,
+                       uAreaCenter.y - P.y,
+                       uAreaCenter.z - uEmitterHalf.y - P.z);
+        vec3 q1 = vec3(uAreaCenter.x + uEmitterHalf.x - P.x,
+                       uAreaCenter.y - P.y,
+                       uAreaCenter.z - uEmitterHalf.y - P.z);
+        vec3 q2 = vec3(uAreaCenter.x + uEmitterHalf.x - P.x,
+                       uAreaCenter.y - P.y,
+                       uAreaCenter.z + uEmitterHalf.y - P.z);
+        vec3 q3 = vec3(uAreaCenter.x - uEmitterHalf.x - P.x,
+                       uAreaCenter.y - P.y,
+                       uAreaCenter.z + uEmitterHalf.y - P.z);
+        vec3 n0 = cross(q0, q1);
+        vec3 n1 = cross(q1, q2);
+        vec3 n2 = cross(q2, q3);
+        vec3 n3 = cross(q3, q0);
+        vec3 qc = vec3(uAreaCenter.x - P.x, uAreaCenter.y - P.y,
+                       uAreaCenter.z - P.z);
+        float sg = (dot(n0, qc) < 0.0) ? 1.0 : -1.0;
+        float sd0 = sg * dot(n0, g);
+        float sd1 = sg * dot(n1, g);
+        float sd2 = sg * dot(n2, g);
+        float sd3 = sg * dot(n3, g);
+        float R2 = sph.w * sph.w;
+        bool sep = (sd0 > 0.0 && sd0 * sd0 > R2 * dot(n0, n0))
+                || (sd1 > 0.0 && sd1 * sd1 > R2 * dot(n1, n1))
+                || (sd2 > 0.0 && sd2 * sd2 > R2 * dot(n2, n2))
+                || (sd3 > 0.0 && sd3 * sd3 > R2 * dot(n3, n3));
+        if (sep) {
+            return 0;   // tangent cone cannot reach the rect cone
+        }
     }
     int n = 0;
     for (int k = 0; k <= kAreaRing; ++k) {
-        float th = (k < kAreaRing)
-            ? (6.28318530718 * float(k) / float(kAreaRing))
-            : thv;
-        float ct = cos(th);
-        float st = sin(th);
+        // L8: the 32 ring angles are compile-time constants (kRingCS);
+        // only the conic vertex thv pays runtime trig.
+        float ct, st;
+        if (k < kAreaRing) {
+            ct = kRingCS[k].x;
+            st = kRingCS[k].y;
+        } else {
+            ct = cos(thv);
+            st = sin(thv);
+        }
         vec3 dir = ca * ch + sa * (e1 * ct + e2 * st);
         if (dir.y > 1e-6) {
             float s = (uAreaCenter.y - P.y) / dir.y;
@@ -1098,7 +1277,7 @@ int areaSphereBlockerPts(vec3 P, vec4 sph, out vec2 pts[kAreaBlockVerts],
 // for any simple subject; bridges lie on the clip line, carry no area, and
 // their edge contributions cancel exactly in the Arvo sum). The leftover
 // piece n B is dropped (fully blocked). Union over blockers stays EXACT.
-void areaSubtractBlocker(in vec2 B[kAreaBlockVerts], in int bn,
+void areaSubtractBlocker(in vec2 B[kAreaClipVerts], in int bn,
                          in vec2 bmin2, in vec2 bmax2)
 {
     vec2 newV[kAreaMaxPieces * kAreaMaxPieceVerts];
@@ -1106,7 +1285,7 @@ void areaSubtractBlocker(in vec2 B[kAreaBlockVerts], in int bn,
     int  newCount = 0;
     for (int p = 0; p < gAreaPieceCount; ++p) {
         int base = p * kAreaMaxPieceVerts;
-        // M5.0.1 exact-reject: a piece whose AABB misses B's AABB keeps its
+        // M5.1 exact-reject: a piece whose AABB misses B's AABB keeps its
         // whole region -- the edge chain could only phantom-split it into
         // area-equal parts (bridges carry no area; the union is unchanged),
         // so copy it through bit-for-bit and skip the bn-edge chain.
@@ -1194,14 +1373,16 @@ void areaSubtractBlocker(in vec2 B[kAreaBlockVerts], in int bn,
 // THE transport: subtract every occluder's backprojected region from the
 // emitter rect, then form-factor the surviving pieces. kRect (out) = the
 // unshadowed rect form factor (also the specular visibility denominator).
-// M5.0.1 exact-reject fast paths: each blocker is tested against the
+// M5.1 exact-reject fast paths: each blocker is tested against the
 // surviving pieces' AABBs BEFORE any hulling/carving (box: after the 8
 // corner transforms; sphere: a conservative disk bound, then the sampled
 // cone's AABB). A blocker that provably reaches no piece is skipped -- the
-// union is unchanged, only dead decomposition work disappears. If NO
-// blocker carved, the piece list is still exactly the rect and the
-// transport returns kRect directly (the final loop would sum one areaArvo
-// over rectP, which is bit-identical to kRect by construction).
+// union is unchanged, only dead decomposition work disappears. L6: a hull
+// that IS subtracted is first restricted to the rect (areaClipBlockerToRect
+// -- exact by the piece-subset invariant). If NO blocker carved, the piece
+// list is still exactly the rect and the transport returns kRect directly
+// (the final loop would sum one areaArvo over rectP, which is bit-identical
+// to kRect by construction).
 float areaLightVisibility(vec3 P, vec3 N, out float kRect)
 {
     vec2 rectP[kAreaMaxPieceVerts];
@@ -1230,13 +1411,25 @@ float areaLightVisibility(vec3 P, vec3 N, out float kRect)
         if (n < 3 || areaPiecesClearOf(bmin2, bmax2)) {
             continue;   // ineligible/degenerate, or provably reaches no piece
         }
-        vec2 B[kAreaBlockVerts];
+        vec2 B[kAreaClipVerts];
         int bn = areaHull2d(pts, n, B);
         if (bn >= 3) {
-            areaSubtractBlocker(B, bn, bmin2, bmax2);
-            carved = true;
-            if (gAreaPieceCount == 0) {
-                return 0.0;
+            // L6: restrict B to the rect (exact B ∩ E, see above) -- the
+            // carve then runs only the edges that can actually cut pieces,
+            // and its per-piece AABB test gets the tighter restricted box.
+            bn = areaClipBlockerToRect(B, bn);
+            if (bn >= 3) {
+                vec2 rmin2 = B[0];      // exact restricted AABB (min/max
+                vec2 rmax2 = B[0];      // add no rounding)
+                for (int i = 1; i < bn; ++i) {
+                    rmin2 = min(rmin2, B[i]);
+                    rmax2 = max(rmax2, B[i]);
+                }
+                areaSubtractBlocker(B, bn, rmin2, rmax2);
+                carved = true;
+                if (gAreaPieceCount == 0) {
+                    return 0.0;
+                }
             }
         }
     }
@@ -1247,13 +1440,25 @@ float areaLightVisibility(vec3 P, vec3 N, out float kRect)
         if (n < 3 || areaPiecesClearOf(bmin2, bmax2)) {
             continue;   // ineligible/degenerate, or provably reaches no piece
         }
-        vec2 B[kAreaBlockVerts];
+        vec2 B[kAreaClipVerts];
         int bn = areaHull2d(pts, n, B);
         if (bn >= 3) {
-            areaSubtractBlocker(B, bn, bmin2, bmax2);
-            carved = true;
-            if (gAreaPieceCount == 0) {
-                return 0.0;
+            // L6: as in the box branch -- B ∩ E is region-exact against
+            // every piece, and far-clamped generators (up to kAreaFarClamp)
+            // collapse onto the rect boundary here.
+            bn = areaClipBlockerToRect(B, bn);
+            if (bn >= 3) {
+                vec2 rmin2 = B[0];
+                vec2 rmax2 = B[0];
+                for (int i = 1; i < bn; ++i) {
+                    rmin2 = min(rmin2, B[i]);
+                    rmax2 = max(rmax2, B[i]);
+                }
+                areaSubtractBlocker(B, bn, rmin2, rmax2);
+                carved = true;
+                if (gAreaPieceCount == 0) {
+                    return 0.0;
+                }
             }
         }
     }

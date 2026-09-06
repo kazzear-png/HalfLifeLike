@@ -208,12 +208,18 @@ mkdir -p out                     # bash/WSL -- Windows cmd:  mkdir out
 # python3 tools/benchmark_compare.py out/m50_ab12_area_c03.ppm benchmarks/cornell_box/reference/cbox03_clean.ppm
 ```
 
-M5.0.1 update (exact-reject fast paths; transport math unchanged): the ab
+M5.1 update (exact-reject fast paths + the L6 rect restriction + the L7
+sphere frustum reject + the L8 ring-trig constant table; transport math
+region-exact): the ab
 rows above remain the protocol, to be measured on an IDLE machine — the
 110-vs-475 field report was taken while the box was otherwise busy, so
-treat absolute fps as noise and the M5.0.1-vs-M5.0 A/B (same command, new
+treat absolute fps as noise and the M5.1-vs-M5.0 A/B (same command, new
 build) as the signal. ab9's `--area-light 0` pin is untouched by 0.5.1
-(the legacy branch was not modified); ab10 records the M5.0.1 default pin.
+(the legacy branch was not modified); ab10 records the M5.1 default pin.
+L7/L8 attribution note: L7 only touches the sphere path's pre-sample
+reject (floor-sphere rings off the shadow band), L8 only the sphere
+sample loop's trig — if the M5.1 A/B still shows an area-path gap, the
+remaining cost is the box path + hull + carve, NOT sphere sampling.
 
 Row template:
 
