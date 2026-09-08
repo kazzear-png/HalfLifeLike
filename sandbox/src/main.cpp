@@ -29,6 +29,7 @@
 
 #include "core/Application.h"
 #include "assets/OBJ.h"
+#include "math/Frustum.h"
 #include "math/Mat4.h"
 #include "math/Vec3.h"
 #include "rendering/Camera.h"
@@ -47,6 +48,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>    // M5.3: dynamic-fps unfocused throttle (sleep_until)
 #include <vector>
 
 #ifdef _WIN32
@@ -280,7 +282,9 @@ struct CornellScene {
     const cornell::VariantDef* def = nullptr;
     std::vector<engine::Mesh>  meshes;        // parallel to def->meshes
     std::vector<bool>          meshLoaded;
+    std::vector<engine::Aabb>  meshAabb;      // M5.3: world AABBs (frustum culling)
     engine::Mesh               emitterQuad;   // unlit emissive draw
+    engine::Aabb               emitterAabb{}; // M5.3: emitter world AABB
     bool                       emitterReady = false;
     OccluderSet                occluders;     // M4.0.9.1 lateral half-plane set
 };
@@ -784,6 +788,7 @@ bool setupCornellScene(CornellScene& scene, int variantIndex,
     scene.def = cornell::kVariants[variantIndex];
     scene.meshes.resize(scene.def->meshCount);
     scene.meshLoaded.assign(scene.def->meshCount, false);
+    scene.meshAabb.assign(scene.def->meshCount, engine::Aabb{});
 
     engine::LoadObjOptions opts;
     opts.centerToOrigin = false;   // the standard is authored in world space
@@ -804,24 +809,28 @@ bool setupCornellScene(CornellScene& scene, int variantIndex,
             std::fprintf(stderr, "[Sandbox] cornell: %s: %s\n", path.c_str(),
                          model.warnings.c_str());
         }
+        // M5.3: world AABB for EVERY mesh -- the frustum-culling input
+        // (identity transform, so object space == world space). The occluder
+        // extraction below reuses the same bounds it always scanned.
+        if (!model.vertices.empty()) {
+            scene.meshAabb[i].seed(engine::Vec3(model.vertices[0].x,
+                                                model.vertices[0].y,
+                                                model.vertices[0].z));
+            for (const engine::Vertex& v : model.vertices) {
+                scene.meshAabb[i].grow(engine::Vec3(v.x, v.y, v.z));
+            }
+        }
         // M4.0.9.1: accumulate the analytic occluder primitives from the
         // SAME meshes the heightfield capture rasterizes (identity
         // transform, so world AABB == mesh AABB). Boxes keep their AABB;
         // "sphere_*" materials become spheres (center = AABB center,
         // R = half the x-extent -- the generated spheres are uniform).
+        const engine::Aabb& meshBox = scene.meshAabb[i];
         if (isOccluderMaterial(scene.def->meshes[i].material) &&
             !model.vertices.empty()) {
-            float mnX = model.vertices[0].x, mxX = mnX;
-            float mnY = model.vertices[0].y, mxY = mnY;
-            float mnZ = model.vertices[0].z, mxZ = mnZ;
-            for (const engine::Vertex& v : model.vertices) {
-                if (v.x < mnX) mnX = v.x;
-                if (v.x > mxX) mxX = v.x;
-                if (v.y < mnY) mnY = v.y;
-                if (v.y > mxY) mxY = v.y;
-                if (v.z < mnZ) mnZ = v.z;
-                if (v.z > mxZ) mxZ = v.z;
-            }
+            const float mnX = meshBox.min.x, mxX = meshBox.max.x;
+            const float mnY = meshBox.min.y, mxY = meshBox.max.y;
+            const float mnZ = meshBox.min.z, mxZ = meshBox.max.z;
             if (std::strncmp(scene.def->meshes[i].material, "sphere_", 7) == 0) {
                 if (scene.occluders.sphereCount < kMaxShadowSpheres) {
                     float* s = scene.occluders.sphere[scene.occluders.sphereCount];
@@ -851,6 +860,14 @@ bool setupCornellScene(CornellScene& scene, int variantIndex,
 
     scene.emitterQuad = createEmitterQuad();
     scene.emitterReady = scene.emitterQuad.valid();
+    // M5.3: the emitter quad is authored flat at kEmitterMin[1]; its culling
+    // AABB is that footprint with zero vertical extent.
+    scene.emitterAabb.seed(engine::Vec3(cornell::kEmitterMin[0],
+                                        cornell::kEmitterMin[1],
+                                        cornell::kEmitterMin[2]));
+    scene.emitterAabb.grow(engine::Vec3(cornell::kEmitterMax[0],
+                                        cornell::kEmitterMin[1],
+                                        cornell::kEmitterMax[2]));
     allOk = allOk && scene.emitterReady;
     return allOk;
 }
@@ -877,6 +894,8 @@ int main(int argc, char** argv) {
     bool marchStepOverridden = false;         // --shadow-step seen (binds BOTH paths)
     std::string dumpHeightfieldPrefix; // --dump-heightfield p: write <p>_hmax/_hmin.ppm
     int  shadowDebugMode = 0;          // --shadow-debug vis|field|uv (M4.0.5 instrument)
+    int  dynamicFps = 1;               // --dynamic-fps 0|1 (M5.3: unfocused/minimized pacing)
+    int  frustumCull = 1;              // --cull 0|1 (M5.3: frustum AABB culling A/B lever)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             screenshotFrames = std::atoi(argv[++i]);
@@ -976,6 +995,27 @@ int main(int argc, char** argv) {
                              argv[i]);
                 return 1;
             }
+        } else if (std::strcmp(argv[i], "--dynamic-fps") == 0 && i + 1 < argc) {
+            dynamicFps = std::atoi(argv[++i]);
+            if (dynamicFps < 0 || dynamicFps > 1) {
+                std::fprintf(stderr,
+                             "[Sandbox] --dynamic-fps: '%s' out of range "
+                             "(0 = full rate always, 1 = 30 fps unfocused cap, "
+                             "event-driven pause when minimized; auto-off "
+                             "during benchmark/screenshot runs)\n",
+                             argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--cull") == 0 && i + 1 < argc) {
+            frustumCull = std::atoi(argv[++i]);
+            if (frustumCull < 0 || frustumCull > 1) {
+                std::fprintf(stderr,
+                             "[Sandbox] --cull: '%s' out of range "
+                             "(1 = conservative frustum-AABB culling on, "
+                             "0 = submit every draw -- the A/B lever)\n",
+                             argv[i]);
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--shadow-debug") == 0 && i + 1 < argc) {
             const char* mode = argv[++i];
             if (std::strcmp(mode, "vis") == 0) {
@@ -1013,6 +1053,12 @@ int main(int argc, char** argv) {
     if (benchMode && screenshotFrames == 0) {
         screenshotFrames = benchmarkFrames;   // a benchmark run also captures its final frame
     }
+
+    // M5.3: benchmark and screenshot runs are deterministic timelines --
+    // window-focus pacing must never touch them. Focus throttling is for
+    // interactive sessions only (the Dynamic-FPS pattern).
+    const bool dynamicFpsActive = (dynamicFps != 0) && !benchMode && (screenshotFrames == 0);
+    const bool cullEnabled = (frustumCull != 0);
 
     // --- window + engine boot ----------------------------------------------
     engine::WindowDesc desc;
@@ -1083,6 +1129,7 @@ int main(int argc, char** argv) {
     const std::string modelDir = findModelDir(argc > 0 ? argv[0] : nullptr, &modelSearchLog);
     engine::Mesh modelMeshes[4];
     bool modelLoaded[4] = { false, false, false, false };
+    engine::Aabb modelAabbs[4];            // M5.3: local (pre-transform) bounds
 
     if (modelDir.empty()) {
         std::fprintf(stderr,
@@ -1105,6 +1152,16 @@ int main(int argc, char** argv) {
             if (!model.warnings.empty()) {
                 std::fprintf(stderr, "[Sandbox] %s: %s\n", path.c_str(), model.warnings.c_str());
             }
+            // M5.3: local AABB for the frustum-cull transform (the loader
+            // already centered + rescaled the vertices; bounds are final).
+            if (!model.vertices.empty()) {
+                modelAabbs[i].seed(engine::Vec3(model.vertices[0].x,
+                                                model.vertices[0].y,
+                                                model.vertices[0].z));
+                for (const engine::Vertex& v : model.vertices) {
+                    modelAabbs[i].grow(engine::Vec3(v.x, v.y, v.z));
+                }
+            }
             modelLoaded[i] = modelMeshes[i].create(model.vertices.data(),
                                                    static_cast<std::uint32_t>(model.vertices.size()),
                                                    model.indices.data(),
@@ -1117,6 +1174,21 @@ int main(int argc, char** argv) {
 
     // --- light bulbs (procedural spheres drawn with the unlit shader) -------
     engine::Mesh bulbMesh = createSphereMesh(0.07f, 16, 12);
+
+    // M5.3: static culling bounds for the demo scene (local space; the
+    // animated objects get Aabb::transformed(modelMatrix) per frame).
+    const engine::Aabb floorAabb  = [] {
+        engine::Aabb b; b.seed(engine::Vec3(-6.0f, -0.75f, -6.0f));
+        b.grow(engine::Vec3(6.0f, -0.75f, 6.0f)); return b;
+    }();
+    const engine::Aabb quadAabbLocal = [] {
+        engine::Aabb b; b.seed(engine::Vec3(-0.5f, -0.5f, 0.0f));
+        b.grow(engine::Vec3(0.5f, 0.5f, 0.0f)); return b;
+    }();
+    const engine::Aabb bulbAabbLocal = [] {
+        engine::Aabb b; b.seed(engine::Vec3(-0.07f, -0.07f, -0.07f));
+        b.grow(engine::Vec3(0.07f, 0.07f, 0.07f)); return b;
+    }();
 
     // --- cornell benchmark scene (M3.3) --------------------------------------
     CornellScene cornell;
@@ -1265,8 +1337,23 @@ int main(int argc, char** argv) {
         "material validation (red = violation)",
     };
 
+    // M5.2: build identification -- the perf-fixed binary announces itself so
+    // hardware reports can be attributed to the right tree (rendering is
+    // byte-identical across the change, so the screenshot md5 cannot tell the
+    // builds apart).
+    std::printf("[Sandbox] build 0.5.3 (M5.3 mod-inspired: frozen-scene upload-once, "
+                "frustum culling, dynamic-fps pacing; M5.1/M5.2: uniform-location "
+                "cache, batched shadow arrays, non-blocking GPU timer ring, "
+                "draw-loop glGetError removed)\n");
     std::printf("[Sandbox] Controls: click=look, WASD+QE=fly, 1-4=model, F=flashlight, "
                 "V=material views, SPACE=pause spin, ESC=quit, scroll=exposure\n");
+    std::printf("[Sandbox] culling: %s | dynamic fps: %s\n",
+                cullEnabled ? "frustum AABB, conservative (--cull 0 to disable)"
+                            : "off (--cull 0)",
+                dynamicFpsActive
+                    ? "30 fps unfocused cap, event-driven when minimized"
+                    : (dynamicFps != 0 ? "off (deterministic run: benchmark/screenshot)"
+                                       : "off (--dynamic-fps 0)"));
     if (cornellVariant >= 0) {
         std::printf("[Sandbox] cornell scene '%s': fixed camera/lights/exposure "
                     "(cornell-box/1.0, FROZEN standard; input disabled)\n",
@@ -1283,10 +1370,41 @@ int main(int argc, char** argv) {
     gpuTimes.reserve(framePeriods.capacity());
     std::chrono::steady_clock::time_point lastEntry = std::chrono::steady_clock::now();
 
+    // M5.3 per-run pacing / upload / culling state --------------------------------
+    bool cornellStaticUploaded = false; // frozen-scene uniforms are up in the program
+    int  lastFbw = -1, lastFbh = -1;    // viewport/aspect change detection
+    bool focusSeen = false;             // throttle only after focus was held once
+    std::uint64_t totalCulledDraws = 0; // culling telemetry (report line)
+    std::uint64_t maxCulledDraws  = 0;  // worst frame
+
     std::uint64_t frameIndex = 0;
 
     app.run([&](float dt) {
         engine::Input& in = app.input();
+
+        // --- M5.3 dynamic-fps pacing (interactive runs only) -----------------
+        // The Dynamic-FPS pattern: an unfocused window draws at a capped rate
+        // (30 fps); a minimized window stops drawing entirely and parks in a
+        // blocking event wait (~zero CPU/GPU). Benchmarks and screenshot
+        // timelines are exempt (dynamicFpsActive == false there) -- their
+        // frame pacing is part of the frozen measurement.
+        if (dynamicFpsActive) {
+            if (app.window().isIconified()) {
+                // Hidden: wait for OS events (restore/close) with a periodic
+                // 250 ms wake; skip this frame's render work entirely.
+                app.window().waitEvents(0.25);
+                return;   // run() still presents the last backbuffer
+            }
+            if (app.window().isFocused()) {
+                focusSeen = true;   // arm the throttle (was focused this run)
+            } else if (focusSeen) {
+                // Tabbed out: pace entry-to-entry at ~30 fps.
+                const auto wakeAt = lastEntry + std::chrono::microseconds(33333);
+                if (std::chrono::steady_clock::now() < wakeAt) {
+                    std::this_thread::sleep_until(wakeAt);
+                }
+            }
+        }
 
         const auto entryTime = std::chrono::steady_clock::now();
         const bool measured = benchMode && (frameIndex >= static_cast<std::uint64_t>(warmupFrames));
@@ -1397,109 +1515,154 @@ int main(int argc, char** argv) {
         }
         const engine::Mat4 vp = camera.viewProjection();
 
-        renderer.setViewport(0, 0, fbw, fbh);
-        if (fbw > 0 && fbh > 0) {
-            renderer.resizeHDR(fbw, fbh);  // no-op unless the size changed
+        // M5.3: viewport + HDR targets follow only ACTUAL framebuffer
+        // changes -- glViewport and the resize probe are global-state calls
+        // whose values are identical every frame of a fixed-size window;
+        // re-issuing them is pure redundant driver traffic (and the first
+        // frame after the startup heightfield capture genuinely needs this
+        // re-issue, which lastFbw == -1 guarantees).
+        const bool fbResized = (fbw != lastFbw || fbh != lastFbh);
+        if (fbResized) {
+            lastFbw = fbw;
+            lastFbh = fbh;
+            renderer.setViewport(0, 0, fbw, fbh);
+            if (fbw > 0 && fbh > 0) {
+                renderer.resizeHDR(fbw, fbh);  // no-op unless the size changed
+            }
         }
+
+        // M5.3 culling: one frustum per frame from the (possibly new) vp.
+        // Degenerate when culling is off -- and the degenerate plane set
+        // rejects nothing, so a runtime flag flip can never hide geometry.
+        const engine::Frustum frustum = cullEnabled
+            ? engine::Frustum::fromViewProjection(vp) : engine::Frustum{};
+        int culledThisFrame = 0;
 
         // --- frame ---------------------------------------------------------------
         renderer.beginFrame();
 
         pbrShader.bind();
-        pbrShader.setMat4("uViewProj", vp);
-        pbrShader.setFloat3("uViewPos", camera.position());
-        pbrShader.setInt("uDebugMode", cornellVariant >= 0 ? 0 : debugMode);
+
+        // M5.3 STATIC UPLOAD (the Sodium/ImmediatelyFast pattern applied to
+        // a FROZEN scene): every cornell-path uniform below is constant for
+        // the whole run -- camera, light grid, occluder set, transport flags
+        // never change -- so they go up ONCE (plus after a resize, when the
+        // aspect changes uViewProj). GL stores uniform values in the program
+        // object, so they survive bind/unbind and frames; per-frame re-upload
+        // of identical values was ~45 redundant glUniform calls including two
+        // 16-element vec3 arrays and three vec4 occluder arrays.
+        const bool uploadStatic =
+            (cornellVariant >= 0) && (!cornellStaticUploaded || fbResized);
+        if (uploadStatic) {
+            cornellStaticUploaded = true;
+        }
 
         if (cornellVariant >= 0) {
-            // Closed light-transport system: no sun, no ambient, no flashlight.
-            // All illumination comes from the frozen point-light grid that
-            // approximates the area emitter (see scene.json for the flux model).
-            pbrShader.setFloat3("uSunDirection", 0.0f, 1.0f, 0.0f);
-            pbrShader.setFloat3("uSunColor", 0.0f, 0.0f, 0.0f);
-            pbrShader.setFloat("uSunIntensity", 0.0f);
-            pbrShader.setFloat3("uAmbientSky", 0.0f, 0.0f, 0.0f);
-            pbrShader.setFloat3("uAmbientGround", 0.0f, 0.0f, 0.0f);
-            pbrShader.setInt("uPointCount", static_cast<int>(cornell::kLightCount));
-            pbrShader.setFloat3Array("uPointPos", cornellLightPos.data(), engine::kMaxPointLights);
-            pbrShader.setFloat3Array("uPointRadiance", cornellLightRad.data(), engine::kMaxPointLights);
-            pbrShader.setInt("uSpotOn", 0);
-            pbrShader.setFloat3("uSpotPos", 0.0f, 0.0f, 0.0f);
-            pbrShader.setFloat3("uSpotDir", 0.0f, -1.0f, 0.0f);
-            pbrShader.setFloat3("uSpotRadiance", 0.0f, 0.0f, 0.0f);
-            pbrShader.setFloat("uSpotInnerCos", 1.0f);
-            pbrShader.setFloat("uSpotOuterCos", 0.5f);
+            if (uploadStatic) {
+                pbrShader.setMat4("uViewProj", vp);   // frozen camera; aspect only
+                pbrShader.setFloat3("uViewPos", camera.position());
+                pbrShader.setInt("uDebugMode", 0);
+                // Closed light-transport system: no sun, no ambient, no flashlight.
+                // All illumination comes from the frozen point-light grid that
+                // approximates the area emitter (see scene.json for the flux model).
+                pbrShader.setFloat3("uSunDirection", 0.0f, 1.0f, 0.0f);
+                pbrShader.setFloat3("uSunColor", 0.0f, 0.0f, 0.0f);
+                pbrShader.setFloat("uSunIntensity", 0.0f);
+                pbrShader.setFloat3("uAmbientSky", 0.0f, 0.0f, 0.0f);
+                pbrShader.setFloat3("uAmbientGround", 0.0f, 0.0f, 0.0f);
+                pbrShader.setInt("uPointCount", static_cast<int>(cornell::kLightCount));
+                pbrShader.setFloat3Array("uPointPos", cornellLightPos.data(), engine::kMaxPointLights);
+                pbrShader.setFloat3Array("uPointRadiance", cornellLightRad.data(), engine::kMaxPointLights);
+                pbrShader.setInt("uSpotOn", 0);
+                pbrShader.setFloat3("uSpotPos", 0.0f, 0.0f, 0.0f);
+                pbrShader.setFloat3("uSpotDir", 0.0f, -1.0f, 0.0f);
+                pbrShader.setFloat3("uSpotRadiance", 0.0f, 0.0f, 0.0f);
+                pbrShader.setFloat("uSpotInnerCos", 1.0f);
+                pbrShader.setFloat("uSpotOuterCos", 0.5f);
 
-            // M4 heightfield shadows (see shaders.h for the march contract).
-            pbrShader.setInt("uShadowOn", shadowsActive ? 1 : 0);
-            // M5.0: the area-light transport flag + the frozen emitter patch.
-            // Consumed only when uShadowOn == 1 (the transport needs the
-            // occluder set and the verified-capture gate); the demo scene
-            // never reaches this branch.
-            pbrShader.setInt("uAreaOn", areaLight);
-            pbrShader.setFloat3("uAreaCenter",
-                                0.5f * (cornell::kEmitterMin[0] + cornell::kEmitterMax[0]),
-                                cornell::kEmitterMin[1],
-                                0.5f * (cornell::kEmitterMin[2] + cornell::kEmitterMax[2]));
-            pbrShader.setFloat("uAreaLe", cornell::kEmitterRadiance);
-            // M4.0.5 debug instrument, independent of shadowsActive so the
-            // panel stays readable even when the march is disabled. uShadowDebugNorm
-            // is the frozen capture top (field-mode R normalizer).
-            pbrShader.setInt("uShadowDebug", shadowDebugMode);
-            pbrShader.setFloat("uShadowDebugNorm",
-                               variantHasBaffle(cornell.def) ? kOccluderTopBaffle
-                                                             : kOccluderTopBoxes);
+                // M4 heightfield shadows (see shaders.h for the march contract).
+                pbrShader.setInt("uShadowOn", shadowsActive ? 1 : 0);
+                // M5.0: the area-light transport flag + the frozen emitter patch.
+                // Consumed only when uShadowOn == 1 (the transport needs the
+                // occluder set and the verified-capture gate); the demo scene
+                // never reaches this branch.
+                pbrShader.setInt("uAreaOn", areaLight);
+                pbrShader.setFloat3("uAreaCenter",
+                                    0.5f * (cornell::kEmitterMin[0] + cornell::kEmitterMax[0]),
+                                    cornell::kEmitterMin[1],
+                                    0.5f * (cornell::kEmitterMin[2] + cornell::kEmitterMax[2]));
+                pbrShader.setFloat("uAreaLe", cornell::kEmitterRadiance);
+                // M4.0.5 debug instrument, independent of shadowsActive so the
+                // panel stays readable even when the march is disabled. uShadowDebugNorm
+                // is the frozen capture top (field-mode R normalizer).
+                pbrShader.setInt("uShadowDebug", shadowDebugMode);
+                pbrShader.setFloat("uShadowDebugNorm",
+                                   variantHasBaffle(cornell.def) ? kOccluderTopBaffle
+                                                                 : kOccluderTopBoxes);
+                if (shadowsActive) {
+                    // Sampler indices are PROGRAM uniforms: uploaded once,
+                    // they persist across frames. The texture bindings
+                    // themselves are context state and re-bind below, per
+                    // frame, because the tonemap pass reuses unit 0.
+                    pbrShader.setInt("uShadowHeightsMax", 0);
+                    pbrShader.setInt("uShadowHeightsMin", 1);
+                    // XZ packed into vec3 (loader carries no Uniform2f entry).
+                    pbrShader.setFloat3("uShadowFootprintMin", -kRoomHalfX, -kRoomHalfZ, 0.0f);
+                    pbrShader.setFloat3("uShadowFootprintMax",  kRoomHalfX,  kRoomHalfZ, 0.0f);
+                    pbrShader.setFloat("uShadowMaxHeight",
+                                       variantHasBaffle(cornell.def) ? kOccluderTopBaffle : kOccluderTopBoxes);
+                    // M4.0.9: the two march paths share the uShadowStep uniform;
+                    // each gets its own default cadence (see centroidStep above).
+                    pbrShader.setFloat("uShadowStep",
+                                       shadowCentroid == 1 ? centroidStep
+                                                           : marchStepOverride);
+                    pbrShader.setFloat("uShadowBias", kShadowBias);
+                    pbrShader.setFloat("uShadowPenumbra", shadowPenumbra);
+                    pbrShader.setInt("uShadowRefine", shadowRefine);
+                    pbrShader.setInt("uShadowCentroid", shadowCentroid);
+                    pbrShader.setFloat3("uShadowCentroidPos",
+                                        centroidPos[0], centroidPos[1], centroidPos[2]);
+                    pbrShader.setFloat("uShadowLightSize", shadowLightSize);
+                    pbrShader.setInt("uShadowJitter", shadowJitter);
+                    // M4.0.9.1: analytic lateral half-plane set (centroid soft
+                    // path). M5.1 PERF: the whole vec4 array goes up in ONE
+                    // glUniform4fv per array (location of "name[0]", count
+                    // elements) instead of per-element snprintf + setFloat4
+                    // uploads every frame -- the occluder set is frozen for the
+                    // whole run, so this branch also pays zero string formatting.
+                    pbrShader.setInt("uShadowLateral", shadowLateral);
+                    pbrShader.setInt("uShadowBoxCount", cornell.occluders.boxCount);
+                    pbrShader.setFloat4Array("uShadowBoxMin[0]",
+                                             &cornell.occluders.boxMin[0][0],
+                                             cornell.occluders.boxCount);
+                    pbrShader.setFloat4Array("uShadowBoxMax[0]",
+                                             &cornell.occluders.boxMax[0][0],
+                                             cornell.occluders.boxCount);
+                    pbrShader.setInt("uShadowSphereCount",
+                                     cornell.occluders.sphereCount);
+                    pbrShader.setFloat4Array("uShadowSphere[0]",
+                                             &cornell.occluders.sphere[0][0],
+                                             cornell.occluders.sphereCount);
+                    pbrShader.setFloat4("uEmitterHalf",
+                                        0.5f * (cornell::kEmitterMax[0] - cornell::kEmitterMin[0]),
+                                        0.5f * (cornell::kEmitterMax[2] - cornell::kEmitterMin[2]),
+                                        0.0f, 0.0f);
+                }
+            }
+
+            // M5.3: texture-unit bindings are CONTEXT state, not program
+            // uniforms: endFrame()'s tonemap pass binds the resolve texture
+            // to unit 0 and unbinds it, so the heightfield textures must
+            // re-bind every frame even though their sampler indices above
+            // were uploaded once. (Unit 1 is not touched by the tonemap, but
+            // re-binding both keeps the pairing obvious and robust.)
             if (shadowsActive) {
                 cornellHeightfield.bindTextures(/*maxUnit=*/0, /*minUnit=*/1);
-                pbrShader.setInt("uShadowHeightsMax", 0);
-                pbrShader.setInt("uShadowHeightsMin", 1);
-                // XZ packed into vec3 (loader carries no Uniform2f entry).
-                pbrShader.setFloat3("uShadowFootprintMin", -kRoomHalfX, -kRoomHalfZ, 0.0f);
-                pbrShader.setFloat3("uShadowFootprintMax",  kRoomHalfX,  kRoomHalfZ, 0.0f);
-                pbrShader.setFloat("uShadowMaxHeight",
-                                   variantHasBaffle(cornell.def) ? kOccluderTopBaffle : kOccluderTopBoxes);
-                // M4.0.9: the two march paths share the uShadowStep uniform;
-                // each gets its own default cadence (see centroidStep above).
-                pbrShader.setFloat("uShadowStep",
-                                   shadowCentroid == 1 ? centroidStep
-                                                       : marchStepOverride);
-                pbrShader.setFloat("uShadowBias", kShadowBias);
-                pbrShader.setFloat("uShadowPenumbra", shadowPenumbra);
-                pbrShader.setInt("uShadowRefine", shadowRefine);
-                pbrShader.setInt("uShadowCentroid", shadowCentroid);
-                pbrShader.setFloat3("uShadowCentroidPos",
-                                    centroidPos[0], centroidPos[1], centroidPos[2]);
-                pbrShader.setFloat("uShadowLightSize", shadowLightSize);
-                pbrShader.setInt("uShadowJitter", shadowJitter);
-                // M4.0.9.1: analytic lateral half-plane set (centroid soft
-                // path). Array elements are addressed individually --
-                // "uShadowBoxMin[i]" is a valid uniform name -- so the
-                // existing setFloat4 covers the upload with zero new
-                // loader entry points (the GL surface-area discipline).
-                pbrShader.setInt("uShadowLateral", shadowLateral);
-                pbrShader.setInt("uShadowBoxCount", cornell.occluders.boxCount);
-                for (int b = 0; b < cornell.occluders.boxCount; ++b) {
-                    char uname[64];
-                    std::snprintf(uname, sizeof(uname), "uShadowBoxMin[%d]", b);
-                    const float* mn = cornell.occluders.boxMin[b];
-                    pbrShader.setFloat4(uname, mn[0], mn[1], mn[2], mn[3]);
-                    std::snprintf(uname, sizeof(uname), "uShadowBoxMax[%d]", b);
-                    const float* mx = cornell.occluders.boxMax[b];
-                    pbrShader.setFloat4(uname, mx[0], mx[1], mx[2], mx[3]);
-                }
-                pbrShader.setInt("uShadowSphereCount",
-                                 cornell.occluders.sphereCount);
-                for (int sp = 0; sp < cornell.occluders.sphereCount; ++sp) {
-                    char uname[64];
-                    std::snprintf(uname, sizeof(uname), "uShadowSphere[%d]", sp);
-                    const float* s = cornell.occluders.sphere[sp];
-                    pbrShader.setFloat4(uname, s[0], s[1], s[2], s[3]);
-                }
-                pbrShader.setFloat4("uEmitterHalf",
-                                    0.5f * (cornell::kEmitterMax[0] - cornell::kEmitterMin[0]),
-                                    0.5f * (cornell::kEmitterMax[2] - cornell::kEmitterMin[2]),
-                                    0.0f, 0.0f);
             }
         } else {
+            pbrShader.setMat4("uViewProj", vp);
+            pbrShader.setFloat3("uViewPos", camera.position());
+            pbrShader.setInt("uDebugMode", debugMode);
             pbrShader.setFloat3("uSunDirection", sun.direction);
             pbrShader.setFloat3("uSunColor", sun.color);
             pbrShader.setFloat("uSunIntensity", sun.intensity);
@@ -1524,15 +1687,33 @@ int main(int argc, char** argv) {
         if (cornellVariant >= 0) {
             // FROZEN geometry: identity transforms -- the OBJs are authored in
             // world space and must never be moved, rescaled, or re-lit.
-            pbrShader.setMat4("uModel", engine::Mat4::identity());
-            pbrShader.setMat4("uNormalMat", engine::Mat4::identity());
-            pbrShader.setFloat("uUseVertexColor", 0.0f);
+            // M5.1 PERF: uModel/uNormalMat/uUseVertexColor are constant for
+            // every mesh in the frozen scene, so they are uploaded OUTSIDE the
+            // mesh loop (they used to be re-uploaded per mesh -- pure
+            // redundant state traffic). M5.3: they join the static set --
+            // program uniforms persist, so this fires once (+on resize).
+            if (uploadStatic) {
+                pbrShader.setMat4("uModel", engine::Mat4::identity());
+                pbrShader.setMat4("uNormalMat", engine::Mat4::identity());
+                pbrShader.setFloat("uUseVertexColor", 0.0f);
+            }
             for (std::uint32_t i = 0; i < cornell.def->meshCount; ++i) {
                 if (!cornell.meshLoaded[i]) {
                     continue;
                 }
                 const cornell::MaterialDef* mat = findCornellMaterial(cornell.def->meshes[i].material);
                 if (mat == nullptr) {
+                    continue;
+                }
+                // M5.3 FRUSTUM CULLING (EntityCulling/MoreCulling pattern): a
+                // mesh whose conservative world AABB misses the view volume
+                // never reaches the GPU. The p-vertex test can only drop a
+                // box that is FULLY outside one frustum plane -- the frozen
+                // camera sees the whole room, so the standard pins culled ==
+                // 0 and a byte-identical image; free-fly cameras in larger
+                // scenes reap the savings. --cull 0 restores the unculled A/B.
+                if (!frustum.intersects(cornell.meshAabb[i])) {
+                    ++culledThisFrame;
                     continue;
                 }
                 pbrShader.setFloat3("uAlbedo", mat->albedo[0], mat->albedo[1], mat->albedo[2]);
@@ -1542,43 +1723,68 @@ int main(int argc, char** argv) {
             }
 
             // The emitter itself: unlit emissive quad at radiance L_e.
+            // M5.3: uViewProj/uModel/uTint are all frozen -- static upload,
+            // same as the pbr set above (unlit must be bound for its own
+            // uniforms, which it is here).
             unlitShader.bind();
-            unlitShader.setMat4("uViewProj", vp);
-            unlitShader.setMat4("uModel", engine::Mat4::identity());
-            unlitShader.setFloat3("uTint", cornell::kEmitterRadiance,
-                                  cornell::kEmitterRadiance, cornell::kEmitterRadiance);
-            renderer.drawIndexed(cornell.emitterQuad);
+            if (uploadStatic) {
+                unlitShader.setMat4("uViewProj", vp);
+                unlitShader.setMat4("uModel", engine::Mat4::identity());
+                unlitShader.setFloat3("uTint", cornell::kEmitterRadiance,
+                                      cornell::kEmitterRadiance, cornell::kEmitterRadiance);
+            }
+            if (frustum.intersects(cornell.emitterAabb)) {
+                renderer.drawIndexed(cornell.emitterQuad);
+            } else {
+                ++culledThisFrame;
+            }
         } else {
             // Floor: identity model, vertex-color albedo, rough dielectric.
-            pbrShader.setMat4("uModel", engine::Mat4::identity());
-            pbrShader.setMat4("uNormalMat", engine::Mat4::identity());
-            pbrShader.setFloat3("uAlbedo", 1.0f, 1.0f, 1.0f);
-            pbrShader.setFloat("uRoughness", 0.85f);
-            pbrShader.setFloat("uMetalness", 0.0f);
-            pbrShader.setFloat("uUseVertexColor", 1.0f);
-            renderer.drawIndexed(floorMesh);
+            // M5.3: each demo object is wrapped in a frustum check -- the
+            // free-fly camera can look away, and a culled object skips BOTH
+            // its uniform traffic and its draw call (conservative test: a
+            // partially-visible object is never dropped).
+            if (frustum.intersects(floorAabb)) {
+                pbrShader.setMat4("uModel", engine::Mat4::identity());
+                pbrShader.setMat4("uNormalMat", engine::Mat4::identity());
+                pbrShader.setFloat3("uAlbedo", 1.0f, 1.0f, 1.0f);
+                pbrShader.setFloat("uRoughness", 0.85f);
+                pbrShader.setFloat("uMetalness", 0.0f);
+                pbrShader.setFloat("uUseVertexColor", 1.0f);
+                renderer.drawIndexed(floorMesh);
+            } else {
+                ++culledThisFrame;
+            }
 
             // Spinning quad (M1 hero): vertex-color albedo, glossy dielectric --
             // shows colored speculars from the two orbiting point lights.
             const engine::Mat4 quadModel = engine::Mat4::translate(engine::Vec3(0.0f, 0.1f, 0.0f))
                                          * engine::Mat4::rotateY(spinAngle);
-            pbrShader.setMat4("uModel", quadModel);
-            pbrShader.setMat4("uNormalMat", quadModel.normalMatrix());
-            pbrShader.setFloat("uRoughness", 0.30f);
-            renderer.drawIndexed(quadMesh);
+            if (frustum.intersects(quadAabbLocal.transformed(quadModel))) {
+                pbrShader.setMat4("uModel", quadModel);
+                pbrShader.setMat4("uNormalMat", quadModel.normalMatrix());
+                pbrShader.setFloat("uRoughness", 0.30f);
+                renderer.drawIndexed(quadMesh);
+            } else {
+                ++culledThisFrame;
+            }
 
             // Hero model: imported OBJ + material preset, floating and turning.
             if (modelLoaded[heroIndex]) {
                 const engine::Mat4 modelT = engine::Mat4::translate(engine::Vec3(0.0f, 0.35f + std::sin(time * 1.2f) * 0.08f, -2.4f))
                                           * engine::Mat4::rotateY(time * 0.4f);
-                const engine::PbrMaterial& mat = kModelAssets[heroIndex].material;
-                pbrShader.setMat4("uModel", modelT);
-                pbrShader.setMat4("uNormalMat", modelT.normalMatrix());
-                pbrShader.setFloat3("uAlbedo", mat.albedo);
-                pbrShader.setFloat("uRoughness", mat.roughness);
-                pbrShader.setFloat("uMetalness", mat.metalness);
-                pbrShader.setFloat("uUseVertexColor", mat.useVertexColor ? 1.0f : 0.0f);
-                renderer.drawIndexed(modelMeshes[heroIndex]);
+                if (frustum.intersects(modelAabbs[heroIndex].transformed(modelT))) {
+                    const engine::PbrMaterial& mat = kModelAssets[heroIndex].material;
+                    pbrShader.setMat4("uModel", modelT);
+                    pbrShader.setMat4("uNormalMat", modelT.normalMatrix());
+                    pbrShader.setFloat3("uAlbedo", mat.albedo);
+                    pbrShader.setFloat("uRoughness", mat.roughness);
+                    pbrShader.setFloat("uMetalness", mat.metalness);
+                    pbrShader.setFloat("uUseVertexColor", mat.useVertexColor ? 1.0f : 0.0f);
+                    renderer.drawIndexed(modelMeshes[heroIndex]);
+                } else {
+                    ++culledThisFrame;
+                }
             }
 
             // Light bulbs (unlit, HDR-bright so the tonemap blooms them).
@@ -1587,15 +1793,23 @@ int main(int argc, char** argv) {
             for (int i = 0; i < kOrbitLightCount; ++i) {
                 const engine::Mat4 bulbT = engine::Mat4::translate(
                     engine::Vec3(pointPos[3 * i + 0], pointPos[3 * i + 1], pointPos[3 * i + 2]));
-                unlitShader.setMat4("uModel", bulbT);
-                unlitShader.setFloat3("uTint", pointRadiance[3 * i + 0],
-                                      pointRadiance[3 * i + 1],
-                                      pointRadiance[3 * i + 2]);
-                renderer.drawIndexed(bulbMesh);
+                if (frustum.intersects(bulbAabbLocal.transformed(bulbT))) {
+                    unlitShader.setMat4("uModel", bulbT);
+                    unlitShader.setFloat3("uTint", pointRadiance[3 * i + 0],
+                                          pointRadiance[3 * i + 1],
+                                          pointRadiance[3 * i + 2]);
+                    renderer.drawIndexed(bulbMesh);
+                } else {
+                    ++culledThisFrame;
+                }
             }
         }
 
         renderer.endFrame();
+
+        // M5.3: culling telemetry (report line; avg over measured frames).
+        totalCulledDraws += static_cast<std::uint64_t>(culledThisFrame);
+        maxCulledDraws = std::max(maxCulledDraws, static_cast<std::uint64_t>(culledThisFrame));
 
         if (measured) {
             const auto exitTime = std::chrono::steady_clock::now();
@@ -1643,7 +1857,7 @@ int main(int argc, char** argv) {
         const std::uint32_t lightCount = (cornellVariant >= 0)
             ? cornell.def->lightCount : static_cast<std::uint32_t>(kOrbitLightCount);
 
-        char lines[14][160];   // M4.0.7: +1 for the "shadow penumbra" line
+        char lines[16][160];   // M4.0.7: shadow line; M5.3: +culling line
         int n = 0;
         std::snprintf(lines[n++], 160, "=== benchmark report ===");
         std::snprintf(lines[n++], 160, "standard: %s", cornellVariant >= 0 ? cornell::kStandard : "n/a (demo scene)");
@@ -1667,6 +1881,20 @@ int main(int argc, char** argv) {
         std::snprintf(lines[n++], 160, "draw calls: %llu  triangles: %llu  lights: %u",
                       static_cast<unsigned long long>(st.drawCalls),
                       static_cast<unsigned long long>(st.triangles), lightCount);
+        // M5.3: culling ledger (avg over the measured frames; the frozen
+        // cornell camera sees the whole room, pinning this at 0 -- any
+        // nonzero number there would mean a culling bug, see frustum_tests).
+        {
+            const double avgCulled = framePeriods.empty()
+                ? 0.0
+                : static_cast<double>(totalCulledDraws) /
+                  static_cast<double>(framePeriods.size());
+            std::snprintf(lines[n++], 160,
+                          "culling: %s  culled draws/frame: avg %.1f  max %llu",
+                          cullEnabled ? "on (frustum aabb, conservative)" : "off (--cull 0)",
+                          avgCulled,
+                          static_cast<unsigned long long>(maxCulledDraws));
+        }
         std::snprintf(lines[n++], 160, "exposure: %.2f (fixed)  vram: not reported (no core GL query)",
                       cornellVariant >= 0 ? static_cast<double>(cornell::kExposure) : 1.0);
         std::snprintf(lines[n++], 160, "shadows: %s",

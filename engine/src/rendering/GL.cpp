@@ -76,6 +76,7 @@ bool load(ProcAddressFn getProcAddress) {
     ENGINE_GL_LOAD(Uniform1i);
     ENGINE_GL_LOAD(Uniform3f);
     ENGINE_GL_LOAD(Uniform3fv);
+    ENGINE_GL_LOAD(Uniform4fv);
     ENGINE_GL_LOAD(GenVertexArrays);
     ENGINE_GL_LOAD(BindVertexArray);
     ENGINE_GL_LOAD(DeleteVertexArrays);
@@ -111,6 +112,7 @@ bool load(ProcAddressFn getProcAddress) {
     ENGINE_GL_LOAD(BeginQuery);
     ENGINE_GL_LOAD(EndQuery);
     ENGINE_GL_LOAD(GetQueryObjectui64v);
+    ENGINE_GL_LOAD(GetQueryObjectiv);
 
 #undef ENGINE_GL_LOAD
 

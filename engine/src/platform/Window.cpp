@@ -72,6 +72,25 @@ void Window::pollEvents() {
     glfwPollEvents();
 }
 
+bool Window::isFocused() const {
+    return m_window != nullptr && glfwGetWindowAttrib(m_window, GLFW_FOCUSED) != 0;
+}
+
+bool Window::isIconified() const {
+    return m_window != nullptr && glfwGetWindowAttrib(m_window, GLFW_ICONIFIED) != 0;
+}
+
+void Window::waitEvents(double timeoutSeconds) {
+    if (m_window == nullptr) {
+        return;
+    }
+    if (timeoutSeconds > 0.0) {
+        glfwWaitEventsTimeout(timeoutSeconds);
+    } else {
+        glfwWaitEvents();
+    }
+}
+
 void Window::swapBuffers() {
     if (m_window != nullptr) {
         glfwSwapBuffers(m_window);

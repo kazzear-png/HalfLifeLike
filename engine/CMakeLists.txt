@@ -2,6 +2,7 @@
 add_library(engine STATIC
     src/assets/OBJ.cpp
     src/core/Application.cpp
+    src/math/Frustum.cpp
     src/math/Mat4.cpp
     src/platform/Input.cpp
     src/platform/Window.cpp
@@ -27,6 +28,17 @@ if(BUILD_TESTING)
         add_test(NAME math_tests COMMAND engine_math_tests)
     else()
         message(STATUS "Skipping engine_math_tests: ${engine_math_tests_src} not found")
+    endif()
+
+    # M5.3: frustum-plane extraction + conservative AABB culling (the
+    # EntityCulling/MoreCulling analog; see tests/frustum_tests.cpp).
+    set(engine_frustum_tests_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/frustum_tests.cpp")
+    if(EXISTS "${engine_frustum_tests_src}")
+        add_executable(engine_frustum_tests "${engine_frustum_tests_src}")
+        target_link_libraries(engine_frustum_tests PRIVATE engine)
+        add_test(NAME frustum_tests COMMAND engine_frustum_tests)
+    else()
+        message(STATUS "Skipping engine_frustum_tests: ${engine_frustum_tests_src} not found")
     endif()
 
     set(engine_obj_tests_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/obj_tests.cpp")

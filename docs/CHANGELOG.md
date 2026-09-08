@@ -6,6 +6,249 @@ sections Added / Changed / Removed / Deprecated / Fixed as needed.
 
 ---
 
+## 0.5.3 — M5.3: mod-inspired efficiency pass (upload-once frozen uniforms, frustum culling, dynamic-fps pacing)
+
+The M5.1/M5.2 ledger closed every CPU-GPU sync point, but the frame loop still
+carried three structural habits that the Minecraft optimization-mod ecosystem
+publicly solved years ago: the frozen cornell scene re-uploaded ~49 identical
+uniform values EVERY frame (~70 glUniform calls counting per-mesh materials,
+including two 16-element vec3 light arrays and three vec4 occluder arrays),
+no culling layer existed anywhere (draws were submitted whether visible or
+not), and an unfocused or minimized window kept rendering at full rate. This
+release ports the four transferable ideas; each maps to a named mod, and each
+lands with a byte-identical-rendering guarantee.
+
+The mapping (mod -> engine change):
+
+| mod | what it does there | what landed here |
+| --- | --- | --- |
+| Sodium | batching, modern pipeline | M5.1 already: batched arrays + uniform-location cache; M5.3 completes the idea with upload-once immutable state |
+| ImmediatelyFast | stops per-instruction immediate uploads | frozen-scene static upload: 49 -> 0 redundant uniform calls per frame |
+| EntityCulling / MoreCulling | never submit hidden work | `engine::Frustum` + conservative per-mesh AABB culling, `--cull 0` A/B lever, culled-draws telemetry |
+| Dynamic FPS | throttle when tabbed out / hidden | `Window::isFocused/isIconified/waitEvents` + 30 fps unfocused cap + event-driven pause when minimized |
+| FerriteCore | dedup data structures | embodied by the M5.1 location cache + this release's upload-once; the cornell meshes are all unique OBJs, so geometry dedup has nothing to collapse (not implemented) |
+| Chunky / ModernFix / Debugify | precompute, patch slow routines | already the house pattern: shaders/meshes/heightfield are built before the loop; M5.1/M5.2 were the slow-routine patches |
+| C2ME / Lithium / Krypton | multithreading / game logic / networking | no analog in a single-window GL renderer at this milestone (render-thread split is future work) |
+
+### Changed
+
+- **The frozen cornell scene uploads its immutable uniforms ONCE.** GL stores
+  uniform values in the program object (they survive bind/unbind and frames),
+  so the ~49 per-frame calls feeding constant values — view/proj (frozen
+  camera), view pos, the closed-transport zero rig (sun/ambient/spot), the
+  16-light grid arrays, all shadow/area flags and occluder arrays, the
+  identity uModel/uNormalMat pair, and the emitter's unlit uniforms — now go
+  up on the first frame and again only after a framebuffer resize (the aspect
+  changes uViewProj; the resize re-uploads the whole static set, once). What
+  genuinely varies per frame survives: the ~21 per-mesh material calls. Two
+  subtleties pinned by inspection: texture-UNIT bindings are context state,
+  and endFrame's tonemap pass reuses unit 0, so the heightfield textures
+  re-bind every frame while their sampler indices (program state) do not; and
+  `uModel/uNormalMat` for the emitter ride the same static gate under the
+  unlit bind.
+- **Viewport and HDR resize probes fire only on actual size changes.**
+  `glViewport` and the `resizeHDR` no-op probe were re-issued every frame
+  with identical arguments; both now gate on a framebuffer-size change
+  (lastFbw/lastFbh), which also guarantees the first frame after the startup
+  heightfield capture re-issues the window viewport (lastFbw starts at -1).
+- **Frustum culling on both scenes.** `engine::Frustum` (Gribb-Hartmann
+  plane extraction from the view-projection; conservative p-vertex AABB
+  test — a box is dropped only when FULLY outside one plane) gates every
+  mesh draw. Cornell meshes carry world AABBs computed at load (the occluder
+  scan was refactored to share them); demo objects use `Aabb::transformed`
+  hulls of their model matrices. The frozen camera sees the whole room, so
+  the standard pins culled == 0 — and a nonzero value there is itself a bug
+  alarm (see frustum_tests). `--cull 0` restores the unculled path as the
+  A/B lever; a cull-disabled runtime degenerates the frustum to
+  reject-nothing planes, so the flag can never hide geometry.
+- **Dynamic-FPS pacing for interactive runs.** `--dynamic-fps 0|1` (default
+  on): an unfocused window paces entry-to-entry at ~30 fps (armed only after
+  the window has held focus once, so headless/never-focused sessions are
+  never throttled); a minimized window stops rendering entirely and parks in
+  `glfwWaitEventsTimeout(0.25)` — event-driven, ~zero CPU/GPU, waking on
+  restore/close. Benchmark and screenshot runs are EXEMPT by construction
+  (`dynamicFpsActive` is false there): their frame pacing is part of the
+  frozen measurement, and the iconified early-return would otherwise stall
+  a screenshot timeline.
+- Build banner bumped to `0.5.3` (rendering is again byte-identical; the md5
+  cannot distinguish builds, hardware reports need the marker).
+
+### Added
+
+- **`math/Frustum.h` + `Frustum.cpp`**: `engine::Aabb` (seed/grow/
+  growToContain, `transformed` conservative hull) and `engine::Frustum`
+  (`fromViewProjection`, `containsPoint`, `intersects`, plane access for
+  tests). Pure math — no GL dependency; registered in the engine library.
+- **`Window::isFocused() / isIconified() / waitEvents(timeoutSeconds)`** —
+  the focus/minimize state and the event-driven wait the pacing layer
+  needs.
+- **CLI `--cull 0|1` and `--dynamic-fps 0|1`** (validated, house-style error
+  messages) + a culling ledger line in the benchmark report:
+  `culling: on (frustum aabb, conservative)  culled draws/frame: avg X max N`
+  (avg over the measured frames).
+- **`tests/frustum_tests.cpp`** (32 checks): hand-computed half-space cases
+  from a 90-degree origin camera (point containment, edge grazing), the
+  conservative guarantees (straddling / touching / camera-inside-room /
+  flat-quad boxes are never culled), the real `Camera::viewProjection`
+  composition path with a 180-degree turn flipping verdicts, AABB hull
+  transforms under translate/rotate, and the degenerate-frustum
+  reject-nothing property. Registered as the `frustum_tests` ctest target.
+
+### Verification
+
+- **Rendering is byte-identical**: `--scene cornell01 --benchmark 300
+  --width 960 --height 540 --out` md5 `1ef386d5210bb25aa53a6231f720ad7d`,
+  unchanged from 0.5.1/0.5.2 — the static upload and culling changed zero
+  pixels.
+- **Culling A/B across ALL variants**: cornell01/02/03 at 480x270, 200
+  frames, `--cull 1` vs `--cull 0` — identical PPMs for every variant, and
+  the ledger reads `culled draws/frame: avg 0.0 max 0` (the frozen camera
+  sees the whole room; that is the pinned safety property, not a no-op
+  claim: any nonzero number would flag a culling bug).
+- **Full engine test suite green**: math 73 / frustum 32 / obj 24 / brdf 38
+  / bench 225 — 392 checks, 0 failures (5/5 ctest targets).
+- **Uniform-cache harness still 13/13** (M5.1 harness re-run against this
+  tree: 300 updates -> 1 location query; move semantics safe).
+- **Uniform-call count (cornell01, by code inspection)**: ~70 per frame
+  (49 static + 21 material) -> ~21 (material only), −70 %; plus the
+  viewport/resize probes now fire once per size instead of per frame.
+- **Software-GL ledger (Xvfb + llvmpipe, 64x36, 2000 frames)**: cpu
+  3.676 avg / 3.713 p95 vs 0.5.2's 3.664 / 3.804 — tail −2 %, avg flat:
+  llvmpipe's glUniform dispatch is a cheap function call, so the ~49
+  removed calls are invisible there; hardware drivers pay per call through
+  command marshaling, and the Windows Debug re-measure is the acceptance
+  row. The frame stays GPU-bound on hardware (fragment transport ~6.2 ms
+  at 720p), so the FPS expectation at 720p is "unchanged"; the CPU-ms
+  metric is what should drop.
+- **Interactive smoke (Xvfb)**: dynamic-fps banner active, clean run; the
+  deterministic exemption is proven by the md5 runs above (they ran with
+  pacing off). The unfocused/minimized behaviors need a window manager /
+  real desktop to exercise — verify on hardware by tabbing out during an
+  interactive session (title-bar FPS should cap at ~30; minimize should
+  drop CPU to ~idle).
+
+---
+
+## 0.5.2 — M5.1: CPU-GPU pipeline desynchronization (glGetError out of the draw loop, uniform-location caching, batched shadow-array uploads, non-blocking GPU timer readback)
+
+Hardware field report on the 0.5.1 build: ~156 fps (6.4 ms/frame) on a scene
+of 36 triangles and 8 draw calls — and the CPU time (6.2 ms) and GPU time
+(6.1 ms) were virtually identical. That lockstep is the diagnosis: the CPU
+and GPU were working SEQUENTIALLY, each idle-waiting on the other, on a
+workload that should be a rounding error. Two mechanisms held the pipeline
+serial, plus two minor CPU-side costs riding on top.
+
+Hardware follow-up (post-fix re-measure, 1280x720, Debug): 153 fps,
+cpu 6.34 / gpu 6.17 / frame 6.53 — the lockstep PERSISTS, and the numbers
+now identify the third sync point: `Renderer::beginFrame` read the timer
+query with `gl::GetQueryObjectui64v(GL_QUERY_RESULT)` — the BLOCKING form —
+at the top of the frame, INSIDE the benchmark's measured cpu-ms window. On
+a GPU-bound frame the CPU finishes its ~1 ms of submission, then sleeps in
+that read until the GPU retires the PREVIOUS frame: cpu ms mirrors gpu ms
+by construction, and the wait that used to live in the 8 per-draw
+glGetError calls simply moved to one blocking read. (The frame was never
+CPU-submission-bound on hardware: the M5.0 → M5.1 ledger progression
+110 → 156 fps tracked SHADER work, and 6.17 ms of fragment shading at
+921,600 px is the real cost — 36 triangles is the wrong cost model for a
+full-screen area-transport workload.)
+
+The primary killer: `Renderer::drawIndexed` called `glGetError()` after
+EVERY `glDrawElements`. glGetError is a synchronization command — to report
+errors accurately the driver flushes the command buffer and waits for the
+GPU to finish pending work — so 8 draws per frame meant 8 full CPU-GPU
+round-trips, interleaved into the submission stream. The secondary killer:
+every `Shader::setXXX` called `glGetUniformLocation()` per update — a
+string-hash driver lookup — and the cornell frame makes ~70 of them
+(materials per mesh, the frozen light rig, the shadow/area uniforms), plus
+4 snprintf-formatted array-element names per frame.
+
+### Changed
+
+- **`Renderer` GPU timing reads are non-blocking (M5.2 follow-up).** The
+  single one-frame-lag query is now a RING of four GL_TIME_ELAPSED queries;
+  each beginFrame drains completed results oldest-first by first polling
+  `GL_QUERY_RESULT_AVAILABLE` (new loader entry point
+  `gl::GetQueryObjectiv`) and only then issuing `GL_QUERY_RESULT` — the
+  read itself never waits on a result that is not already retired. The GPU
+  gets up to four frames of slack, so every frame still yields a fresh
+  sample in steady state (a slot still pending when its turn to re-arm
+  comes — GPU 4+ frames behind — falls back to ONE blocking read so a
+  sample is never dropped; frames with no completed sample report n/a and
+  the benchmark skips them rather than double-counting). This removes the
+  last intentional CPU-GPU sync point inside the benchmark's measured
+  cpu-ms window: on a GPU-bound frame the CPU metric now measures the actual
+  submission cost, not the wait for the previous frame's GPU retirement
+  (frame rate itself is unchanged by this — a GPU-bound frame is still
+  gated by the GPU through present backpressure; what changes is that the
+  report can finally SAY that).
+- **`Renderer::drawIndexed` no longer polls glGetError per draw.** The M1
+  debug tripwire moves to `Renderer::endFrame()` — ONE glGetError per frame,
+  after `glEndQuery`, outside the GPU timer region. Error STATE is sticky
+  until read, so any GL error raised anywhere in the frame still surfaces
+  (only per-call attribution is lost); call-site attribution belongs to
+  GL_KHR_debug / GL_ARB_debug_output when it is needed. The GPU timer query
+  itself keeps its one-frame-lag read pattern (unchanged).
+- **`Shader` caches uniform locations.** New private
+  `getUniformLocation(name) const` with a `mutable
+  std::unordered_map<std::string, GLint>` populated lazily on first use;
+  every `setXXX` routes through it. Misses cost exactly one driver query
+  (cached, including -1 for optimized-out uniforms — misspelled names stop
+  paying rent too); hits cost one string hash. Move construction/assignment
+  carry the cache WITH the program handle and drop the destination's stale
+  entries (locations are per-program; a moved-from shader is a safe no-op).
+- **The cornell shadow arrays upload as whole arrays.** New
+  `Shader::setFloat4Array(name[0], data, count)` → one `glUniform4fv` per
+  array replaces the per-element snprintf + setFloat4 loop
+  (uShadowBoxMin/Max/Sphere, 2 boxes + 0 spheres in cornell01: 4 formatted
+  string builds + 4 lookups + 4 uploads → 3 lookups (cached) + 3 uploads).
+  Location queried via the spec-safe `"name[0]"` form; count = boxCount /
+  sphereCount so nothing beyond the active prefix is touched.
+
+### Added
+
+- `gl::Uniform4fv` and `gl::GetQueryObjectiv` (+ `GL_QUERY_RESULT_AVAILABLE`)
+  in the scoped loader (GL.h/GL.cpp) — the two new GL entry points the
+  batched-array and non-blocking-readback paths need. `Shader::setFloat4Array`
+  on the engine API (mirrors `setFloat3Array`).
+- **A startup build banner** (`[Sandbox] build 0.5.2 (M5.1 perf: ...)`) —
+  rendering is byte-identical across this change, so the screenshot md5
+  cannot tell the builds apart; hardware field reports need an explicit
+  marker to attribute runs to the right tree.
+
+### Verification
+
+- **Rendering is byte-identical**: full `--scene cornell01 --benchmark 300
+  --width 960 --height 540 --out` runs before/after (including the timer
+  ring) produce the same md5 (`1ef386d5210bb25aa53a6231f720ad7d`) — the perf
+  work changed zero pixels.
+- **Instrumented fake-GL harness** (stub entry points injected through the
+  loader, counting glGetUniformLocation calls): 300 repeated setFloat →
+  exactly 1 location query and 300 glUniform1f value uploads (values still
+  flow; only the lookup is cached); same result for setFloat4Array (300 → 1
+  query, 300 Uniform4fv calls with count=4); move construction reuses the
+  carried cache with 0 re-queries; move assignment drops the destination's
+  stale entries and re-queries exactly once. 13/13 checks pass.
+- **Full engine test suite green**: math 73 / brdf 38 / obj 24 / bench 225 —
+  360 checks, 0 failures.
+- **Software-GL A/B** (Xvfb + llvmpipe, where the hardware command-buffer
+  flush does not exist, so only the CPU-side savings are visible): cpu ms
+  3.735 → 3.664 avg, p95 4.498 → 3.804 (−15 % tail) at 64×36. The 6.2 ms
+  hardware CPU cost was dominated by the 8 per-draw glGetError round-trips,
+  which software GL cannot reproduce — the hardware re-measure is the
+  acceptance row for this change.
+- **Hardware re-measure verdict (the follow-up field report)**: 153 fps,
+  cpu 6.34 / gpu 6.17 — the frame is GPU-throughput-bound in the M5 area
+  transport fragment shader at 1280×720 4×MSAA (0.36 ms/frame = 5.5 %
+  non-GPU overhead; the pipeline is ~94 % GPU-saturated). The remaining CPU
+  levers are ~5 %; the real lever is shader cost / resolution. The
+  definitive user-side experiment: a resolution sweep — gpu ms scaling
+  ~linearly with pixel count proves fragment-bound (640×360 ≈ 1.5 ms /
+  1280×720 ≈ 6.2 / 1920×1080 ≈ 14 → ~72 fps); flat gpu ms across
+  resolutions would mean a residual sync artifact (none known — all three
+  are now removed).
+
+---
+
 ## 0.5.1 — M5.1: exact-reject fast paths for the area transport (revert of the 0.5.1-draft inclusion-exclusion experiment)
 
 Hardware field report on the 0.5.0 build: ~110 fps against the M4 variant's

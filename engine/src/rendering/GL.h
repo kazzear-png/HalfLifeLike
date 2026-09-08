@@ -86,6 +86,8 @@ enum : GLenum {
     // M3.3: timer queries (benchmark GPU frame time)
     TimeElapsed          = 0x88BF,
     QueryResult          = 0x8866,
+    // M5.2: non-blocking availability poll for the ring readback.
+    QueryResultAvailable = 0x8867,
 };
 
 // ---- Entry points (null until load() succeeds) ----
@@ -126,6 +128,7 @@ inline void  (ENGINE_GL_CALL* Uniform1f)(GLint location, GLfloat v0) = nullptr;
 inline void  (ENGINE_GL_CALL* Uniform1i)(GLint location, GLint v0) = nullptr;
 inline void  (ENGINE_GL_CALL* Uniform3f)(GLint location, GLfloat v0, GLfloat v1, GLfloat v2) = nullptr;
 inline void  (ENGINE_GL_CALL* Uniform3fv)(GLint location, GLsizei count, const GLfloat* value) = nullptr;
+inline void  (ENGINE_GL_CALL* Uniform4fv)(GLint location, GLsizei count, const GLfloat* value) = nullptr;
 
 // Buffers / vertex arrays
 inline void (ENGINE_GL_CALL* GenVertexArrays)(GLsizei n, GLuint* arrays) = nullptr;
@@ -175,6 +178,7 @@ inline void (ENGINE_GL_CALL* DeleteQueries)(GLsizei n, const GLuint* ids) = null
 inline void (ENGINE_GL_CALL* BeginQuery)(GLenum target, GLuint id) = nullptr;
 inline void (ENGINE_GL_CALL* EndQuery)(GLenum target) = nullptr;
 inline void (ENGINE_GL_CALL* GetQueryObjectui64v)(GLuint id, GLenum pname, GLuint64* params) = nullptr;
+inline void (ENGINE_GL_CALL* GetQueryObjectiv)(GLuint id, GLenum pname, GLint* params) = nullptr;
 
 // Resolves every entry point above via getProcAddress (the platform layer
 // supplies this, typically wrapping glfwGetProcAddress). Returns false if any

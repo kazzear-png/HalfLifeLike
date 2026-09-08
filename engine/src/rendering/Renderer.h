@@ -74,10 +74,20 @@ public:
     bool readBackbufferPixels(int width, int height, unsigned char* outRgba);
 
     // --- benchmark GPU timing (M3.3) ---
-    // Wraps each frame in a GL_TIME_ELAPSED timer query. Results are read one
-    // frame later (the standard pattern -- the query must complete before its
-    // result is fetched). If a driver misbehaves, timing disables itself and
-    // lastGpuFrameMs() keeps reporting a negative value ("n/a").
+    // Wraps each frame in a GL_TIME_ELAPSED timer query. M5.2: results are
+    // read through a small RING of query objects with a NON-BLOCKING
+    // availability poll (GL_QUERY_RESULT_AVAILABLE), so the CPU never stalls
+    // waiting for the GPU inside the frame loop -- the old one-frame-lag
+    // blocking read (GL_QUERY_RESULT) sat at the top of beginFrame() INSIDE
+    // the benchmark's measured cpu-ms window, which is why cpu ms mirrored
+    // gpu ms on GPU-bound frames (the CPU finished submitting, then slept in
+    // that read until the GPU retired the previous frame). The ring gives the
+    // GPU up to kTimerRingSize frames of slack; a slot that is still pending
+    // when its turn to re-arm comes (GPU 4+ frames behind -- pathological)
+    // falls back to one blocking read so per-frame timing never drops. If a
+    // driver misbehaves, timing disables itself and lastGpuFrameMs() keeps
+    // reporting a negative value ("n/a"). Frames with no completed sample
+    // report n/a (the benchmark skips them rather than double-counting).
     void enableGpuTiming(bool enable);
     float lastGpuFrameMs() const { return m_gpuFrameMs; }
     bool gpuTimingActive() const { return m_gpuTimingOn; }
@@ -104,12 +114,14 @@ private:
 
     RenderStats m_stats;
 
-    // M3.3: GPU frame timing (timer query, one-frame-lag readback).
+    // M3.3 / M5.2: GPU frame timing (timer-query ring, non-blocking readback).
+    static constexpr int kTimerRingSize = 4;
     bool m_gpuTimingWanted = false;   // caller asked for timing
     bool m_gpuTimingOn    = false;    // driver accepted it
-    bool m_gpuQueryPending = false;
-    gl::GLuint m_timerQuery = 0;
-    float m_gpuFrameMs = -1.0f;       // < 0 == "n/a"
+    bool m_timerSlotPending[kTimerRingSize] = {false, false, false, false};
+    gl::GLuint m_timerQueries[kTimerRingSize] = {0, 0, 0, 0};
+    int  m_timerRingIndex = 0;         // slot armed by this frame's BeginQuery
+    float m_gpuFrameMs = -1.0f;       // < 0 == "n/a" (no completed sample this frame)
 
     // Internal helpers (require a current GL context).
     void destroyHDRTargets();

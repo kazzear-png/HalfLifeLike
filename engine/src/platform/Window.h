@@ -37,6 +37,19 @@ public:
     void pollEvents();     // process OS events (input callbacks fire here)
     void swapBuffers();    // present the frame
 
+    // --- M5.3: focus/minimize state + event-driven wait (Dynamic-FPS pacing) ---
+    // Input focus == false means the user tabbed out; iconified means the
+    // window is minimized. Both are cheap GLFW attribute queries.
+    bool isFocused() const;
+    bool isIconified() const;
+
+    // Blocks until an OS event arrives or the timeout (seconds) elapses,
+    // processing callbacks exactly like pollEvents(). The event-driven
+    // counterpart to the pollEvents() busy loop: a hidden window can park
+    // here at ~zero CPU instead of rendering frames nobody sees.
+    // timeoutSeconds <= 0 waits indefinitely.
+    void waitEvents(double timeoutSeconds);
+
     // Size of the GL framebuffer in pixels (differs from window size on HiDPI).
     void getFramebufferSize(int& outWidth, int& outHeight) const;
 

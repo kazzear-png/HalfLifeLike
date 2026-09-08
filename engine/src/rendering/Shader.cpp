@@ -37,14 +37,20 @@ gl::GLuint compileStage(gl::GLenum stage, const char* source, const char* stageN
 
 } // namespace
 
-Shader::Shader(Shader&& other) noexcept : m_handle(other.m_handle) {
+Shader::Shader(Shader&& other) noexcept
+    : m_handle(other.m_handle), m_uniformCache(std::move(other.m_uniformCache)) {
     other.m_handle = 0;
+    // (the moved-from map is guaranteed empty by std::string/string move;
+    // locations now belong to this object's program)
 }
 
 Shader& Shader::operator=(Shader&& other) noexcept {
     if (this != &other) {
         if (m_handle != 0) gl::DeleteProgram(m_handle);
         m_handle = other.m_handle;
+        // Old entries describe the deleted program; take the source's cache,
+        // which matches the handle we just adopted.
+        m_uniformCache = std::move(other.m_uniformCache);
         other.m_handle = 0;
     }
     return *this;
@@ -100,8 +106,24 @@ void Shader::bind() const {
     }
 }
 
-void Shader::setMat4(const char* name, const Mat4& value) {
+// M5.1 PERF: cached location lookup -- see Shader.h. Misses cost exactly one
+// driver query (cached, including -1 for optimized-out uniforms); hits cost
+// one string hash. Empties with the program on move; never outlives m_handle.
+gl::GLint Shader::getUniformLocation(const char* name) const {
+    if (m_handle == 0 || name == nullptr) {
+        return -1;
+    }
+    auto it = m_uniformCache.find(name);
+    if (it != m_uniformCache.end()) {
+        return it->second;
+    }
     const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    m_uniformCache.emplace(name, location);
+    return location;
+}
+
+void Shader::setMat4(const char* name, const Mat4& value) {
+    const gl::GLint location = getUniformLocation(name);
     if (location >= 0) {
         // Column-major storage matches Mat4's layout; no transpose needed.
         gl::UniformMatrix4fv(location, 1, 0, value.data());
@@ -109,28 +131,28 @@ void Shader::setMat4(const char* name, const Mat4& value) {
 }
 
 void Shader::setFloat4(const char* name, float x, float y, float z, float w) {
-    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    const gl::GLint location = getUniformLocation(name);
     if (location >= 0) {
         gl::Uniform4f(location, x, y, z, w);
     }
 }
 
 void Shader::setFloat(const char* name, float value) {
-    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    const gl::GLint location = getUniformLocation(name);
     if (location >= 0) {
         gl::Uniform1f(location, value);
     }
 }
 
 void Shader::setInt(const char* name, int value) {
-    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    const gl::GLint location = getUniformLocation(name);
     if (location >= 0) {
         gl::Uniform1i(location, value);
     }
 }
 
 void Shader::setFloat3(const char* name, float x, float y, float z) {
-    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    const gl::GLint location = getUniformLocation(name);
     if (location >= 0) {
         gl::Uniform3f(location, x, y, z);
     }
@@ -144,9 +166,19 @@ void Shader::setFloat3Array(const char* name, const float* xyz, int count) {
     if (xyz == nullptr || count <= 0) {
         return;
     }
-    const gl::GLint location = gl::GetUniformLocation(m_handle, name);
+    const gl::GLint location = getUniformLocation(name);
     if (location >= 0) {
         gl::Uniform3fv(location, gl::GLsizei(count), xyz);
+    }
+}
+
+void Shader::setFloat4Array(const char* name, const float* xyzw, int count) {
+    if (xyzw == nullptr || count <= 0) {
+        return;
+    }
+    const gl::GLint location = getUniformLocation(name);
+    if (location >= 0) {
+        gl::Uniform4fv(location, gl::GLsizei(count), xyzw);
     }
 }
 

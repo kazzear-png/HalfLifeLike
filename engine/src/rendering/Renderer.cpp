@@ -99,9 +99,12 @@ Renderer::~Renderer() {
     // Application member destruction order guarantees the GL context is still
     // alive here (m_renderer is destroyed before m_window).
     destroyHDRTargets();
-    if (m_timerQuery != 0) {
-        gl::DeleteQueries(1, &m_timerQuery);
-        m_timerQuery = 0;
+    if (m_timerQueries[0] != 0) {
+        gl::DeleteQueries(kTimerRingSize, m_timerQueries);
+        for (int i = 0; i < kTimerRingSize; ++i) {
+            m_timerQueries[i] = 0;
+            m_timerSlotPending[i] = false;
+        }
     }
     if (m_emptyVao != 0) {
         gl::DeleteVertexArrays(1, &m_emptyVao);
@@ -117,13 +120,18 @@ void Renderer::enableGpuTiming(bool enable) {
     m_gpuTimingWanted = enable;
     m_gpuTimingOn = enable;
     m_gpuFrameMs = -1.0f;
-    m_gpuQueryPending = false;
-    if (enable && m_timerQuery == 0) {
-        gl::GenQueries(1, &m_timerQuery);
+    for (int i = 0; i < kTimerRingSize; ++i) {
+        m_timerSlotPending[i] = false;
     }
-    if (!enable && m_timerQuery != 0) {
-        gl::DeleteQueries(1, &m_timerQuery);
-        m_timerQuery = 0;
+    m_timerRingIndex = 0;
+    if (enable && m_timerQueries[0] == 0) {
+        gl::GenQueries(kTimerRingSize, m_timerQueries);
+    }
+    if (!enable && m_timerQueries[0] != 0) {
+        gl::DeleteQueries(kTimerRingSize, m_timerQueries);
+        for (int i = 0; i < kTimerRingSize; ++i) {
+            m_timerQueries[i] = 0;
+        }
     }
 }
 
@@ -291,20 +299,42 @@ void Renderer::beginFrame() {
     m_stats.reset();  // frame starts here
 
     if (m_gpuTimingOn) {
-        // Read last frame's completed query before re-arming (standard
-        // one-frame-lag pattern; the result is guaranteed available).
-        if (m_gpuQueryPending) {
+        // M5.2: drain completed query results NON-BLOCKINGLY before re-arming.
+        // Slots are visited oldest -> newest (queries on one target retire in
+        // issue order, so the first not-ready slot means nothing newer is done
+        // either). Every drained value refreshes m_gpuFrameMs; a frame with no
+        // completed sample reports n/a (-1) and the benchmark skips it.
+        m_gpuFrameMs = -1.0f;
+        for (int i = 0; i < kTimerRingSize; ++i) {
+            const int slot = (m_timerRingIndex + i) % kTimerRingSize;
+            if (!m_timerSlotPending[slot]) {
+                continue;
+            }
+            gl::GLint available = 0;
+            gl::GetQueryObjectiv(m_timerQueries[slot], gl::QueryResultAvailable, &available);
+            if (available == 0) {
+                if (i != 0) {
+                    break;  // in-order retirement: stop at the first gap
+                }
+                // The slot we must re-arm THIS frame is a full ring old and
+                // still not retired (GPU 4+ frames behind -- pathological).
+                // One blocking read so its sample is not lost; this is the
+                // rare fallback, not the steady-state path.
+            }
             gl::GLuint64 ns = 0;
-            gl::GetQueryObjectui64v(m_timerQuery, gl::QueryResult, &ns);
-            if (gl::GetError() == gl::NoError && ns > 0) {
-                m_gpuFrameMs = static_cast<float>(static_cast<double>(ns) / 1e6);
-            } else {
+            gl::GetQueryObjectui64v(m_timerQueries[slot], gl::QueryResult, &ns);
+            m_timerSlotPending[slot] = false;
+            if (gl::GetError() != gl::NoError || ns == 0) {
                 m_gpuTimingOn = false;   // driver misbehaved; report n/a
                 std::fprintf(stderr, "[Renderer] GPU timer query failed; timing disabled.\n");
+                break;
             }
-            m_gpuQueryPending = false;
+            m_gpuFrameMs = static_cast<float>(static_cast<double>(ns) / 1e6);
         }
-        gl::BeginQuery(gl::TimeElapsed, m_timerQuery);
+        // (a driver failure above clears m_gpuTimingOn; do not re-arm then)
+        if (m_gpuTimingOn) {
+            gl::BeginQuery(gl::TimeElapsed, m_timerQueries[m_timerRingIndex]);
+        }
     }
 
     if (m_hdrActive) {
@@ -339,16 +369,6 @@ void Renderer::drawTonemapPass() {
     gl::BindFramebuffer(gl::DrawFramebuffer, 0);
 }
 
-void Renderer::endFrame() {
-    if (m_hdrActive) {
-        drawTonemapPass();
-    }
-    if (m_gpuTimingOn) {
-        gl::EndQuery(gl::TimeElapsed);
-        m_gpuQueryPending = true;
-    }
-}
-
 void Renderer::drawIndexed(const Mesh& mesh) {
     if (!mesh.valid()) {
         return;
@@ -359,11 +379,34 @@ void Renderer::drawIndexed(const Mesh& mesh) {
     m_stats.drawCalls += 1;
     m_stats.triangles += mesh.indexCount() / 3;
 
-    // Debug tripwire from M1: surfaces wrong-state issues instead of silently
-    // drawing nothing. Replaced by a proper debug layer later.
+    // M5.1 PERF: the per-draw glGetError() tripwire that used to live here
+    // forced a driver-level command-buffer flush after EVERY draw call,
+    // fully serializing CPU and GPU (measured ~6.4 ms/frame on a 36-triangle
+    // scene: CPU 6.2 ms == GPU 6.1 ms -- both sides idle-waiting on the
+    // other). Error state is now sampled once per frame in endFrame(),
+    // after the timer query is closed, so the pipeline stays asynchronous.
+    // For call-site attribution use GL_ARB_debug_output / GL_KHR_debug
+    // instead of polling.
+}
+
+void Renderer::endFrame() {
+    if (m_hdrActive) {
+        drawTonemapPass();
+    }
+    if (m_gpuTimingOn) {
+        gl::EndQuery(gl::TimeElapsed);
+        m_timerSlotPending[m_timerRingIndex] = true;
+        m_timerRingIndex = (m_timerRingIndex + 1) % kTimerRingSize;
+    }
+
+    // M5.1 PERF: once-per-frame error tripwire (replaces the per-draw check
+    // removed from drawIndexed). glGetError() clears the pending error flag,
+    // so this still surfaces any GL error raised anywhere during the frame;
+    // only the call-site attribution is lost. Placed after EndQuery so the
+    // GPU timer region is unaffected by the (rare) error path.
     const gl::GLenum error = gl::GetError();
     if (error != gl::NoError) {
-        std::fprintf(stderr, "[Renderer] GL error 0x%04x raised during drawIndexed\n", error);
+        std::fprintf(stderr, "[Renderer] GL error 0x%04x raised during frame\n", error);
     }
 }
 
