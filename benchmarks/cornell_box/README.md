@@ -109,7 +109,7 @@ python3 tools/benchmark_compare.py /tmp/cbox01.ppm \
 # repeat for cornell02 / cornell03
 
 # performance-only runs (no reference needed)
-./build/bin/Debug/sandbox --scene cornell01 --benchmark 1000 --width 1280 --height 720 --report /tmp/perf720.txt
+./build/bin/sandbox --scene cornell01 --benchmark 1000 --width 1280 --height 720 --report /tmp/perf720.txt
 ./build/bin/sandbox --scene cornell01 --benchmark 1000 --width 1920 --height 1080 --report /tmp/perf1080.txt
 ```
 

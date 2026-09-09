@@ -1,3 +1,5 @@
+> **Realtime GI update:** Cornell scenes now enable GPU-updated one-bounce diffuse color bleeding by default. Read [REALTIME_GI.md](REALTIME_GI.md) for controls, the lighting correction, scope, and validation. Use `--gi 0` for corrected direct-only lighting.
+
 # Engine
 
 A small, dependency-light C++17 3D engine core for Windows, macOS, and Linux.

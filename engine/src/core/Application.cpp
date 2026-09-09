@@ -72,7 +72,13 @@ void Application::run(const std::function<void(float dt)>& onFrame) {
         m_lastDrawCalls = m_renderer.stats().drawCalls;
         m_lastTriangles = m_renderer.stats().triangles;
 
+        // M5.4: present cost is its own metric. SwapBuffers is where the
+        // driver's present-queue throttle parks a CPU that outran the GPU --
+        // measuring it separately keeps the callback's cpu-ms clean.
+        const auto presentStart = Clock::now();
         m_window.swapBuffers();
+        m_lastPresentMs = std::chrono::duration<float, std::milli>(
+            Clock::now() - presentStart).count();
 
         // Title-bar telemetry (verification signal). Uses UNCLAMPED time.
         statTimer += rawDt;

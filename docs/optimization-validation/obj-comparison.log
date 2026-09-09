@@ -1,0 +1,3 @@
+All 22 OBJ assets, raw and normalized: byte-identical vertices, indices and warnings.
+Median of 5 trials, 10 loads per mode: 3789.323 -> 2841.976 ms
+Raw timings: [[3710.634, 2349.829, 7055.66, 4304.316, 3789.323], [1130.576, 2841.976, 1999.405, 7452.879, 4448.789]]

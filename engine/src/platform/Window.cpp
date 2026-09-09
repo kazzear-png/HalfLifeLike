@@ -8,7 +8,14 @@ namespace engine {
 
 namespace {
 
-bool s_glfwInitialized = false;
+// M5.5: GLFW global lifetime is REFERENCE-COUNTED, not a single bool. The
+// old single-shot "last window terminates GLFW" logic broke the moment two
+// Window instances overlapped: A ok, B ok, A destroyed -> glfwTerminate()
+// with B still alive (GLFW state freed under a live window); or a failed
+// B construction left the flag set after its destructor terminated. Each
+// successfully-created window owns exactly one reference; the count hitting
+// zero (and only zero) terminates.
+int s_glfwRefCount = 0;
 
 void glfwErrorCallback(int error, const char* description) {
     std::fprintf(stderr, "[GLFW] error %d: %s\n", error, description);
@@ -19,13 +26,16 @@ void glfwErrorCallback(int error, const char* description) {
 Window::Window(const WindowDesc& desc) : m_vsync(desc.vsync) {
     glfwSetErrorCallback(glfwErrorCallback);
 
-    if (!s_glfwInitialized) {
+    if (s_glfwRefCount == 0) {
         if (glfwInit() != GLFW_TRUE) {
             std::fprintf(stderr, "[Window] glfwInit() failed\n");
             return;
         }
-        s_glfwInitialized = true;
     }
+
+    // This Window instance now owns one GLFW lifetime reference (released
+    // on destruction, or below if window creation fails).
+    ++s_glfwRefCount;
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, desc.glVersionMajor);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, desc.glVersionMinor);
@@ -40,6 +50,13 @@ Window::Window(const WindowDesc& desc) : m_vsync(desc.vsync) {
         std::fprintf(stderr,
                      "[Window] glfwCreateWindow failed. A driver supporting OpenGL %d.%d core is required.\n",
                      desc.glVersionMajor, desc.glVersionMinor);
+        // Construction failed AFTER acquiring the reference: release it
+        // here so the destructor (which sees m_window == nullptr and does
+        // nothing) cannot decrement it twice.
+        --s_glfwRefCount;
+        if (s_glfwRefCount == 0) {
+            glfwTerminate();
+        }
         return;
     }
 
@@ -51,10 +68,13 @@ Window::~Window() {
     if (m_window != nullptr) {
         glfwDestroyWindow(m_window);
         m_window = nullptr;
-    }
-    if (s_glfwInitialized) {
-        glfwTerminate();
-        s_glfwInitialized = false;
+
+        if (s_glfwRefCount > 0) {
+            --s_glfwRefCount;
+        }
+        if (s_glfwRefCount == 0) {
+            glfwTerminate();
+        }
     }
 }
 

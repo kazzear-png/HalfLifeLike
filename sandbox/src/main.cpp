@@ -33,6 +33,7 @@
 #include "math/Mat4.h"
 #include "math/Vec3.h"
 #include "rendering/Camera.h"
+#include "rendering/DiffuseGI.h"
 #include "rendering/Lighting.h"
 #include "rendering/Mesh.h"
 #include "rendering/Shader.h"
@@ -42,11 +43,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>   // std::begin/std::end (M4.0.4 probe table splice; MSVC does not leak this)
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <thread>    // M5.3: dynamic-fps unfocused throttle (sleep_until)
 #include <vector>
@@ -66,6 +71,60 @@ namespace {
 std::string dirOf(const std::string& path) {
     const std::size_t slash = path.find_last_of("/\\");
     return (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+}
+
+// --- M5.5: strict CLI value parsing ---------------------------------------
+// std::atoi/std::atof interpreted every malformed argument as 0.0: a typo'd
+// "--benchmark potato" silently DISABLED the benchmark, "--width xyz"
+// silently opened a 0x0 window, and "--benchmak 500" (misspelled flag) was
+// silently ignored and ran the interactive demo instead. These helpers
+// reject anything that is not a complete, in-range number; combined with
+// the unknown-option else below, the CLI now fails loudly and precisely.
+
+bool parseIntArg(const char* text, int& output) {
+    if (text == nullptr || *text == '\0') {
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const long value = std::strtol(text, &end, 10);
+    if (errno == ERANGE ||
+        end == text ||
+        *end != '\0' ||
+        value < INT_MIN ||
+        value > INT_MAX) {
+        return false;
+    }
+    output = static_cast<int>(value);
+    return true;
+}
+
+bool parseFloatArg(const char* text, float& output) {
+    if (text == nullptr || *text == '\0') {
+        return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const float value = std::strtof(text, &end);
+    if (errno == ERANGE ||
+        end == text ||
+        *end != '\0' ||
+        !std::isfinite(value)) {
+        return false;
+    }
+    output = value;
+    return true;
+}
+
+// Consumes the next argv element as an option's value. On failure prints the
+// "... requires a value" diagnostic and returns false (caller returns 1).
+bool requireValue(int argc, char** argv, int& index, const char* option, const char*& value) {
+    if (index + 1 >= argc) {
+        std::fprintf(stderr, "[Sandbox] %s requires a value\n", option);
+        return false;
+    }
+    value = argv[++index];
+    return true;
 }
 
 // Locates the bundled model assets. Works no matter how the sandbox is
@@ -219,22 +278,49 @@ engine::Mesh createSphereMesh(float radius, int slices, int stacks) {
     return mesh;
 }
 
+bool ensureParentDirectory(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    const std::filesystem::path outPath(path);
+    const std::filesystem::path parent = outPath.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            std::fprintf(stderr,
+                         "[Sandbox] Cannot create output directory '%s': %s\n",
+                         parent.string().c_str(), ec.message().c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 bool writePpm(const std::string& path, const unsigned char* rgba, int width, int height) {
+    if (rgba == nullptr || width <= 0 || height <= 0 || !ensureParentDirectory(path)) {
+        return false;
+    }
+    std::vector<unsigned char> row(static_cast<std::size_t>(width) * 3);
     FILE* f = std::fopen(path.c_str(), "wb");
     if (f == nullptr) {
         std::fprintf(stderr, "[Sandbox] Cannot open '%s' for writing.\n", path.c_str());
         return false;
     }
-    std::fprintf(f, "P6\n%d %d\n255\n", width, height);
-    // ReadPixels returns bottom-up rows; PPM expects top-down.
-    for (int y = height - 1; y >= 0; --y) {
+    bool ok = std::fprintf(f, "P6\n%d %d\n255\n", width, height) > 0;
+    // ReadPixels is bottom-up RGBA; pack one top-down RGB row per write.
+    for (int y = height - 1; ok && y >= 0; --y) {
+        const unsigned char* src = rgba + static_cast<std::size_t>(y) * width * 4;
         for (int x = 0; x < width; ++x) {
-            const unsigned char* px = rgba + (static_cast<std::size_t>(y) * width + x) * 4;
-            std::fwrite(px, 1, 3, f);  // drop alpha
+            const std::size_t dst = static_cast<std::size_t>(x) * 3;
+            row[dst] = src[0]; row[dst + 1] = src[1]; row[dst + 2] = src[2];
+            src += 4;
         }
+        ok = std::fwrite(row.data(), 1, row.size(), f) == row.size();
     }
-    std::fclose(f);
-    return true;
+    if (std::fclose(f) != 0) ok = false;
+    if (!ok) std::fprintf(stderr, "[Sandbox] Failed writing '%s'.\n", path.c_str());
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +368,9 @@ struct CornellScene {
     const cornell::VariantDef* def = nullptr;
     std::vector<engine::Mesh>  meshes;        // parallel to def->meshes
     std::vector<bool>          meshLoaded;
+    std::vector<const cornell::MaterialDef*> meshMaterials;
+    std::vector<engine::GiSurface> giSurfaces;
+    std::vector<int> meshGiIndex;
     std::vector<engine::Aabb>  meshAabb;      // M5.3: world AABBs (frustum culling)
     engine::Mesh               emitterQuad;   // unlit emissive draw
     engine::Aabb               emitterAabb{}; // M5.3: emitter world AABB
@@ -788,6 +877,9 @@ bool setupCornellScene(CornellScene& scene, int variantIndex,
     scene.def = cornell::kVariants[variantIndex];
     scene.meshes.resize(scene.def->meshCount);
     scene.meshLoaded.assign(scene.def->meshCount, false);
+    scene.meshMaterials.resize(scene.def->meshCount);
+    scene.meshGiIndex.assign(scene.def->meshCount, -1);
+    scene.giSurfaces.clear();
     scene.meshAabb.assign(scene.def->meshCount, engine::Aabb{});
 
     engine::LoadObjOptions opts;
@@ -796,6 +888,7 @@ bool setupCornellScene(CornellScene& scene, int variantIndex,
 
     bool allOk = true;
     for (std::uint32_t i = 0; i < scene.def->meshCount; ++i) {
+        scene.meshMaterials[i] = findCornellMaterial(scene.def->meshes[i].material);
         const char* file = scene.def->meshes[i].file;
         const std::string path = geoDir + "/" + file;
         engine::LoadObjResult model = engine::loadOBJ(path, opts);
@@ -848,6 +941,23 @@ bool setupCornellScene(CornellScene& scene, int variantIndex,
                 scene.occluders.boxCount++;
             }
         }
+        if (const auto* material = scene.meshMaterials[i]) {
+            engine::GiSurface surface;
+            const auto& b = scene.meshAabb[i];
+            const bool sphere = std::strncmp(scene.def->meshes[i].material, "sphere_", 7) == 0;
+            int mask = 63;
+            if (!sphere) {
+                const float extent[3] = {b.max.x-b.min.x, b.max.y-b.min.y, b.max.z-b.min.z};
+                const float normal[3] = {model.vertices[0].nx,model.vertices[0].ny,model.vertices[0].nz};
+                for (int axis = 0; axis < 3; ++axis)
+                    if (extent[axis] < 1e-6f) mask = 1 << (axis * 2 + (normal[axis] > 0 ? 1 : 0));
+            }
+            surface.lo = {b.min.x,b.min.y,b.min.z,sphere ? 1.0f : 0.0f};
+            surface.hi = {b.max.x,b.max.y,b.max.z,static_cast<float>(mask)};
+            surface.material = {material->albedo[0],material->albedo[1],material->albedo[2],material->metalness};
+            scene.meshGiIndex[i] = static_cast<int>(scene.giSurfaces.size());
+            scene.giSurfaces.push_back(surface);
+        }
         scene.meshLoaded[i] = scene.meshes[i].create(
             model.vertices.data(), static_cast<std::uint32_t>(model.vertices.size()),
             model.indices.data(), static_cast<std::uint32_t>(model.indices.size()));
@@ -890,146 +1000,319 @@ int main(int argc, char** argv) {
     float shadowLightSize = kShadowLightSize; // --shadow-light-size (M4.0.9, centroid path)
     int  shadowJitter = kShadowJitterDefault; // --shadow-jitter 0|1 (M4.0.9 diagnostic)
     int  shadowLateral = kShadowLateralDefault; // --shadow-lateral 0|1 (M4.0.9.1, centroid path)
-    int  areaLight = kAreaLightDefault;       // --area-light 0|1 (M5.0 transport)
+    int  areaLight = kAreaLightDefault;       // --area-light 0|1
+    int giEnabled = 1, giRays = 8, giResolution = 16, giHistory = 32;
+    int gpuTiming = 1;
+    int  areaFast = 1;                      // --area-fast 0|1 (1 = realtime path, 0 = exact validation solver)
     bool marchStepOverridden = false;         // --shadow-step seen (binds BOTH paths)
     std::string dumpHeightfieldPrefix; // --dump-heightfield p: write <p>_hmax/_hmin.ppm
     int  shadowDebugMode = 0;          // --shadow-debug vis|field|uv (M4.0.5 instrument)
     int  dynamicFps = 1;               // --dynamic-fps 0|1 (M5.3: unfocused/minimized pacing)
     int  frustumCull = 1;              // --cull 0|1 (M5.3: frustum AABB culling A/B lever)
+    int  msaaSamples = 4;              // --msaa N (M5.4: GPU-cost ablation; 4 = frozen standard)
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
-            screenshotFrames = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
-            screenshotPath = argv[++i];
-        } else if (std::strcmp(argv[i], "--scene") == 0 && i + 1 < argc) {
-            sceneName = argv[++i];
-        } else if (std::strcmp(argv[i], "--benchmark") == 0 && i + 1 < argc) {
-            benchmarkFrames = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
-            reportPath = argv[++i];
-        } else if (std::strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
-            windowWidth = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
-            windowHeight = std::atoi(argv[++i]);
+        const char* value = nullptr;
+        if (std::strcmp(argv[i], "--gi") == 0 || std::strcmp(argv[i], "--gi-rays") == 0 ||
+            std::strcmp(argv[i], "--gi-res") == 0 || std::strcmp(argv[i], "--gi-history") == 0 ||
+            std::strcmp(argv[i], "--gpu-timing") == 0) {
+            const std::string option = argv[i];
+            int parsed = 0;
+            const int lo = option == "--gi-res" ? 4 : ((option == "--gi" || option == "--gpu-timing") ? 0 : 1);
+            const int hi = option == "--gi-history" ? 128 : ((option == "--gi" || option == "--gpu-timing") ? 1 : 64);
+            if (!requireValue(argc, argv, i, option.c_str(), value) || !parseIntArg(value, parsed) || parsed < lo || parsed > hi) {
+                std::fprintf(stderr, "[Sandbox] %s requires an integer in [%d,%d].\n", option.c_str(),lo,hi);
+                return 1;
+            }
+            if (option == "--gi") giEnabled = parsed;
+            else if (option == "--gi-rays") giRays = parsed;
+            else if (option == "--gi-res") giResolution = parsed;
+            else if (option == "--gi-history") giHistory = parsed;
+            else gpuTiming = parsed;
+        } else if (std::strcmp(argv[i], "--frames") == 0) {
+            if (!requireValue(argc, argv, i, "--frames", value)) {
+                return 1;  // diagnostic already printed
+            }
+            if (!parseIntArg(value, screenshotFrames) || screenshotFrames < 0) {
+                std::fprintf(stderr,
+                             "[Sandbox] invalid --frames value '%s' (a frame count >= 0)\n",
+                             value);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--out") == 0) {
+            if (!requireValue(argc, argv, i, "--out", value)) {
+                return 1;  // diagnostic already printed
+            }
+            screenshotPath = value;
+        } else if (std::strcmp(argv[i], "--scene") == 0) {
+            if (!requireValue(argc, argv, i, "--scene", value)) {
+                return 1;
+            }
+            sceneName = value;
+        } else if (std::strcmp(argv[i], "--benchmark") == 0) {
+            if (!requireValue(argc, argv, i, "--benchmark", value)) {
+                return 1;  // diagnostic already printed
+            }
+            if (!parseIntArg(value, benchmarkFrames) || benchmarkFrames < 0) {
+                std::fprintf(stderr,
+                             "[Sandbox] invalid --benchmark value '%s' (a frame count >= 0)\n",
+                             value);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--report") == 0) {
+            if (!requireValue(argc, argv, i, "--report", value)) {
+                return 1;
+            }
+            reportPath = value;
+        } else if (std::strcmp(argv[i], "--width") == 0) {
+            if (!requireValue(argc, argv, i, "--width", value) ||
+                !parseIntArg(value, windowWidth) ||
+                windowWidth < 1 ||
+                windowWidth > 16384) {
+                std::fprintf(stderr,
+                             "[Sandbox] invalid --width value '%s' (1..16384)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--height") == 0) {
+            if (!requireValue(argc, argv, i, "--height", value) ||
+                !parseIntArg(value, windowHeight) ||
+                windowHeight < 1 ||
+                windowHeight > 16384) {
+                std::fprintf(stderr,
+                             "[Sandbox] invalid --height value '%s' (1..16384)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "--no-shadows") == 0) {
             shadowsEnabled = false;
-        } else if (std::strcmp(argv[i], "--dump-heightfield") == 0 && i + 1 < argc) {
-            dumpHeightfieldPrefix = argv[++i];
-        } else if (std::strcmp(argv[i], "--shadow-penumbra") == 0 && i + 1 < argc) {
-            shadowPenumbra = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(argv[i], "--dump-heightfield") == 0) {
+            if (!requireValue(argc, argv, i, "--dump-heightfield", value)) {
+                return 1;
+            }
+            dumpHeightfieldPrefix = value;
+        } else if (std::strcmp(argv[i], "--shadow-penumbra") == 0) {
+            if (!requireValue(argc, argv, i, "--shadow-penumbra", value) ||
+                !parseFloatArg(value, shadowPenumbra)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-penumbra: '%s' is not a number "
+                             "(use 0 = binary march, or a positive scale)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (shadowPenumbra < 0.0f) {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-penumbra: negative scale '%s' "
                              "(use 0 = binary march, or a positive scale)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--shadow-step") == 0 && i + 1 < argc) {
-            marchStepOverride = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(argv[i], "--shadow-step") == 0) {
+            if (!requireValue(argc, argv, i, "--shadow-step", value) ||
+                !parseFloatArg(value, marchStepOverride)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-step: '%s' is not a number "
+                             "(0 < step < 0.19, the baffle-thickness invariant)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             marchStepOverridden = true;
             if (marchStepOverride <= 0.0f || marchStepOverride >= 0.19f) {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-step: '%s' out of range "
                              "(0 < step < 0.19, the baffle-thickness invariant)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--shadow-centroid") == 0 && i + 1 < argc) {
-            shadowCentroid = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--shadow-centroid") == 0) {
+            if (!requireValue(argc, argv, i, "--shadow-centroid", value) ||
+                !parseIntArg(value, shadowCentroid)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-centroid: '%s' is not a number\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (shadowCentroid < 0 || shadowCentroid > 1) {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-centroid: '%s' out of range "
                              "(0 = exact M4.0.8 per-light march, 1 = M4.0.9 "
                              "centroid rig march)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--shadow-light-size") == 0 && i + 1 < argc) {
-            shadowLightSize = static_cast<float>(std::atof(argv[++i]));
+        } else if (std::strcmp(argv[i], "--shadow-light-size") == 0) {
+            if (!requireValue(argc, argv, i, "--shadow-light-size", value) ||
+                !parseFloatArg(value, shadowLightSize)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-light-size: '%s' is not a number "
+                             "(use 0 = binary centroid march, or a positive "
+                             "extent in meters)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (shadowLightSize < 0.0f) {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-light-size: negative size '%s' "
                              "(use 0 = binary centroid march, or a positive "
                              "extent in meters)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--shadow-jitter") == 0 && i + 1 < argc) {
-            shadowJitter = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--shadow-jitter") == 0) {
+            if (!requireValue(argc, argv, i, "--shadow-jitter", value) ||
+                !parseIntArg(value, shadowJitter)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-jitter: '%s' is not a number\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (shadowJitter < 0 || shadowJitter > 1) {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-jitter: '%s' out of range "
                              "(0 = deterministic lattice, 1 = per-pixel IGN "
                              "jitter of both march lattices, diagnostic only "
                              "-- needs TAA to converge)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--shadow-lateral") == 0 && i + 1 < argc) {
-            shadowLateral = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--shadow-lateral") == 0) {
+            if (!requireValue(argc, argv, i, "--shadow-lateral", value) ||
+                !parseIntArg(value, shadowLateral)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-lateral: '%s' is not a number\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (shadowLateral < 0 || shadowLateral > 1) {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-lateral: '%s' out of range "
                              "(0 = exact M4.0.9 centroid march, 1 = analytic "
                              "lateral half-plane grade, M4.0.9.1)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--area-light") == 0 && i + 1 < argc) {
-            areaLight = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--area-light") == 0) {
+            if (!requireValue(argc, argv, i, "--area-light", value) ||
+                !parseIntArg(value, areaLight)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --area-light: '%s' is not a number\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (areaLight < 0 || areaLight > 1) {
                 std::fprintf(stderr,
                              "[Sandbox] --area-light: '%s' out of range "
-                             "(1 = M5.0 true area-light transport, 0 = exact "
+                             "(1 = M5.0 area-light transport, 0 = legacy 16-point "
                              "M4.0.9.1 grid transport, all replay pins)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--shadow-refine") == 0 && i + 1 < argc) {
-            shadowRefine = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--area-fast") == 0) {
+            if (!requireValue(argc, argv, i, "--area-fast", value) ||
+                !parseIntArg(value, areaFast)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --area-fast: '%s' is not a number (0 or 1)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
+            if (areaFast < 0 || areaFast > 1) {
+                std::fprintf(stderr,
+                             "[Sandbox] --area-fast: '%s' out of range "
+                             "(1 = realtime 5-ray area path, 0 = exact M5.0 validation solver)\n",
+                             value);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-refine") == 0) {
+            if (!requireValue(argc, argv, i, "--shadow-refine", value) ||
+                !parseIntArg(value, shadowRefine)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --shadow-refine: '%s' is not a number\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (shadowRefine < 0 || shadowRefine > 1) {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-refine: '%s' out of range "
                              "(0 = exact M4.0.7 soft march, 1 = M4.0.8 bracket "
                              "refinement)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--dynamic-fps") == 0 && i + 1 < argc) {
-            dynamicFps = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--dynamic-fps") == 0) {
+            if (!requireValue(argc, argv, i, "--dynamic-fps", value) ||
+                !parseIntArg(value, dynamicFps)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --dynamic-fps: '%s' is not a number "
+                             "(0 or 1)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (dynamicFps < 0 || dynamicFps > 1) {
                 std::fprintf(stderr,
                              "[Sandbox] --dynamic-fps: '%s' out of range "
                              "(0 = full rate always, 1 = 30 fps unfocused cap, "
                              "event-driven pause when minimized; auto-off "
                              "during benchmark/screenshot runs)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--cull") == 0 && i + 1 < argc) {
-            frustumCull = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--cull") == 0) {
+            if (!requireValue(argc, argv, i, "--cull", value) ||
+                !parseIntArg(value, frustumCull)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --cull: '%s' is not a number (0 or 1)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
             if (frustumCull < 0 || frustumCull > 1) {
                 std::fprintf(stderr,
                              "[Sandbox] --cull: '%s' out of range "
                              "(1 = conservative frustum-AABB culling on, "
                              "0 = submit every draw -- the A/B lever)\n",
-                             argv[i]);
+                             value);
                 return 1;
             }
-        } else if (std::strcmp(argv[i], "--shadow-debug") == 0 && i + 1 < argc) {
-            const char* mode = argv[++i];
-            if (std::strcmp(mode, "vis") == 0) {
+        } else if (std::strcmp(argv[i], "--msaa") == 0) {
+            if (!requireValue(argc, argv, i, "--msaa", value) ||
+                !parseIntArg(value, msaaSamples)) {
+                std::fprintf(stderr,
+                             "[Sandbox] --msaa: '%s' is not a number (1..32)\n",
+                             value != nullptr ? value : "");
+                return 1;
+            }
+            if (msaaSamples < 1 || msaaSamples > 32) {
+                std::fprintf(stderr,
+                             "[Sandbox] --msaa: '%s' out of range "
+                             "(1 = off, 4 = frozen cornell-box/1.0 standard; a "
+                             "GPU-cost ablation lever -- non-default values "
+                             "change pixels, do not ledger them)\n",
+                             value);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "--shadow-debug") == 0) {
+            if (!requireValue(argc, argv, i, "--shadow-debug", value)) {
+                return 1;
+            }
+            if (std::strcmp(value, "vis") == 0) {
                 shadowDebugMode = 1;
-            } else if (std::strcmp(mode, "field") == 0) {
+            } else if (std::strcmp(value, "field") == 0) {
                 shadowDebugMode = 2;
-            } else if (std::strcmp(mode, "uv") == 0) {
+            } else if (std::strcmp(value, "uv") == 0) {
                 shadowDebugMode = 3;
             } else {
                 std::fprintf(stderr,
                              "[Sandbox] --shadow-debug: unknown mode '%s' (use vis|field|uv)\n",
-                             mode);
+                             value);
                 return 1;
             }
+        } else {
+            // M5.5: the old chain silently ignored anything it did not
+            // recognize -- typos ("--benchmak 500") and truncated options
+            // ("--frames" as the last argument) ran the wrong experiment
+            // without a word. Unknown/malformed options are now fatal.
+            std::fprintf(stderr,
+                         "[Sandbox] unknown or malformed option: %s\n",
+                         argv[i]);
+            return 1;
         }
     }
 
@@ -1050,6 +1333,7 @@ int main(int argc, char** argv) {
         }
     }
     const bool benchMode = benchmarkFrames > 0;
+    const bool giWanted = giEnabled != 0 && cornellVariant >= 0 && shadowsEnabled && areaLight == 1;
     if (benchMode && screenshotFrames == 0) {
         screenshotFrames = benchmarkFrames;   // a benchmark run also captures its final frame
     }
@@ -1076,11 +1360,20 @@ int main(int argc, char** argv) {
 
     engine::Renderer& renderer = app.renderer();
 
-    // HDR pipeline: RGBA16F + 4x MSAA + ACES tonemap. Falls back gracefully
-    // (1x MSAA, then direct rendering) on limited drivers.
+    // HDR pipeline: RGBA16F + MSAA + ACES tonemap. Falls back gracefully
+    // (1x MSAA, then direct rendering) on limited drivers. --msaa is the
+    // GPU-cost ablation lever (resolve bandwidth + per-sample coverage
+    // tests); the frozen cornell-box/1.0 standard is 4x -- anything else
+    // changes pixels and is for perf attribution only.
     int fbw = 0, fbh = 0;
     app.window().getFramebufferSize(fbw, fbh);
-    renderer.initHDR(fbw, fbh, /*msaaSamples=*/4);
+    renderer.initHDR(fbw, fbh, msaaSamples);
+    if (cornellVariant >= 0 && msaaSamples != 4) {
+        std::fprintf(stderr,
+                     "[Sandbox] --msaa %d: ablation run, NOT the frozen "
+                     "cornell-box/1.0 standard (4x) -- do not ledger this image\n",
+                     msaaSamples);
+    }
 
     // Cornell scenes are a closed light-transport system: black background
     // (rays that leave through the open front see nothing), fixed exposure,
@@ -1088,11 +1381,30 @@ int main(int argc, char** argv) {
     if (cornellVariant >= 0) {
         renderer.setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         renderer.setExposure(cornell::kExposure);
-        renderer.enableGpuTiming(benchMode);
+        renderer.enableGpuTiming(benchMode && gpuTiming != 0);
     }
 
     // --- shaders ------------------------------------------------------------
-    engine::Shader pbrShader  = engine::Shader::fromSource(shaders::kPbrVertex, shaders::kPbrFragment);
+    // Compile only the selected area-light implementation. Keeping the exact
+    // polygon solver behind a runtime uniform still forces many drivers to
+    // reserve registers/local storage for its large arrays, crushing occupancy
+    // even when the fast branch is selected. A compile-time variant lets the
+    // production shader contain none of that code or temporary storage.
+    std::string pbrFragmentSource = shaders::kPbrFragment;
+    const std::string versionLine = "#version 330 core\n";
+    const std::size_t versionPos = pbrFragmentSource.find(versionLine);
+    if (versionPos != std::string::npos) {
+        pbrFragmentSource.insert(versionPos + versionLine.size(),
+                                 areaFast ? "#define AREA_FAST_BUILD 1\n"
+                                          : "#define AREA_FAST_BUILD 0\n");
+    }
+    if (versionPos != std::string::npos) {
+        pbrFragmentSource.insert(versionPos + versionLine.size(),
+            giWanted ? std::string("#define SURFACE_GI_BUILD 1\n") + engine::DiffuseGI::samplingSource()
+                     : "#define SURFACE_GI_BUILD 0\n");
+    }
+    engine::Shader pbrShader  = engine::Shader::fromSource(
+        shaders::kPbrVertex, pbrFragmentSource.c_str());
     engine::Shader unlitShader = engine::Shader::fromSource(shaders::kUnlitVertex, shaders::kUnlitFragment);
     if (!pbrShader.valid() || !unlitShader.valid()) {
         std::fprintf(stderr, "Failed to build shaders; see messages above.\n");
@@ -1341,10 +1653,11 @@ int main(int argc, char** argv) {
     // hardware reports can be attributed to the right tree (rendering is
     // byte-identical across the change, so the screenshot md5 cannot tell the
     // builds apart).
-    std::printf("[Sandbox] build 0.5.3 (M5.3 mod-inspired: frozen-scene upload-once, "
-                "frustum culling, dynamic-fps pacing; M5.1/M5.2: uniform-location "
-                "cache, batched shadow arrays, non-blocking GPU timer ring, "
-                "draw-loop glGetError removed)\n");
+    std::printf("[Sandbox] build 0.5.7 (M5.7: PPC projected-polygon coverage shadows; "
+                "continuous analytic box penumbra + 2-blocker union; M5.6: timer ring 64; "
+                "M5.5: correctness hardening -- leak-free heightfield create, GLFW "
+                "refcounted lifetime, Mat4 degenerate guards, OBJ ear-clip + strict parsing, "
+                "strict CLI)\n");
     std::printf("[Sandbox] Controls: click=look, WASD+QE=fly, 1-4=model, F=flashlight, "
                 "V=material views, SPACE=pause spin, ESC=quit, scroll=exposure\n");
     std::printf("[Sandbox] culling: %s | dynamic fps: %s\n",
@@ -1364,20 +1677,44 @@ int main(int argc, char** argv) {
     const int warmupFrames = benchMode ? std::max(10, benchmarkFrames / 10) : 0;
     std::vector<float> framePeriods;   // entry-to-entry (includes present)
     std::vector<float> cpuTimes;       // callback work time
-    std::vector<float> gpuTimes;       // renderer timer query (one-frame lag)
+    std::vector<float> gpuTimes;       // renderer timer query (ring lag)
+    std::vector<float> drainTimes;     // M5.4: timer readback wait (beginFrame)
+    std::vector<float> presentTimes;   // M5.4: SwapBuffers wall time (prev frame)
     framePeriods.reserve(static_cast<std::size_t>(std::max(0, benchmarkFrames)));
     cpuTimes.reserve(framePeriods.capacity());
     gpuTimes.reserve(framePeriods.capacity());
+    drainTimes.reserve(framePeriods.capacity());
+    presentTimes.reserve(framePeriods.capacity());
     std::chrono::steady_clock::time_point lastEntry = std::chrono::steady_clock::now();
+
+    engine::DiffuseGI diffuseGI;
+    const bool giActive = giWanted && shadowsActive;
+    if (giActive) {
+        if (!diffuseGI.setScene(cornell.giSurfaces) || !diffuseGI.init(giResolution, giRays, giHistory)) {
+            std::fprintf(stderr, "[GI] Initialization failed; cannot provide requested realtime GI.\n");
+            return 1;
+        }
+        diffuseGI.setLight(engine::Vec3(0.5f*(cornell::kEmitterMin[0]+cornell::kEmitterMax[0]),
+                          cornell::kEmitterMin[1],0.5f*(cornell::kEmitterMin[2]+cornell::kEmitterMax[2])),
+                          0.5f*(cornell::kEmitterMax[0]-cornell::kEmitterMin[0]),
+                          0.5f*(cornell::kEmitterMax[2]-cornell::kEmitterMin[2]),cornell::kEmitterRadiance);
+        std::printf("[GI] Realtime one-bounce diffuse: %d surfaces, %dx%d per face, %d rays/update, history %d.\n",
+                    diffuseGI.surfaceCount(),giResolution,giResolution,giRays,giHistory);
+    } else {
+        std::printf("[GI] Off (requires Cornell scene, shadows and area lighting enabled).\n");
+    }
 
     // M5.3 per-run pacing / upload / culling state --------------------------------
     bool cornellStaticUploaded = false; // frozen-scene uniforms are up in the program
     int  lastFbw = -1, lastFbh = -1;    // viewport/aspect change detection
+    engine::Mat4 cachedVp;
+    engine::Frustum cachedFrustum;
     bool focusSeen = false;             // throttle only after focus was held once
     std::uint64_t totalCulledDraws = 0; // culling telemetry (report line)
     std::uint64_t maxCulledDraws  = 0;  // worst frame
 
     std::uint64_t frameIndex = 0;
+    int outputExitCode = 0;
 
     app.run([&](float dt) {
         engine::Input& in = app.input();
@@ -1506,14 +1843,23 @@ int main(int argc, char** argv) {
 
         // --- camera projection (resize-safe) ------------------------------------
         app.window().getFramebufferSize(fbw, fbh);
-        const float aspect = fbh > 0 ? static_cast<float>(fbw) / static_cast<float>(fbh) : 1.0f;
-        if (cornellVariant >= 0) {
-            camera.setPerspective(cornell::kCameraFovYRadians, aspect,
-                                  cornell::kCameraNear, cornell::kCameraFar);
-        } else {
-            camera.setPerspective(0.7854f /* 45 deg */, aspect, 0.1f, 100.0f);
+        const bool fbResized = (fbw != lastFbw || fbh != lastFbh);
+        if (fbResized) {
+            const float aspect = fbh > 0 ? static_cast<float>(fbw) / static_cast<float>(fbh) : 1.0f;
+            if (cornellVariant >= 0) {
+                camera.setPerspective(cornell::kCameraFovYRadians, aspect,
+                                      cornell::kCameraNear, cornell::kCameraFar);
+            } else {
+                camera.setPerspective(0.7854f /* 45 deg */, aspect, 0.1f, 100.0f);
+            }
         }
-        const engine::Mat4 vp = camera.viewProjection();
+        // Cornell camera is frozen; the demo camera can move every frame.
+        if (cornellVariant < 0 || fbResized) {
+            cachedVp = camera.viewProjection();
+            cachedFrustum = cullEnabled
+                ? engine::Frustum::fromViewProjection(cachedVp) : engine::Frustum{};
+        }
+        const engine::Mat4& vp = cachedVp;
 
         // M5.3: viewport + HDR targets follow only ACTUAL framebuffer
         // changes -- glViewport and the resize probe are global-state calls
@@ -1521,7 +1867,6 @@ int main(int argc, char** argv) {
         // re-issuing them is pure redundant driver traffic (and the first
         // frame after the startup heightfield capture genuinely needs this
         // re-issue, which lastFbw == -1 guarantees).
-        const bool fbResized = (fbw != lastFbw || fbh != lastFbh);
         if (fbResized) {
             lastFbw = fbw;
             lastFbh = fbh;
@@ -1531,17 +1876,19 @@ int main(int argc, char** argv) {
             }
         }
 
-        // M5.3 culling: one frustum per frame from the (possibly new) vp.
-        // Degenerate when culling is off -- and the degenerate plane set
-        // rejects nothing, so a runtime flag flip can never hide geometry.
-        const engine::Frustum frustum = cullEnabled
-            ? engine::Frustum::fromViewProjection(vp) : engine::Frustum{};
+        // Reuse the frozen frustum; demo movement and resizes refresh it.
+        // The disabled-culling plane set rejects nothing.
+        const engine::Frustum& frustum = cachedFrustum;
         int culledThisFrame = 0;
 
         // --- frame ---------------------------------------------------------------
         renderer.beginFrame();
-
+        if (giActive) {
+            diffuseGI.update();
+            renderer.bindSceneTarget(fbw, fbh);
+        }
         pbrShader.bind();
+        if (giWanted && !giActive) pbrShader.setInt("uGiSurface", -1);
 
         // M5.3 STATIC UPLOAD (the Sodium/ImmediatelyFast pattern applied to
         // a FROZEN scene): every cornell-path uniform below is constant for
@@ -1697,11 +2044,12 @@ int main(int argc, char** argv) {
                 pbrShader.setMat4("uNormalMat", engine::Mat4::identity());
                 pbrShader.setFloat("uUseVertexColor", 0.0f);
             }
+            const cornell::MaterialDef* lastMaterial = nullptr;
             for (std::uint32_t i = 0; i < cornell.def->meshCount; ++i) {
                 if (!cornell.meshLoaded[i]) {
                     continue;
                 }
-                const cornell::MaterialDef* mat = findCornellMaterial(cornell.def->meshes[i].material);
+                const cornell::MaterialDef* mat = cornell.meshMaterials[i];
                 if (mat == nullptr) {
                     continue;
                 }
@@ -1716,9 +2064,14 @@ int main(int argc, char** argv) {
                     ++culledThisFrame;
                     continue;
                 }
-                pbrShader.setFloat3("uAlbedo", mat->albedo[0], mat->albedo[1], mat->albedo[2]);
-                pbrShader.setFloat("uRoughness", mat->roughness);
-                pbrShader.setFloat("uMetalness", mat->metalness);
+                // Only adjacent draws share state; reset tracking each frame.
+                if (mat != lastMaterial) {
+                    pbrShader.setFloat3("uAlbedo", mat->albedo[0], mat->albedo[1], mat->albedo[2]);
+                    pbrShader.setFloat("uRoughness", mat->roughness);
+                    pbrShader.setFloat("uMetalness", mat->metalness);
+                    lastMaterial = mat;
+                }
+                if (giActive) diffuseGI.bind(pbrShader, cornell.meshGiIndex[i]);
                 renderer.drawIndexed(cornell.meshes[i]);
             }
 
@@ -1744,7 +2097,8 @@ int main(int argc, char** argv) {
             // free-fly camera can look away, and a culled object skips BOTH
             // its uniform traffic and its draw call (conservative test: a
             // partially-visible object is never dropped).
-            if (frustum.intersects(floorAabb)) {
+            const bool floorVisible = frustum.intersects(floorAabb);
+            if (floorVisible) {
                 pbrShader.setMat4("uModel", engine::Mat4::identity());
                 pbrShader.setMat4("uNormalMat", engine::Mat4::identity());
                 pbrShader.setFloat3("uAlbedo", 1.0f, 1.0f, 1.0f);
@@ -1763,6 +2117,12 @@ int main(int argc, char** argv) {
             if (frustum.intersects(quadAabbLocal.transformed(quadModel))) {
                 pbrShader.setMat4("uModel", quadModel);
                 pbrShader.setMat4("uNormalMat", quadModel.normalMatrix());
+                // Restore shared material only when the floor did not upload it.
+                if (!floorVisible) {
+                    pbrShader.setFloat3("uAlbedo", 1.0f, 1.0f, 1.0f);
+                    pbrShader.setFloat("uMetalness", 0.0f);
+                    pbrShader.setFloat("uUseVertexColor", 1.0f);
+                }
                 pbrShader.setFloat("uRoughness", 0.30f);
                 renderer.drawIndexed(quadMesh);
             } else {
@@ -1808,12 +2168,16 @@ int main(int argc, char** argv) {
         renderer.endFrame();
 
         // M5.3: culling telemetry (report line; avg over measured frames).
-        totalCulledDraws += static_cast<std::uint64_t>(culledThisFrame);
-        maxCulledDraws = std::max(maxCulledDraws, static_cast<std::uint64_t>(culledThisFrame));
+        if (measured) {
+            totalCulledDraws += static_cast<std::uint64_t>(culledThisFrame);
+            maxCulledDraws = std::max(maxCulledDraws, static_cast<std::uint64_t>(culledThisFrame));
+        }
 
         if (measured) {
             const auto exitTime = std::chrono::steady_clock::now();
             cpuTimes.push_back(std::chrono::duration<float, std::milli>(exitTime - entryTime).count());
+            drainTimes.push_back(renderer.lastDrainWaitMs());   // M5.4 (this frame's beginFrame)
+            presentTimes.push_back(app.lastPresentMs());        // M5.4 (previous frame's swap)
             if (renderer.gpuTimingActive() && renderer.lastGpuFrameMs() >= 0.0f) {
                 gpuTimes.push_back(renderer.lastGpuFrameMs());
             }
@@ -1829,6 +2193,7 @@ int main(int argc, char** argv) {
                             screenshotPath.c_str(), fbw, fbh);
             } else {
                 std::fprintf(stderr, "[Sandbox] screenshot capture failed.\n");
+                outputExitCode = 1;
             }
             app.window().requestClose();
         }
@@ -1853,32 +2218,109 @@ int main(int argc, char** argv) {
         summarize(framePeriods, fAvg, fMin, f95);
         summarize(cpuTimes, cAvg, cMin, c95);
         summarize(gpuTimes, gAvg, gMin, g95);
+
+        // M5.4 decomposition: the legacy "cpu ms" (callback wall time)
+        // conflates real submit work with any driver wait inside GL calls.
+        // Steady-state identity: frame period = submit + gpu-wait + present
+        // + loop, where
+        //   submit   = cpu - drain   (app + driver GL submit work)
+        //   gpu-wait = drain         (timer readback wait in beginFrame; ~0 by design)
+        //   present  = SwapBuffers   (previous frame's swap; 1-frame-offset series)
+        //   loop     = poll + run overhead
+        // Per-frame alignment: framePeriods[k] = entry_k - entry_{k-1} spans
+        // cpu[k-1] + present[k-1] + poll_k (poll runs before entry_k), and
+        // presentTimes[k] already holds present_{k-1} -- so the loop term
+        // pairs with the PREVIOUS cpu sample. The first measured frame has
+        // no previous sample and is skipped.
+        std::vector<float> submitTimes, loopTimes;
+        const std::size_t kDecomp = std::min(cpuTimes.size(),
+                                     std::min(drainTimes.size(),
+                                     std::min(presentTimes.size(), framePeriods.size())));
+        submitTimes.reserve(kDecomp);
+        loopTimes.reserve(kDecomp > 0 ? kDecomp - 1 : 0);
+        for (std::size_t k = 0; k < kDecomp; ++k) {
+            submitTimes.push_back(std::max(0.0f, cpuTimes[k] - drainTimes[k]));
+            if (k > 0) {
+                loopTimes.push_back(std::max(0.0f,
+                    framePeriods[k] - cpuTimes[k - 1] - presentTimes[k]));
+            }
+        }
+        double sAvg, sMin, s95, dAvg, dMin, d95, pAvg, pMin, p95, lAvg, lMin, l95;
+        summarize(submitTimes, sAvg, sMin, s95);
+        summarize(drainTimes, dAvg, dMin, d95);
+        summarize(presentTimes, pAvg, pMin, p95);
+        summarize(loopTimes, lAvg, lMin, l95);
+
         const engine::RenderStats& st = renderer.stats();
         const std::uint32_t lightCount = (cornellVariant >= 0)
             ? cornell.def->lightCount : static_cast<std::uint32_t>(kOrbitLightCount);
 
-        char lines[16][160];   // M4.0.7: shadow line; M5.3: +culling line
+        char lines[32][1024];   // M4.0.7: shadow line; M5.3: +culling; M5.4: +decomposition
         int n = 0;
-        std::snprintf(lines[n++], 160, "=== benchmark report ===");
-        std::snprintf(lines[n++], 160, "standard: %s", cornellVariant >= 0 ? cornell::kStandard : "n/a (demo scene)");
-        std::snprintf(lines[n++], 160, "scene: %s", sceneName.c_str());
-        std::snprintf(lines[n++], 160, "resolution: %dx%d  vsync: %s", fbw, fbh, benchMode ? "off" : "on");
-        std::snprintf(lines[n++], 160, "frames: %d (warmup %d discarded)", benchmarkFrames, warmupFrames);
+        std::snprintf(lines[n++], sizeof(lines[0]), "=== benchmark report ===");
+        std::snprintf(lines[n++], sizeof(lines[0]), "gi: %s  surface-res: %d  rays/update: %d  history: %d  auxiliary passes/frame: %d",
+                      giActive ? "realtime one-bounce diffuse" : "off",giResolution,giRays,giHistory,giActive ? 1 : 0);
+        std::snprintf(lines[n++], sizeof(lines[0]), "gpu-timing requested: %s (--gpu-timing 0 disables query overhead)",gpuTiming ? "on" : "off");
+        std::snprintf(lines[n++], sizeof(lines[0]), "standard: %s", cornellVariant >= 0 ? cornell::kStandard : "n/a (demo scene)");
+        std::snprintf(lines[n++], sizeof(lines[0]), "scene: %s", sceneName.c_str());
+        std::snprintf(lines[n++], sizeof(lines[0]), "resolution: %dx%d  vsync: %s  msaa: %d%s", fbw, fbh,
+                      benchMode ? "off" : "on", msaaSamples,
+                      (cornellVariant >= 0 && msaaSamples != 4) ? " (ablation, not frozen standard)" : "");
+        std::snprintf(lines[n++], sizeof(lines[0]), "frames: %d (warmup %d discarded)", benchmarkFrames, warmupFrames);
         if (fAvg >= 0.0) {
-            std::snprintf(lines[n++], 160, "fps avg: %.1f", 1000.0 / fAvg);
-            std::snprintf(lines[n++], 160, "frame ms: avg %.3f  min %.3f  p95 %.3f", fAvg, fMin, f95);
+            std::snprintf(lines[n++], sizeof(lines[0]), "fps avg: %.1f", 1000.0 / fAvg);
+            std::snprintf(lines[n++], sizeof(lines[0]), "frame ms: avg %.3f  min %.3f  p95 %.3f", fAvg, fMin, f95);
         } else {
-            std::snprintf(lines[n++], 160, "fps avg: n/a (no frames measured)");
+            std::snprintf(lines[n++], sizeof(lines[0]), "fps avg: n/a (no frames measured)");
         }
         if (cAvg >= 0.0) {
-            std::snprintf(lines[n++], 160, "cpu ms: avg %.3f  min %.3f  p95 %.3f", cAvg, cMin, c95);
+            std::snprintf(lines[n++], sizeof(lines[0]), "cpu ms: avg %.3f  min %.3f  p95 %.3f (callback wall time, includes driver calls)", cAvg, cMin, c95);
         }
         if (gAvg >= 0.0) {
-            std::snprintf(lines[n++], 160, "gpu ms: avg %.3f  min %.3f  p95 %.3f (timer query)", gAvg, gMin, g95);
+            std::snprintf(lines[n++], sizeof(lines[0]), "gpu ms: avg %.3f  min %.3f  p95 %.3f (timer query)", gAvg, gMin, g95);
         } else {
-            std::snprintf(lines[n++], 160, "gpu ms: n/a (timer query unavailable or disabled)");
+            std::snprintf(lines[n++], sizeof(lines[0]), "gpu ms: n/a (timer query unavailable or disabled)");
         }
-        std::snprintf(lines[n++], 160, "draw calls: %llu  triangles: %llu  lights: %u",
+        // M5.4: where the frame actually goes (sums to the frame average).
+        if (sAvg >= 0.0) {
+            std::snprintf(lines[n++], sizeof(lines[0]),
+                          "submit ms: avg %.3f  min %.3f  p95 %.3f (app + driver GL submit work)",
+                          sAvg, sMin, s95);
+            std::snprintf(lines[n++], sizeof(lines[0]),
+                          "timer-section ms: avg %.3f  min %.3f  p95 %.3f (poll/read/error/begin combined; not isolated GPU wait)",
+                          dAvg, dMin, d95);
+            std::snprintf(lines[n++], sizeof(lines[0]),
+                          "present ms: avg %.3f  min %.3f  p95 %.3f (SwapBuffers, 1-frame-offset)",
+                          pAvg, pMin, p95);
+            if (lAvg >= 0.0) {
+                std::snprintf(lines[n++], sizeof(lines[0]),
+                              "loop ms: avg %.3f  min %.3f  p95 %.3f (event poll + run overhead)",
+                              lAvg, lMin, l95);
+            }
+            std::snprintf(lines[n++], sizeof(lines[0]),
+                          "budget: submit %.3f + timer-section %.3f + present %.3f + loop %.3f = %.3f  (frame %.3f)",
+                          sAvg, dAvg, pAvg, (lAvg >= 0.0 ? lAvg : 0.0),
+                          sAvg + dAvg + pAvg + (lAvg >= 0.0 ? lAvg : 0.0), fAvg);
+        }
+        if (renderer.gpuTimingActive()) {
+            std::snprintf(lines[n++], sizeof(lines[0]),
+                          "gpu timer: ring 64  samples %llu  overflow skips %llu",
+                          static_cast<unsigned long long>(renderer.timerSamplesCollected()),
+                          static_cast<unsigned long long>(renderer.timerOverflowSkips()));
+        }
+        if (gAvg > 0.0 && sAvg > 0.0) {
+            std::snprintf(lines[n++], sizeof(lines[0]),
+                          "ceiling: gpu %.0f fps (1000/gpu ms)  submit %.0f fps (1000/submit ms)",
+                          1000.0 / gAvg, 1000.0 / sAvg);
+            const char* verdict =
+                (gAvg >= sAvg)
+                    ? "GPU work / driver pacing dominant; verify with --gpu-timing 0"
+                    : (pAvg > sAvg)
+                        ? "present-queue bound -- SwapBuffers driver wait dominates"
+                        : "CPU-submit bound -- app/driver submission work dominates";
+            std::snprintf(lines[n++], sizeof(lines[0]), "verdict: %s", verdict);
+        }
+        std::snprintf(lines[n++], sizeof(lines[0]), "draw calls: %llu  triangles: %llu  lights: %u",
                       static_cast<unsigned long long>(st.drawCalls),
                       static_cast<unsigned long long>(st.triangles), lightCount);
         // M5.3: culling ledger (avg over the measured frames; the frozen
@@ -1889,36 +2331,40 @@ int main(int argc, char** argv) {
                 ? 0.0
                 : static_cast<double>(totalCulledDraws) /
                   static_cast<double>(framePeriods.size());
-            std::snprintf(lines[n++], 160,
+            std::snprintf(lines[n++], sizeof(lines[0]),
                           "culling: %s  culled draws/frame: avg %.1f  max %llu",
                           cullEnabled ? "on (frustum aabb, conservative)" : "off (--cull 0)",
                           avgCulled,
                           static_cast<unsigned long long>(maxCulledDraws));
         }
-        std::snprintf(lines[n++], 160, "exposure: %.2f (fixed)  vram: not reported (no core GL query)",
+        std::snprintf(lines[n++], sizeof(lines[0]), "exposure: %.2f (fixed)  vram: not reported (no core GL query)",
                       cornellVariant >= 0 ? static_cast<double>(cornell::kExposure) : 1.0);
-        std::snprintf(lines[n++], 160, "shadows: %s",
+        std::snprintf(lines[n++], sizeof(lines[0]), "shadows: %s",
                       (cornellVariant < 0) ? "n/a (demo scene)"
                       : (!shadowsEnabled) ? "off (--no-shadows: M3.3 direct-only)"
-                      : shadowsActive ? "on (heightfield march, field verified + registered)"
+                      : shadowsActive ? ((areaLight == 1 && areaFast == 1)
+                                             ? "on (PPC projected-polygon area visibility)"
+                                             : "on (verified heightfield / analytic validation path)")
                                       : "off (capture failed, verify or registration FAILED)");
         if (cornellVariant >= 0 && shadowsEnabled && shadowsActive) {
             if (areaLight == 1) {
-                // M5.0 mode line: the transport replaced the grid entirely.
-                std::snprintf(lines[n++], 160,
-                              "shadow mode: area light backprojection (M5.0)  "
+                std::snprintf(lines[n++], sizeof(lines[0]),
+                              "shadow mode: area light %s  "
                               "Le: %.2f  patch: %.2f x %.2f m  "
                               "occluders: %d box(es) + %d sphere(s)  "
-                              "march: none (analytic, 0 taps)",
+                              "%s",
+                              areaFast ? "PPC projected polygon coverage" : "exact backprojection (validation)",
                               cornell::kEmitterRadiance,
                               cornell::kEmitterMax[0] - cornell::kEmitterMin[0],
                               cornell::kEmitterMax[2] - cornell::kEmitterMin[2],
                               cornell.occluders.boxCount,
-                              cornell.occluders.sphereCount);
+                              cornell.occluders.sphereCount,
+                              areaFast ? "analytic box projection + emitter clip/union, no march/sampling"
+                                       : "exact polygon solver, no march");
             } else if (shadowCentroid == 1) {
                 // M4.0.9 mode line (replaces the M4.0.7 penumbra line; the
                 // legacy line prints verbatim under --shadow-centroid 0).
-                std::snprintf(lines[n++], 160,
+                std::snprintf(lines[n++], sizeof(lines[0]),
                               "shadow mode: centroid march (M4.0.9.1)  "
                               "light size: %.3f m (%s)  march step: %.3f m%s  "
                               "refine: %s  jitter: %s  lateral: %s",
@@ -1938,7 +2384,7 @@ int main(int argc, char** argv) {
                                   ? "analytic half-plane (M4.0.9.1)"
                                   : "off (M4.0.9 A/B)");
             } else {
-                std::snprintf(lines[n++], 160,
+                std::snprintf(lines[n++], sizeof(lines[0]),
                               "shadow penumbra: %.4f (%s)  march step: %.3f m%s  "
                               "refine: %s  jitter: %s",
                               shadowPenumbra,
@@ -1954,7 +2400,7 @@ int main(int argc, char** argv) {
             }
         }
         if (shadowDebugMode > 0) {
-            std::snprintf(lines[n++], 160, "shadow-debug: %s (M4.0.5 instrument -- NOT a ledger image)",
+            std::snprintf(lines[n++], sizeof(lines[0]), "shadow-debug: %s (M4.0.5 instrument -- NOT a ledger image)",
                           shadowDebugMode == 1 ? "vis" : shadowDebugMode == 2 ? "field" : "uv");
         }
 
@@ -1963,19 +2409,28 @@ int main(int argc, char** argv) {
             std::printf("%s\n", lines[i]);
         }
         if (!reportPath.empty()) {
-            FILE* f = std::fopen(reportPath.c_str(), "w");
+            FILE* f = ensureParentDirectory(reportPath)
+                ? std::fopen(reportPath.c_str(), "w")
+                : nullptr;
             if (f != nullptr) {
+                bool ok = true;
                 for (int i = 0; i < n; ++i) {
-                    std::fprintf(f, "%s\n", lines[i]);
+                    if (std::fprintf(f, "%s\n", lines[i]) < 0) ok = false;
                 }
-                std::fclose(f);
-                std::printf("[Sandbox] report written: %s\n", reportPath.c_str());
+                if (std::fclose(f) != 0) ok = false;
+                if (ok) {
+                    std::printf("[Sandbox] report written: %s\n", reportPath.c_str());
+                } else {
+                    std::fprintf(stderr, "[Sandbox] failed writing report '%s'\n", reportPath.c_str());
+                    outputExitCode = 1;
+                }
             } else {
                 std::fprintf(stderr, "[Sandbox] cannot write report '%s'\n", reportPath.c_str());
+                outputExitCode = 1;
             }
         }
     }
 
     // shaders/meshes destroyed here, BEFORE `app` (and its GL context).
-    return 0;
+    return outputExitCode;
 }

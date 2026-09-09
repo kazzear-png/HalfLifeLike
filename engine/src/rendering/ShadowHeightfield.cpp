@@ -54,7 +54,10 @@ ShadowHeightfield::~ShadowHeightfield() {
 bool ShadowHeightfield::create(unsigned resolution, float minY, float maxY) {
     destroy();
 
-    if (resolution == 0 || minY >= maxY) {
+    if (resolution == 0 ||
+        !std::isfinite(minY) ||
+        !std::isfinite(maxY) ||
+        minY >= maxY) {
         std::fprintf(stderr, "[ShadowHeightfield] invalid create parameters.\n");
         return false;
     }
@@ -69,12 +72,39 @@ bool ShadowHeightfield::create(unsigned resolution, float minY, float maxY) {
     m_uModel    = gl::GetUniformLocation(m_program.nativeHandle(), "uModel");
 
     // --- two R16F height textures + FBOs (filterable in core 3.3) ----------
+    // M5.5 leak fix: targets are built under LOCAL ownership and only
+    // transferred to the members after BOTH completed. The old failure path
+    // called destroy() while the half-built GL names still lived only in the
+    // locals -- destroy() had nothing to delete, so every failed create()
+    // leaked one texture + FBO + depth renderbuffer. Local cleanup (not the
+    // member-based destroy()) owns every early return below.
     struct Target { gl::GLuint fbo; gl::GLuint tex; gl::GLuint depth; };
     Target targets[2] = { {0, 0, 0}, {0, 0, 0} };
 
+    auto destroyTarget = [](Target& t) {
+        if (t.depth != 0) { gl::DeleteRenderbuffers(1, &t.depth); t.depth = 0; }
+        if (t.tex   != 0) { gl::DeleteTextures(1, &t.tex);       t.tex   = 0; }
+        if (t.fbo   != 0) { gl::DeleteFramebuffers(1, &t.fbo);   t.fbo   = 0; }
+    };
+
+    auto cleanupTargets = [&]() {
+        destroyTarget(targets[0]);
+        destroyTarget(targets[1]);
+        gl::BindFramebuffer(gl::Framebuffer, 0);
+        gl::BindRenderbuffer(gl::Renderbuffer, 0);
+        gl::BindTexture(gl::Texture2D, 0);
+    };
+
     for (int i = 0; i < 2; ++i) {
         Target& t = targets[i];
+
         gl::GenTextures(1, &t.tex);
+        if (t.tex == 0) {
+            std::fprintf(stderr, "[ShadowHeightfield] failed to create texture %d\n", i);
+            cleanupTargets();
+            destroy();
+            return false;
+        }
         gl::BindTexture(gl::Texture2D, t.tex);
         gl::TexImage2D(gl::Texture2D, 0, gl::R16F,
                        static_cast<gl::GLsizei>(resolution), static_cast<gl::GLsizei>(resolution),
@@ -86,10 +116,22 @@ bool ShadowHeightfield::create(unsigned resolution, float minY, float maxY) {
         gl::BindTexture(gl::Texture2D, 0);
 
         gl::GenFramebuffers(1, &t.fbo);
+        if (t.fbo == 0) {
+            std::fprintf(stderr, "[ShadowHeightfield] failed to create framebuffer %d\n", i);
+            cleanupTargets();
+            destroy();
+            return false;
+        }
         gl::BindFramebuffer(gl::Framebuffer, t.fbo);
         gl::FramebufferTexture2D(gl::Framebuffer, gl::ColorAttachment0, gl::Texture2D, t.tex, 0);
 
         gl::GenRenderbuffers(1, &t.depth);
+        if (t.depth == 0) {
+            std::fprintf(stderr, "[ShadowHeightfield] failed to create depth buffer %d\n", i);
+            cleanupTargets();
+            destroy();
+            return false;
+        }
         gl::BindRenderbuffer(gl::Renderbuffer, t.depth);
         gl::RenderbufferStorage(gl::Renderbuffer, gl::DepthComponent24,
                                 static_cast<gl::GLsizei>(resolution), static_cast<gl::GLsizei>(resolution));
@@ -101,13 +143,19 @@ bool ShadowHeightfield::create(unsigned resolution, float minY, float maxY) {
         if (status != gl::FramebufferComplete) {
             std::fprintf(stderr, "[ShadowHeightfield] target %d incomplete (0x%04x) at %ux%u\n",
                          i, status, resolution, resolution);
+            cleanupTargets();
             destroy();
             return false;
         }
     }
 
+    // Transfer ownership only after both targets succeeded: from here on the
+    // members delete everything through destroy()/the destructor.
     m_maxFbo = targets[0].fbo; m_maxTex = targets[0].tex; m_maxDepthRb = targets[0].depth;
     m_minFbo = targets[1].fbo; m_minTex = targets[1].tex; m_minDepthRb = targets[1].depth;
+    targets[0] = Target{0, 0, 0};   // locals no longer own these names
+    targets[1] = Target{0, 0, 0};
+
     m_resolution = resolution;
     m_minY = minY;
     m_maxY = maxY;
@@ -124,7 +172,12 @@ void ShadowHeightfield::destroy() {
     if (m_minTex != 0)     { gl::DeleteTextures(1, &m_minTex);          m_minTex = 0; }
     if (m_minFbo != 0)     { gl::DeleteFramebuffers(1, &m_minFbo);      m_minFbo = 0; }
     m_resolution = 0;
-    // m_program releases its own GL program through the Shader destructor.
+    // M5.5: release the capture program too (move-assigning a default Shader
+    // deletes the old program). A failed create() now leaves the object fully
+    // clean instead of a live program + stale uniform locations.
+    m_program = Shader{};
+    m_uViewProj = -1;
+    m_uModel    = -1;
 }
 
 bool ShadowHeightfield::verifyField(float expectedTopM, float coverageLoPct,
@@ -240,13 +293,31 @@ bool ShadowHeightfield::worldToTexel(float x, float z,
                                      float minZ, float maxZ,
                                      unsigned resolution,
                                      float* outCol, float* outRow) {
-    if (resolution == 0 || maxX <= minX || maxZ <= minZ) {
+    if (outCol == nullptr || outRow == nullptr) {
+        return false;
+    }
+    if (resolution == 0 ||
+        !std::isfinite(x) || !std::isfinite(z) ||
+        !std::isfinite(minX) || !std::isfinite(maxX) ||
+        !std::isfinite(minZ) || !std::isfinite(maxZ) ||
+        maxX <= minX || maxZ <= minZ) {
         return false;
     }
     // Same formula as the GLSL march: uv = (world.xz - footprintMin) / span,
     // texture v = 0 at minZ. ReadPixels row 0 is the framebuffer bottom,
     // which the capture projection puts at world minZ (y_ndc = -1), so the
     // row index and the texture v agree -- no flip anywhere in the chain.
+    //
+    // NOTE on the returned scale (M5.5): this is the CONTINUOUS texel
+    // coordinate uv * res, i.e. the exact CPU twin of the march's
+    // texture(uv) sample (texel i spans [i/res, (i+1)/res)). It deliberately
+    // does NOT clamp to 0..res-1: the closed footprint can yield exactly
+    // res at the max boundary, which is a valid continuous coordinate but
+    // an out-of-range ARRAY index -- consumers converting to integer
+    // indices must clamp (runFieldRegistrationProbes does). Pinned by
+    // bench_tests ("maxX -> continuous column res", texel-center round
+    // trip i+0.5) -- changing the scale here would desynchronize every CPU
+    // diagnostic from the shader.
     const float u = (x - minX) / (maxX - minX);
     const float v = (z - minZ) / (maxZ - minZ);
     if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {

@@ -1,0 +1,7 @@
+cornell01 6 bounces: exact match; CPU median 995.04 -> 873.55 ms (1.14x)
+cornell01 direct: exact match; CPU median 100.34 -> 80.46 ms (1.25x)
+cornell02 6 bounces: exact match; CPU median 748.18 -> 711.23 ms (1.05x)
+cornell02 direct: exact match; CPU median 114.54 -> 99.20 ms (1.15x)
+cornell03 6 bounces: exact match; CPU median 594.86 -> 525.42 ms (1.13x)
+cornell03 direct: exact match; CPU median 86.21 -> 87.96 ms (0.98x)
+110 exact comparison cases passed.

@@ -51,6 +51,9 @@ void main()
 
 inline const char* kPbrFragment = R"GLSL(
 #version 330 core
+#ifndef AREA_FAST_BUILD
+#define AREA_FAST_BUILD 1
+#endif
 
 in vec3 vWorldPos;
 in vec3 vNormal;
@@ -228,7 +231,7 @@ uniform vec4  uEmitterHalf;         // (hx, hz, pad, pad): emitter patch
 // self-shadow, matching the heightfield's own-column semantics).
 // --area-light 0 reproduces the M4.0.9.1 transport bit-for-bit (all replay
 // pins live under it).
-uniform int   uAreaOn;              // 1 = M5.0 area-light transport (default)
+uniform int   uAreaOn;              // 1 = area-light transport enabled
 uniform vec3  uAreaCenter;          // emitter patch center on the plane
 uniform float uAreaLe;              // emitted radiance L_e (frozen 12.0)
 
@@ -786,6 +789,412 @@ float shadowVisibilityCentroid(vec3 receiverPos, vec3 lightPos)
     return vis;
 }
 
+
+#if AREA_FAST_BUILD
+// ---------------------------------------------------------------------------
+// M5.7 PPC -- Projected Polygon Coverage area-shadow solver.
+//
+// This is a geometry solver, not a low-sample shadow approximation:
+//   1. Back-project each box's vertical slab through the receiver onto the
+//      emitter plane (8 points: top/bottom cap x 4 XZ corners).
+//   2. Build the convex footprint (<= 8 vertices).
+//   3. Clip that footprint to the rectangular emitter.
+//   4. Measure covered emitter area with the shoelace formula.
+//   5. For the first two boxes (the frozen Cornell rig), compute their exact
+//      convex-polygon overlap and apply inclusion/exclusion so overlap is not
+//      double-counted.
+//
+// Result: continuous contact hardening and penumbra width from projective
+// geometry, with no texture march, no blocker sampling grid, no Arvo loop,
+// and no visible-region piece decomposition.  Sphere-only scenes retain a
+// small 9-ray fallback until a projected conic-area path is added.
+// ---------------------------------------------------------------------------
+
+vec3 shadeLight(vec3 N, vec3 V, vec3 L, vec3 radiance,
+                vec3 albedo, float alpha, vec3 f0, float metalness);
+
+const int kPpcPolyCap = 24;
+
+float ppcCross(vec2 a, vec2 b, vec2 c)
+{
+    vec2 ab = b - a;
+    vec2 ac = c - a;
+    return ab.x * ac.y - ab.y * ac.x;
+}
+
+float ppcArea(vec2 poly[kPpcPolyCap], int n)
+{
+    if (n < 3) return 0.0;
+    float twice = 0.0;
+    for (int i = 0; i < kPpcPolyCap; ++i) {
+        if (i >= n) break;
+        int j = (i + 1 == n) ? 0 : i + 1;
+        twice += poly[i].x * poly[j].y - poly[i].y * poly[j].x;
+    }
+    return 0.5 * abs(twice);
+}
+
+int ppcHull(inout vec2 pts[kPpcPolyCap], int n,
+            out vec2 hull[kPpcPolyCap])
+{
+    // n is at most eight for a box.  Insertion sort is smaller/faster than
+    // carrying the M5.0 generic 33-point hull machinery in this shader.
+    for (int i = 1; i < 8; ++i) {
+        if (i >= n) break;
+        vec2 v = pts[i];
+        int j = i - 1;
+        for (int k = 0; k < 8; ++k) {
+            if (j < 0) break;
+            bool after = pts[j].x > v.x ||
+                         (pts[j].x == v.x && pts[j].y > v.y);
+            if (!after) break;
+            pts[j + 1] = pts[j];
+            --j;
+        }
+        pts[j + 1] = v;
+    }
+
+    vec2 uniq[kPpcPolyCap];
+    int m = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (i >= n) break;
+        if (m == 0 || any(notEqual(pts[i], uniq[m - 1]))) {
+            uniq[m++] = pts[i];
+        }
+    }
+    if (m < 3) {
+        for (int i = 0; i < kPpcPolyCap; ++i) {
+            if (i >= m) break;
+            hull[i] = uniq[i];
+        }
+        return m;
+    }
+
+    vec2 lower[kPpcPolyCap];
+    int ln = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (i >= m) break;
+        for (int guard = 0; guard < 8; ++guard) {
+            if (ln < 2) break;
+            if (ppcCross(lower[ln - 2], lower[ln - 1], uniq[i]) > 1e-7)
+                break;
+            --ln;
+        }
+        lower[ln++] = uniq[i];
+    }
+
+    vec2 upper[kPpcPolyCap];
+    int un = 0;
+    for (int ii = 0; ii < 8; ++ii) {
+        int i = m - 1 - ii;
+        if (i < 0) break;
+        for (int guard = 0; guard < 8; ++guard) {
+            if (un < 2) break;
+            if (ppcCross(upper[un - 2], upper[un - 1], uniq[i]) > 1e-7)
+                break;
+            --un;
+        }
+        upper[un++] = uniq[i];
+    }
+
+    int hn = 0;
+    for (int i = 0; i < kPpcPolyCap; ++i) {
+        if (i >= ln - 1) break;
+        hull[hn++] = lower[i];
+    }
+    for (int i = 0; i < kPpcPolyCap; ++i) {
+        if (i >= un - 1) break;
+        hull[hn++] = upper[i];
+    }
+    return hn;
+}
+
+int ppcClipEmitter(inout vec2 poly[kPpcPolyCap], int n)
+{
+    vec2 lo = uAreaCenter.xz - uEmitterHalf.xy;
+    vec2 hi = uAreaCenter.xz + uEmitterHalf.xy;
+
+    // Sutherland-Hodgman against the four axis-aligned emitter planes.
+    for (int pass = 0; pass < 4; ++pass) {
+        if (n < 3) return 0;
+        vec2 outP[kPpcPolyCap];
+        int on = 0;
+        for (int i = 0; i < kPpcPolyCap; ++i) {
+            if (i >= n) break;
+            int j = (i + 1 == n) ? 0 : i + 1;
+            vec2 a = poly[i];
+            vec2 b = poly[j];
+
+            float fa;
+            float fb;
+            if (pass == 0) { fa = a.x - lo.x; fb = b.x - lo.x; }
+            else if (pass == 1) { fa = hi.x - a.x; fb = hi.x - b.x; }
+            else if (pass == 2) { fa = a.y - lo.y; fb = b.y - lo.y; }
+            else { fa = hi.y - a.y; fb = hi.y - b.y; }
+
+            bool ina = fa >= 0.0;
+            bool inb = fb >= 0.0;
+            if (ina && on < kPpcPolyCap) outP[on++] = a;
+            if (ina != inb && on < kPpcPolyCap) {
+                float t = fa / (fa - fb);
+                outP[on++] = mix(a, b, t);
+            }
+        }
+        n = on;
+        for (int i = 0; i < kPpcPolyCap; ++i) {
+            if (i >= n) break;
+            poly[i] = outP[i];
+        }
+    }
+    return n;
+}
+
+int ppcBoxFootprint(vec3 P, vec4 bmin4, vec4 bmax4,
+                    out vec2 poly[kPpcPolyCap])
+{
+    // Uniform packing is (minX, minZ, minY, pad)/(maxX,maxZ,maxY,pad).
+    float yLo = max(bmin4.z, P.y + uShadowBias);
+    float yHi = min(bmax4.z, uAreaCenter.y - uShadowBias);
+    if (yLo >= yHi || yHi <= P.y + uShadowBias) return 0;
+
+    // If the receiver belongs to this solid, exclude self shadow.
+    if (P.x >= bmin4.x - uShadowBias && P.x <= bmax4.x + uShadowBias &&
+        P.z >= bmin4.y - uShadowBias && P.z <= bmax4.y + uShadowBias &&
+        P.y >= bmin4.z - uShadowBias && P.y <= bmax4.z + uShadowBias) {
+        return 0;
+    }
+
+    float planeDy = uAreaCenter.y - P.y;
+    float mInner = planeDy / max(yHi - P.y, 1e-5);
+    float mOuter = planeDy / max(yLo - P.y, 1e-5);
+    // Extremely near-contact bottom caps project toward infinity.  We only
+    // care about the finite emitter, so a large finite clamp is equivalent
+    // after emitter clipping and avoids INF/NaN on floor receivers.
+    mOuter = min(mOuter, 4096.0);
+
+    // Exact broad phase: before building/sorting the 8-point hull, compute
+    // the projected footprint's axis-aligned bounds.  Projection is affine
+    // for each fixed cap scale and both scales are positive, so extrema occur
+    // at the two box X/Z bounds and at mInner/mOuter.  If this AABB misses the
+    // emitter rectangle, the convex footprint cannot possibly clip into it.
+    // This skips the expensive hull + four S-H clipping passes for the large
+    // majority of receiver/occluder pairs that cannot cast onto the light.
+    float px0 = P.x + mInner * (bmin4.x - P.x);
+    float px1 = P.x + mInner * (bmax4.x - P.x);
+    float px2 = P.x + mOuter * (bmin4.x - P.x);
+    float px3 = P.x + mOuter * (bmax4.x - P.x);
+    float pz0 = P.z + mInner * (bmin4.y - P.z);
+    float pz1 = P.z + mInner * (bmax4.y - P.z);
+    float pz2 = P.z + mOuter * (bmin4.y - P.z);
+    float pz3 = P.z + mOuter * (bmax4.y - P.z);
+    vec2 projMin = vec2(min(min(px0, px1), min(px2, px3)),
+                        min(min(pz0, pz1), min(pz2, pz3)));
+    vec2 projMax = vec2(max(max(px0, px1), max(px2, px3)),
+                        max(max(pz0, pz1), max(pz2, pz3)));
+    vec2 emitterMin = uAreaCenter.xz - uEmitterHalf.xy;
+    vec2 emitterMax = uAreaCenter.xz + uEmitterHalf.xy;
+    if (projMax.x < emitterMin.x || projMin.x > emitterMax.x ||
+        projMax.y < emitterMin.y || projMin.y > emitterMax.y) {
+        return 0;
+    }
+
+    vec2 c0 = vec2(bmin4.x, bmin4.y);
+    vec2 c1 = vec2(bmax4.x, bmin4.y);
+    vec2 c2 = vec2(bmax4.x, bmax4.y);
+    vec2 c3 = vec2(bmin4.x, bmax4.y);
+    vec2 pts[kPpcPolyCap];
+    pts[0] = P.xz + mInner * (c0 - P.xz);
+    pts[1] = P.xz + mOuter * (c0 - P.xz);
+    pts[2] = P.xz + mInner * (c1 - P.xz);
+    pts[3] = P.xz + mOuter * (c1 - P.xz);
+    pts[4] = P.xz + mInner * (c2 - P.xz);
+    pts[5] = P.xz + mOuter * (c2 - P.xz);
+    pts[6] = P.xz + mInner * (c3 - P.xz);
+    pts[7] = P.xz + mOuter * (c3 - P.xz);
+
+    int n = ppcHull(pts, 8, poly);
+    if (n < 3) return 0;
+    return ppcClipEmitter(poly, n);
+}
+
+int ppcIntersectConvex(vec2 subject[kPpcPolyCap], int sn,
+                       vec2 clipper[kPpcPolyCap], int cn,
+                       out vec2 result[kPpcPolyCap])
+{
+    if (sn < 3 || cn < 3) return 0;
+
+    vec2 work[kPpcPolyCap];
+    int wn = sn;
+    for (int i = 0; i < kPpcPolyCap; ++i) {
+        if (i >= sn) break;
+        work[i] = subject[i];
+    }
+
+    // ppcHull emits CCW polygons. Keep the left side of every clip edge.
+    for (int e = 0; e < kPpcPolyCap; ++e) {
+        if (e >= cn || wn < 3) break;
+        int en = (e + 1 == cn) ? 0 : e + 1;
+        vec2 ca = clipper[e];
+        vec2 cb = clipper[en];
+
+        vec2 outP[kPpcPolyCap];
+        int on = 0;
+        for (int i = 0; i < kPpcPolyCap; ++i) {
+            if (i >= wn) break;
+            int j = (i + 1 == wn) ? 0 : i + 1;
+            vec2 a = work[i];
+            vec2 b = work[j];
+            float fa = ppcCross(ca, cb, a);
+            float fb = ppcCross(ca, cb, b);
+            bool ina = fa >= -1e-7;
+            bool inb = fb >= -1e-7;
+            if (ina && on < kPpcPolyCap) outP[on++] = a;
+            if (ina != inb && on < kPpcPolyCap) {
+                float t = fa / (fa - fb);
+                outP[on++] = mix(a, b, t);
+            }
+        }
+        wn = on;
+        for (int i = 0; i < kPpcPolyCap; ++i) {
+            if (i >= wn) break;
+            work[i] = outP[i];
+        }
+    }
+
+    for (int i = 0; i < kPpcPolyCap; ++i) {
+        if (i >= wn) break;
+        result[i] = work[i];
+    }
+    return wn;
+}
+
+bool ppcSegmentHitsSphere(vec3 P, vec3 Q, vec4 sph)
+{
+    vec3 pc = P - sph.xyz;
+    float selfR = sph.w + uShadowBias;
+    if (dot(pc, pc) <= selfR * selfR) return false;
+    vec3 d = Q - P;
+    float a = dot(d, d);
+    if (a <= 1e-12) return false;
+    float b = dot(pc, d);
+    float c = dot(pc, pc) - sph.w * sph.w;
+    float disc = b * b - a * c;
+    if (disc <= 0.0) return false;
+    float t = (-b - sqrt(disc)) / a;
+    return t > 1e-4 && t < 1.0 - 1e-4;
+}
+
+float ppcSphereVisibility(vec3 P)
+{
+    if (uShadowSphereCount <= 0) return 1.0;
+    // Sphere fallback only. Boxes never use this sampling path.
+    vec2 o[9] = vec2[9](
+        vec2( 0.0,  0.0),
+        vec2(-1.0, -1.0), vec2( 1.0, -1.0),
+        vec2( 1.0,  1.0), vec2(-1.0,  1.0),
+        vec2( 0.0, -1.0), vec2( 1.0,  0.0),
+        vec2( 0.0,  1.0), vec2(-1.0,  0.0));
+    float clear = 0.0;
+    for (int r = 0; r < 9; ++r) {
+        vec3 Q = vec3(uAreaCenter.x + o[r].x * uEmitterHalf.x,
+                      uAreaCenter.y,
+                      uAreaCenter.z + o[r].y * uEmitterHalf.y);
+        bool hit = false;
+        for (int s = 0; s < 4; ++s) {
+            if (s >= uShadowSphereCount) break;
+            if (ppcSegmentHitsSphere(P, Q, uShadowSphere[s])) {
+                hit = true;
+                break;
+            }
+        }
+        clear += hit ? 0.0 : 1.0;
+    }
+    return clear / 9.0;
+}
+
+float ppcAreaVisibility(vec3 P)
+{
+    float emitterArea = max(4.0 * uEmitterHalf.x * uEmitterHalf.y, 1e-6);
+
+    vec2 p0[kPpcPolyCap];
+    vec2 p1[kPpcPolyCap];
+    int n0 = 0;
+    int n1 = 0;
+    float blocked = 0.0;
+
+    if (uShadowBoxCount > 0) {
+        n0 = ppcBoxFootprint(P, uShadowBoxMin[0], uShadowBoxMax[0], p0);
+        blocked += ppcArea(p0, n0);
+        // Union coverage can only increase as more blockers are added.  Once
+        // one clipped footprint covers the whole emitter, later boxes/spheres
+        // cannot restore visibility, so skip all remaining solver work.
+        if (blocked >= emitterArea - 1e-6) return 0.0;
+    }
+    if (uShadowBoxCount > 1) {
+        n1 = ppcBoxFootprint(P, uShadowBoxMin[1], uShadowBoxMax[1], p1);
+        blocked += ppcArea(p1, n1);
+        if (n0 >= 3 && n1 >= 3) {
+            // Exact overlap broad phase.  If clipped polygon AABBs are
+            // disjoint, their convex intersection is empty and the costly
+            // polygon-vs-polygon Sutherland-Hodgman pass is unnecessary.
+            vec2 min0 = p0[0], max0 = p0[0];
+            vec2 min1 = p1[0], max1 = p1[0];
+            for (int i = 1; i < kPpcPolyCap; ++i) {
+                if (i < n0) { min0 = min(min0, p0[i]); max0 = max(max0, p0[i]); }
+                if (i < n1) { min1 = min(min1, p1[i]); max1 = max(max1, p1[i]); }
+                if (i >= n0 && i >= n1) break;
+            }
+            bool aabbOverlap = !(max0.x < min1.x || max1.x < min0.x ||
+                                 max0.y < min1.y || max1.y < min0.y);
+            if (aabbOverlap) {
+                vec2 overlap[kPpcPolyCap];
+                int no = ppcIntersectConvex(p0, n0, p1, n1, overlap);
+                blocked -= ppcArea(overlap, no);
+            }
+        }
+        if (blocked >= emitterArea - 1e-6) return 0.0;
+    }
+
+    // Extra boxes are uncommon outside the frozen Cornell benchmark. Add
+    // their exact individual footprint areas; clamp prevents invalid energy.
+    // (Pairwise/3-way union can be added if a future scene needs >2 boxes.)
+    for (int b = 2; b < 4; ++b) {
+        if (b >= uShadowBoxCount) break;
+        vec2 pb[kPpcPolyCap];
+        int nb = ppcBoxFootprint(P, uShadowBoxMin[b], uShadowBoxMax[b], pb);
+        blocked += ppcArea(pb, nb);
+    }
+
+    float boxVis = 1.0 - clamp(blocked / emitterArea, 0.0, 1.0);
+    // Avoid the sphere fallback entirely for pixels already fully blocked by
+    // boxes, and avoid its call overhead in the common box-only Cornell rig.
+    if (boxVis <= 0.0) return 0.0;
+    if (uShadowSphereCount <= 0) return boxVis;
+    return clamp(boxVis * ppcSphereVisibility(P), 0.0, 1.0);
+}
+
+vec3 shadeFastArea(vec3 P, vec3 N, vec3 V,
+                   vec3 albedo, float alpha, vec3 f0, float metalness)
+{
+    vec3 toLight = uAreaCenter - P;
+    float dist2 = max(dot(toLight, toLight), 1e-5);
+    float dist = sqrt(dist2);
+    vec3 L = toLight / dist;
+    if (dot(N, L) <= 0.0 || L.y <= 0.0) return vec3(0.0);
+
+    float vis = ppcAreaVisibility(P);
+    if (vis <= 0.0) return vec3(0.0);
+
+    float emitterArea = 4.0 * uEmitterHalf.x * uEmitterHalf.y;
+    // One-sided emitter faces -Y. Reject its back side before expensive visibility.
+    float emitterCos = max(L.y, 0.0);
+    vec3 radiance = vec3(uAreaLe * emitterArea * emitterCos * vis / dist2);
+    return shadeLight(N, V, L, radiance, albedo, alpha, f0, metalness);
+}
+
+#endif // AREA_FAST_BUILD
+
+#if !AREA_FAST_BUILD
 // ===========================================================================
 // M5.0 area-light transport -- GLSL mirror of engine/src/rendering/AreaLight.h
 // (constants, formulas, and evaluation order identical; the float64 reference
@@ -1477,6 +1886,8 @@ float areaLightVisibility(vec3 P, vec3 N, out float kRect)
     return clamp(k, 0.0, kRect);   // visibility can only remove light
 }
 
+#endif // !AREA_FAST_BUILD
+
 // Single-light Cook-Torrance evaluation. radiance = color * intensity * falloff.
 vec3 shadeLight(vec3 N, vec3 V, vec3 L, vec3 radiance,
                 vec3 albedo, float alpha, vec3 f0, float metalness)
@@ -1581,6 +1992,11 @@ void main()
 
     // --- sun (directional, no falloff) ---
     vec3 color = ambient;
+#if SURFACE_GI_BUILD
+    // Cache is incoming indirect irradiance/pi; apply the receiver material
+    // exactly once. Direct emitter light is not part of the cache.
+    color += kD * albedo * giLookup(vWorldPos, N);
+#endif
     color += shadeLight(N, V, uSunDirection, uSunColor * uSunIntensity,
                         albedo, alpha, f0, uMetalness);
 
@@ -1595,6 +2011,14 @@ void main()
     // backprojection visibility + representative-point specular). The legacy
     // branch below is untouched, so --area-light 0 reproduces the M4.0.9.1
     // transport bit-for-bit and every replay pin lives under it.
+#if AREA_FAST_BUILD
+    if (uAreaOn == 1 && uShadowOn == 1) {
+        color += shadeFastArea(vWorldPos, N, V, albedo, alpha, f0, uMetalness);
+        if (uShadowDebug != 0) {
+            g_dbgMinVis = min(g_dbgMinVis, ppcAreaVisibility(vWorldPos));
+        }
+    }
+#else
     if (uAreaOn == 1 && uShadowOn == 1) {
         float kRect = 0.0;
         float kVis  = 0.0;
@@ -1641,39 +2065,41 @@ void main()
                 g_dbgMinVis = min(g_dbgMinVis, kVis / kRect);   // instrument
             }
         }
-    } else {
-    float rigVis     = 1.0;
-    bool  rigMarched = false;
-    for (int i = 0; i < 16; ++i) {
-        if (i >= uPointCount) break;
-        vec3  toLight = uPointPos[i] - vWorldPos;
-        float dist    = length(toLight);
-        vec3  L       = toLight / max(dist, 1e-4);
-        if (dot(N, L) <= 0.0) {
-            continue;
-        }
-        float vis = 1.0;
-        if (uShadowOn == 1) {
-            if (uShadowCentroid == 1) {
-                if (!rigMarched) {
-                    rigVis = shadowVisibilityCentroid(vWorldPos,
-                                                      uShadowCentroidPos);
-                    rigMarched = true;
-                }
-                vis = rigVis;
-            } else {
-                vis = shadowVisibility(vWorldPos, uPointPos[i]);
-            }
-        }
-        if (uShadowDebug != 0) {
-            g_dbgMinVis = min(g_dbgMinVis, vis);   // instrument only
-        }
-        if (vis <= 0.0) {
-            continue;
-        }
-        vec3  radiance = uPointRadiance[i] / max(dist * dist, 1e-4);
-        color += shadeLight(N, V, L, radiance, albedo, alpha, f0, uMetalness) * vis;
     }
+#endif
+    else {
+        float rigVis     = 1.0;
+        bool  rigMarched = false;
+        for (int i = 0; i < 16; ++i) {
+            if (i >= uPointCount) break;
+            vec3  toLight = uPointPos[i] - vWorldPos;
+            float dist    = length(toLight);
+            vec3  L       = toLight / max(dist, 1e-4);
+            if (dot(N, L) <= 0.0) {
+                continue;
+            }
+            float vis = 1.0;
+            if (uShadowOn == 1) {
+                if (uShadowCentroid == 1) {
+                    if (!rigMarched) {
+                        rigVis = shadowVisibilityCentroid(vWorldPos,
+                                                          uShadowCentroidPos);
+                        rigMarched = true;
+                    }
+                    vis = rigVis;
+                } else {
+                    vis = shadowVisibility(vWorldPos, uPointPos[i]);
+                }
+            }
+            if (uShadowDebug != 0) {
+                g_dbgMinVis = min(g_dbgMinVis, vis);   // instrument only
+            }
+            if (vis <= 0.0) {
+                continue;
+            }
+            vec3  radiance = uPointRadiance[i] / max(dist * dist, 1e-4);
+            color += shadeLight(N, V, L, radiance, albedo, alpha, f0, uMetalness) * vis;
+        }
     } // end legacy 16-grid transport branch (M4.x, byte-identical)
 
     // --- flashlight (smooth-edged cone on the camera) ---

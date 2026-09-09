@@ -1,0 +1,657 @@
+--- a/sandbox/src/main.cpp
++++ b/sandbox/src/main.cpp
+@@ -297,24 +297,29 @@
+ }
+ 
+ bool writePpm(const std::string& path, const unsigned char* rgba, int width, int height) {
+-    if (!ensureParentDirectory(path)) {
++    if (rgba == nullptr || width <= 0 || height <= 0 || !ensureParentDirectory(path)) {
+         return false;
+     }
++    std::vector<unsigned char> row(static_cast<std::size_t>(width) * 3);
+     FILE* f = std::fopen(path.c_str(), "wb");
+     if (f == nullptr) {
+         std::fprintf(stderr, "[Sandbox] Cannot open '%s' for writing.\n", path.c_str());
+         return false;
+     }
+-    std::fprintf(f, "P6\n%d %d\n255\n", width, height);
+-    // ReadPixels returns bottom-up rows; PPM expects top-down.
+-    for (int y = height - 1; y >= 0; --y) {
++    bool ok = std::fprintf(f, "P6\n%d %d\n255\n", width, height) > 0;
++    // ReadPixels is bottom-up RGBA; pack one top-down RGB row per write.
++    for (int y = height - 1; ok && y >= 0; --y) {
++        const unsigned char* src = rgba + static_cast<std::size_t>(y) * width * 4;
+         for (int x = 0; x < width; ++x) {
+-            const unsigned char* px = rgba + (static_cast<std::size_t>(y) * width + x) * 4;
+-            std::fwrite(px, 1, 3, f);  // drop alpha
+-        }
+-    }
+-    std::fclose(f);
+-    return true;
++            const std::size_t dst = static_cast<std::size_t>(x) * 3;
++            row[dst] = src[0]; row[dst + 1] = src[1]; row[dst + 2] = src[2];
++            src += 4;
++        }
++        ok = std::fwrite(row.data(), 1, row.size(), f) == row.size();
++    }
++    if (std::fclose(f) != 0) ok = false;
++    if (!ok) std::fprintf(stderr, "[Sandbox] Failed writing '%s'.\n", path.c_str());
++    return ok;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -362,6 +367,7 @@
+     const cornell::VariantDef* def = nullptr;
+     std::vector<engine::Mesh>  meshes;        // parallel to def->meshes
+     std::vector<bool>          meshLoaded;
++    std::vector<const cornell::MaterialDef*> meshMaterials;
+     std::vector<engine::Aabb>  meshAabb;      // M5.3: world AABBs (frustum culling)
+     engine::Mesh               emitterQuad;   // unlit emissive draw
+     engine::Aabb               emitterAabb{}; // M5.3: emitter world AABB
+@@ -868,6 +874,7 @@
+     scene.def = cornell::kVariants[variantIndex];
+     scene.meshes.resize(scene.def->meshCount);
+     scene.meshLoaded.assign(scene.def->meshCount, false);
++    scene.meshMaterials.resize(scene.def->meshCount);
+     scene.meshAabb.assign(scene.def->meshCount, engine::Aabb{});
+ 
+     engine::LoadObjOptions opts;
+@@ -876,6 +883,7 @@
+ 
+     bool allOk = true;
+     for (std::uint32_t i = 0; i < scene.def->meshCount; ++i) {
++        scene.meshMaterials[i] = findCornellMaterial(scene.def->meshes[i].material);
+         const char* file = scene.def->meshes[i].file;
+         const std::string path = geoDir + "/" + file;
+         engine::LoadObjResult model = engine::loadOBJ(path, opts);
+@@ -1636,11 +1644,14 @@
+     // M5.3 per-run pacing / upload / culling state --------------------------------
+     bool cornellStaticUploaded = false; // frozen-scene uniforms are up in the program
+     int  lastFbw = -1, lastFbh = -1;    // viewport/aspect change detection
++    engine::Mat4 cachedVp;
++    engine::Frustum cachedFrustum;
+     bool focusSeen = false;             // throttle only after focus was held once
+     std::uint64_t totalCulledDraws = 0; // culling telemetry (report line)
+     std::uint64_t maxCulledDraws  = 0;  // worst frame
+ 
+     std::uint64_t frameIndex = 0;
++    int outputExitCode = 0;
+ 
+     app.run([&](float dt) {
+         engine::Input& in = app.input();
+@@ -1769,14 +1780,23 @@
+ 
+         // --- camera projection (resize-safe) ------------------------------------
+         app.window().getFramebufferSize(fbw, fbh);
+-        const float aspect = fbh > 0 ? static_cast<float>(fbw) / static_cast<float>(fbh) : 1.0f;
+-        if (cornellVariant >= 0) {
+-            camera.setPerspective(cornell::kCameraFovYRadians, aspect,
+-                                  cornell::kCameraNear, cornell::kCameraFar);
+-        } else {
+-            camera.setPerspective(0.7854f /* 45 deg */, aspect, 0.1f, 100.0f);
+-        }
+-        const engine::Mat4 vp = camera.viewProjection();
++        const bool fbResized = (fbw != lastFbw || fbh != lastFbh);
++        if (fbResized) {
++            const float aspect = fbh > 0 ? static_cast<float>(fbw) / static_cast<float>(fbh) : 1.0f;
++            if (cornellVariant >= 0) {
++                camera.setPerspective(cornell::kCameraFovYRadians, aspect,
++                                      cornell::kCameraNear, cornell::kCameraFar);
++            } else {
++                camera.setPerspective(0.7854f /* 45 deg */, aspect, 0.1f, 100.0f);
++            }
++        }
++        // Cornell camera is frozen; the demo camera can move every frame.
++        if (cornellVariant < 0 || fbResized) {
++            cachedVp = camera.viewProjection();
++            cachedFrustum = cullEnabled
++                ? engine::Frustum::fromViewProjection(cachedVp) : engine::Frustum{};
++        }
++        const engine::Mat4& vp = cachedVp;
+ 
+         // M5.3: viewport + HDR targets follow only ACTUAL framebuffer
+         // changes -- glViewport and the resize probe are global-state calls
+@@ -1784,7 +1804,6 @@
+         // re-issuing them is pure redundant driver traffic (and the first
+         // frame after the startup heightfield capture genuinely needs this
+         // re-issue, which lastFbw == -1 guarantees).
+-        const bool fbResized = (fbw != lastFbw || fbh != lastFbh);
+         if (fbResized) {
+             lastFbw = fbw;
+             lastFbh = fbh;
+@@ -1794,11 +1813,9 @@
+             }
+         }
+ 
+-        // M5.3 culling: one frustum per frame from the (possibly new) vp.
+-        // Degenerate when culling is off -- and the degenerate plane set
+-        // rejects nothing, so a runtime flag flip can never hide geometry.
+-        const engine::Frustum frustum = cullEnabled
+-            ? engine::Frustum::fromViewProjection(vp) : engine::Frustum{};
++        // Reuse the frozen frustum; demo movement and resizes refresh it.
++        // The disabled-culling plane set rejects nothing.
++        const engine::Frustum& frustum = cachedFrustum;
+         int culledThisFrame = 0;
+ 
+         // --- frame ---------------------------------------------------------------
+@@ -1960,11 +1977,12 @@
+                 pbrShader.setMat4("uNormalMat", engine::Mat4::identity());
+                 pbrShader.setFloat("uUseVertexColor", 0.0f);
+             }
++            const cornell::MaterialDef* lastMaterial = nullptr;
+             for (std::uint32_t i = 0; i < cornell.def->meshCount; ++i) {
+                 if (!cornell.meshLoaded[i]) {
+                     continue;
+                 }
+-                const cornell::MaterialDef* mat = findCornellMaterial(cornell.def->meshes[i].material);
++                const cornell::MaterialDef* mat = cornell.meshMaterials[i];
+                 if (mat == nullptr) {
+                     continue;
+                 }
+@@ -1979,9 +1997,13 @@
+                     ++culledThisFrame;
+                     continue;
+                 }
+-                pbrShader.setFloat3("uAlbedo", mat->albedo[0], mat->albedo[1], mat->albedo[2]);
+-                pbrShader.setFloat("uRoughness", mat->roughness);
+-                pbrShader.setFloat("uMetalness", mat->metalness);
++                // Only adjacent draws share state; reset tracking each frame.
++                if (mat != lastMaterial) {
++                    pbrShader.setFloat3("uAlbedo", mat->albedo[0], mat->albedo[1], mat->albedo[2]);
++                    pbrShader.setFloat("uRoughness", mat->roughness);
++                    pbrShader.setFloat("uMetalness", mat->metalness);
++                    lastMaterial = mat;
++                }
+                 renderer.drawIndexed(cornell.meshes[i]);
+             }
+ 
+@@ -2007,7 +2029,8 @@
+             // free-fly camera can look away, and a culled object skips BOTH
+             // its uniform traffic and its draw call (conservative test: a
+             // partially-visible object is never dropped).
+-            if (frustum.intersects(floorAabb)) {
++            const bool floorVisible = frustum.intersects(floorAabb);
++            if (floorVisible) {
+                 pbrShader.setMat4("uModel", engine::Mat4::identity());
+                 pbrShader.setMat4("uNormalMat", engine::Mat4::identity());
+                 pbrShader.setFloat3("uAlbedo", 1.0f, 1.0f, 1.0f);
+@@ -2026,6 +2049,12 @@
+             if (frustum.intersects(quadAabbLocal.transformed(quadModel))) {
+                 pbrShader.setMat4("uModel", quadModel);
+                 pbrShader.setMat4("uNormalMat", quadModel.normalMatrix());
++                // Restore shared material only when the floor did not upload it.
++                if (!floorVisible) {
++                    pbrShader.setFloat3("uAlbedo", 1.0f, 1.0f, 1.0f);
++                    pbrShader.setFloat("uMetalness", 0.0f);
++                    pbrShader.setFloat("uUseVertexColor", 1.0f);
++                }
+                 pbrShader.setFloat("uRoughness", 0.30f);
+                 renderer.drawIndexed(quadMesh);
+             } else {
+@@ -2071,8 +2100,10 @@
+         renderer.endFrame();
+ 
+         // M5.3: culling telemetry (report line; avg over measured frames).
+-        totalCulledDraws += static_cast<std::uint64_t>(culledThisFrame);
+-        maxCulledDraws = std::max(maxCulledDraws, static_cast<std::uint64_t>(culledThisFrame));
++        if (measured) {
++            totalCulledDraws += static_cast<std::uint64_t>(culledThisFrame);
++            maxCulledDraws = std::max(maxCulledDraws, static_cast<std::uint64_t>(culledThisFrame));
++        }
+ 
+         if (measured) {
+             const auto exitTime = std::chrono::steady_clock::now();
+@@ -2094,6 +2125,7 @@
+                             screenshotPath.c_str(), fbw, fbh);
+             } else {
+                 std::fprintf(stderr, "[Sandbox] screenshot capture failed.\n");
++                outputExitCode = 1;
+             }
+             app.window().requestClose();
+         }
+@@ -2155,58 +2187,58 @@
+         const std::uint32_t lightCount = (cornellVariant >= 0)
+             ? cornell.def->lightCount : static_cast<std::uint32_t>(kOrbitLightCount);
+ 
+-        char lines[28][160];   // M4.0.7: shadow line; M5.3: +culling; M5.4: +decomposition
++        char lines[28][1024];   // M4.0.7: shadow line; M5.3: +culling; M5.4: +decomposition
+         int n = 0;
+-        std::snprintf(lines[n++], 160, "=== benchmark report ===");
+-        std::snprintf(lines[n++], 160, "standard: %s", cornellVariant >= 0 ? cornell::kStandard : "n/a (demo scene)");
+-        std::snprintf(lines[n++], 160, "scene: %s", sceneName.c_str());
+-        std::snprintf(lines[n++], 160, "resolution: %dx%d  vsync: %s  msaa: %d%s", fbw, fbh,
++        std::snprintf(lines[n++], sizeof(lines[0]), "=== benchmark report ===");
++        std::snprintf(lines[n++], sizeof(lines[0]), "standard: %s", cornellVariant >= 0 ? cornell::kStandard : "n/a (demo scene)");
++        std::snprintf(lines[n++], sizeof(lines[0]), "scene: %s", sceneName.c_str());
++        std::snprintf(lines[n++], sizeof(lines[0]), "resolution: %dx%d  vsync: %s  msaa: %d%s", fbw, fbh,
+                       benchMode ? "off" : "on", msaaSamples,
+                       (cornellVariant >= 0 && msaaSamples != 4) ? " (ablation, not frozen standard)" : "");
+-        std::snprintf(lines[n++], 160, "frames: %d (warmup %d discarded)", benchmarkFrames, warmupFrames);
++        std::snprintf(lines[n++], sizeof(lines[0]), "frames: %d (warmup %d discarded)", benchmarkFrames, warmupFrames);
+         if (fAvg >= 0.0) {
+-            std::snprintf(lines[n++], 160, "fps avg: %.1f", 1000.0 / fAvg);
+-            std::snprintf(lines[n++], 160, "frame ms: avg %.3f  min %.3f  p95 %.3f", fAvg, fMin, f95);
++            std::snprintf(lines[n++], sizeof(lines[0]), "fps avg: %.1f", 1000.0 / fAvg);
++            std::snprintf(lines[n++], sizeof(lines[0]), "frame ms: avg %.3f  min %.3f  p95 %.3f", fAvg, fMin, f95);
+         } else {
+-            std::snprintf(lines[n++], 160, "fps avg: n/a (no frames measured)");
++            std::snprintf(lines[n++], sizeof(lines[0]), "fps avg: n/a (no frames measured)");
+         }
+         if (cAvg >= 0.0) {
+-            std::snprintf(lines[n++], 160, "cpu ms: avg %.3f  min %.3f  p95 %.3f (legacy total: submit + gpu-wait)", cAvg, cMin, c95);
++            std::snprintf(lines[n++], sizeof(lines[0]), "cpu ms: avg %.3f  min %.3f  p95 %.3f (legacy total: submit + gpu-wait)", cAvg, cMin, c95);
+         }
+         if (gAvg >= 0.0) {
+-            std::snprintf(lines[n++], 160, "gpu ms: avg %.3f  min %.3f  p95 %.3f (timer query)", gAvg, gMin, g95);
++            std::snprintf(lines[n++], sizeof(lines[0]), "gpu ms: avg %.3f  min %.3f  p95 %.3f (timer query)", gAvg, gMin, g95);
+         } else {
+-            std::snprintf(lines[n++], 160, "gpu ms: n/a (timer query unavailable or disabled)");
++            std::snprintf(lines[n++], sizeof(lines[0]), "gpu ms: n/a (timer query unavailable or disabled)");
+         }
+         // M5.4: where the frame actually goes (sums to the frame average).
+         if (sAvg >= 0.0) {
+-            std::snprintf(lines[n++], 160,
++            std::snprintf(lines[n++], sizeof(lines[0]),
+                           "submit ms: avg %.3f  min %.3f  p95 %.3f (app + driver GL submit work)",
+                           sAvg, sMin, s95);
+-            std::snprintf(lines[n++], 160,
++            std::snprintf(lines[n++], sizeof(lines[0]),
+                           "gpu-wait ms: avg %.3f  min %.3f  p95 %.3f (timer readback in beginFrame)",
+                           dAvg, dMin, d95);
+-            std::snprintf(lines[n++], 160,
++            std::snprintf(lines[n++], sizeof(lines[0]),
+                           "present ms: avg %.3f  min %.3f  p95 %.3f (SwapBuffers, 1-frame-offset)",
+                           pAvg, pMin, p95);
+             if (lAvg >= 0.0) {
+-                std::snprintf(lines[n++], 160,
++                std::snprintf(lines[n++], sizeof(lines[0]),
+                               "loop ms: avg %.3f  min %.3f  p95 %.3f (event poll + run overhead)",
+                               lAvg, lMin, l95);
+             }
+-            std::snprintf(lines[n++], 160,
++            std::snprintf(lines[n++], sizeof(lines[0]),
+                           "budget: submit %.3f + gpu-wait %.3f + present %.3f + loop %.3f = %.3f  (frame %.3f)",
+                           sAvg, dAvg, pAvg, (lAvg >= 0.0 ? lAvg : 0.0),
+                           sAvg + dAvg + pAvg + (lAvg >= 0.0 ? lAvg : 0.0), fAvg);
+         }
+         if (renderer.gpuTimingActive()) {
+-            std::snprintf(lines[n++], 160,
++            std::snprintf(lines[n++], sizeof(lines[0]),
+                           "gpu timer: ring 64  samples %llu  overflow skips %llu",
+                           static_cast<unsigned long long>(renderer.timerSamplesCollected()),
+                           static_cast<unsigned long long>(renderer.timerOverflowSkips()));
+         }
+         if (gAvg > 0.0 && sAvg > 0.0) {
+-            std::snprintf(lines[n++], 160,
++            std::snprintf(lines[n++], sizeof(lines[0]),
+                           "ceiling: gpu %.0f fps (1000/gpu ms)  submit %.0f fps (1000/submit ms)",
+                           1000.0 / gAvg, 1000.0 / sAvg);
+             const char* verdict =
+@@ -2215,9 +2247,9 @@
+                     : (pAvg > sAvg)
+                         ? "present-queue bound -- SwapBuffers driver wait dominates"
+                         : "CPU-submit bound -- app/driver submission work dominates";
+-            std::snprintf(lines[n++], 160, "verdict: %s", verdict);
+-        }
+-        std::snprintf(lines[n++], 160, "draw calls: %llu  triangles: %llu  lights: %u",
++            std::snprintf(lines[n++], sizeof(lines[0]), "verdict: %s", verdict);
++        }
++        std::snprintf(lines[n++], sizeof(lines[0]), "draw calls: %llu  triangles: %llu  lights: %u",
+                       static_cast<unsigned long long>(st.drawCalls),
+                       static_cast<unsigned long long>(st.triangles), lightCount);
+         // M5.3: culling ledger (avg over the measured frames; the frozen
+@@ -2228,15 +2260,15 @@
+                 ? 0.0
+                 : static_cast<double>(totalCulledDraws) /
+                   static_cast<double>(framePeriods.size());
+-            std::snprintf(lines[n++], 160,
++            std::snprintf(lines[n++], sizeof(lines[0]),
+                           "culling: %s  culled draws/frame: avg %.1f  max %llu",
+                           cullEnabled ? "on (frustum aabb, conservative)" : "off (--cull 0)",
+                           avgCulled,
+                           static_cast<unsigned long long>(maxCulledDraws));
+         }
+-        std::snprintf(lines[n++], 160, "exposure: %.2f (fixed)  vram: not reported (no core GL query)",
++        std::snprintf(lines[n++], sizeof(lines[0]), "exposure: %.2f (fixed)  vram: not reported (no core GL query)",
+                       cornellVariant >= 0 ? static_cast<double>(cornell::kExposure) : 1.0);
+-        std::snprintf(lines[n++], 160, "shadows: %s",
++        std::snprintf(lines[n++], sizeof(lines[0]), "shadows: %s",
+                       (cornellVariant < 0) ? "n/a (demo scene)"
+                       : (!shadowsEnabled) ? "off (--no-shadows: M3.3 direct-only)"
+                       : shadowsActive ? ((areaLight == 1 && areaFast == 1)
+@@ -2245,7 +2277,7 @@
+                                       : "off (capture failed, verify or registration FAILED)");
+         if (cornellVariant >= 0 && shadowsEnabled && shadowsActive) {
+             if (areaLight == 1) {
+-                std::snprintf(lines[n++], 160,
++                std::snprintf(lines[n++], sizeof(lines[0]),
+                               "shadow mode: area light %s  "
+                               "Le: %.2f  patch: %.2f x %.2f m  "
+                               "occluders: %d box(es) + %d sphere(s)  "
+@@ -2261,7 +2293,7 @@
+             } else if (shadowCentroid == 1) {
+                 // M4.0.9 mode line (replaces the M4.0.7 penumbra line; the
+                 // legacy line prints verbatim under --shadow-centroid 0).
+-                std::snprintf(lines[n++], 160,
++                std::snprintf(lines[n++], sizeof(lines[0]),
+                               "shadow mode: centroid march (M4.0.9.1)  "
+                               "light size: %.3f m (%s)  march step: %.3f m%s  "
+                               "refine: %s  jitter: %s  lateral: %s",
+@@ -2281,7 +2313,7 @@
+                                   ? "analytic half-plane (M4.0.9.1)"
+                                   : "off (M4.0.9 A/B)");
+             } else {
+-                std::snprintf(lines[n++], 160,
++                std::snprintf(lines[n++], sizeof(lines[0]),
+                               "shadow penumbra: %.4f (%s)  march step: %.3f m%s  "
+                               "refine: %s  jitter: %s",
+                               shadowPenumbra,
+@@ -2297,7 +2329,7 @@
+             }
+         }
+         if (shadowDebugMode > 0) {
+-            std::snprintf(lines[n++], 160, "shadow-debug: %s (M4.0.5 instrument -- NOT a ledger image)",
++            std::snprintf(lines[n++], sizeof(lines[0]), "shadow-debug: %s (M4.0.5 instrument -- NOT a ledger image)",
+                           shadowDebugMode == 1 ? "vis" : shadowDebugMode == 2 ? "field" : "uv");
+         }
+ 
+@@ -2310,17 +2342,24 @@
+                 ? std::fopen(reportPath.c_str(), "w")
+                 : nullptr;
+             if (f != nullptr) {
++                bool ok = true;
+                 for (int i = 0; i < n; ++i) {
+-                    std::fprintf(f, "%s\n", lines[i]);
++                    if (std::fprintf(f, "%s\n", lines[i]) < 0) ok = false;
+                 }
+-                std::fclose(f);
+-                std::printf("[Sandbox] report written: %s\n", reportPath.c_str());
++                if (std::fclose(f) != 0) ok = false;
++                if (ok) {
++                    std::printf("[Sandbox] report written: %s\n", reportPath.c_str());
++                } else {
++                    std::fprintf(stderr, "[Sandbox] failed writing report '%s'\n", reportPath.c_str());
++                    outputExitCode = 1;
++                }
+             } else {
+                 std::fprintf(stderr, "[Sandbox] cannot write report '%s'\n", reportPath.c_str());
++                outputExitCode = 1;
+             }
+         }
+     }
+ 
+     // shaders/meshes destroyed here, BEFORE `app` (and its GL context).
+-    return 0;
++    return outputExitCode;
+ }
+--- a/tools/reference_pathtracer.py
++++ b/tools/reference_pathtracer.py
+@@ -54,13 +54,14 @@
+         self.metalness = float(metalness)
+         self.is_emitter = False
+ 
+-    def intersect(self, ro, rd):
++    def intersect(self, ro, rd, *, normals=True):
+         """Slab test. Returns (t, normal); t=inf on miss."""
+         n = ro.shape[0]
+         t0 = np.full(n, EPS)
+         t1 = np.full(n, np.inf)
+-        axis = np.full(n, -1, dtype=np.int64)
+-        sign = np.zeros(n, dtype=np.int64)
++        if normals:
++            axis = np.full(n, -1, dtype=np.int64)
++            sign = np.zeros(n, dtype=np.int64)
+         for a in range(3):
+             rd_a = rd[:, a]
+             parallel = np.abs(rd_a) < 1e-12
+@@ -75,14 +76,16 @@
+             tb = np.where(parallel & outside, -np.inf, tb)
+             near = np.minimum(ta, tb)
+             far = np.maximum(ta, tb)
+-            s = (tb < ta).astype(np.int64)          # entering from the max side
+             upd = (near > t0) & (far >= EPS)
+             t0 = np.where(upd, near, t0)
+-            axis = np.where(upd, a, axis)
+-            sign = np.where(upd, s, sign)
++            if normals:
++                axis = np.where(upd, a, axis)
++                sign = np.where(upd, (tb < ta).astype(np.int64), sign)
+             t1 = np.minimum(t1, far)
+         hit = (t0 <= t1) & (t0 > EPS)
+         t = np.where(hit, t0, np.inf)
++        if not normals:
++            return t, None
+         out = np.zeros_like(ro)
+         idx = np.nonzero(hit)[0]
+         if idx.size:
+@@ -100,7 +103,7 @@
+         self.radiance = float(gc.EMITTER["radiance"])
+         self.is_emitter = True
+ 
+-    def intersect(self, ro, rd):
++    def intersect(self, ro, rd, *, normals=True):
+         rd_y = rd[:, 1]
+         t = np.where(np.abs(rd_y) < 1e-12, np.inf,
+                      (self.y - ro[:, 1]) / np.where(np.abs(rd_y) < 1e-12, 1.0, rd_y))
+@@ -109,6 +112,8 @@
+         hit = (t > EPS) & (x >= self.xmin) & (x <= self.xmax) \
+             & (z >= self.zmin) & (z <= self.zmax)
+         t = np.where(hit, t, np.inf)
++        if not normals:
++            return t, None
+         n = np.zeros_like(ro)
+         n[:, 1] = 1.0   # geometric normal +Y; the light emits from the -Y side
+         return t, n
+@@ -123,7 +128,7 @@
+         self.metalness = float(metalness)
+         self.is_emitter = False
+ 
+-    def intersect(self, ro, rd):
++    def intersect(self, ro, rd, *, normals=True):
+         oc = ro - self.c
+         b = np.einsum("ij,ij->i", oc, rd)
+         c = np.einsum("ij,ij->i", oc, oc) - self.r * self.r
+@@ -133,6 +138,8 @@
+         t = -b - sq
+         hit &= t > EPS
+         t = np.where(hit, t, np.inf)
++        if not normals:
++            return t, None
+         n = np.zeros_like(ro)
+         idx = np.nonzero(hit)[0]
+         if idx.size:
+@@ -248,7 +255,7 @@
+         for pi, pr in enumerate(prims):
+             t, nn = pr.intersect(o, d)
+             closer = t < best_t
+-            best_t = np.where(closer, t, best_t)
++            np.copyto(best_t, t, where=closer)
+             best_n[closer] = nn[closer]
+             best_p[closer] = pi
+         hit = np.isfinite(best_t)
+@@ -268,7 +275,7 @@
+         o = ro_all[alive]
+         d = rd_all[alive]
+         t = best_t[keep]
+-        n = best_n[keep].copy()
++        n = best_n[keep]  # Boolean indexing already makes an independent copy.
+         flip = np.einsum("ij,ij->i", n, d) > 0.0
+         n[flip] = -n[flip]
+         p = o + t[:, None] * d
+@@ -296,7 +303,7 @@
+         for pi, pr in enumerate(prims):
+             if pr.is_emitter:
+                 continue
+-            t_s, _ = pr.intersect(soff, wl)
++            t_s, _ = pr.intersect(soff, wl, normals=False)
+             vis &= ~(np.isfinite(t_s) & (t_s < smax))
+         ok = (nol > 0.0) & (cos_e > 0.0) & vis
+         if ok.any():
+--- a/tools/glsl_validate.py
++++ b/tools/glsl_validate.py
+@@ -5,7 +5,7 @@
+ # script extracts every R"GLSL(...)GLSL" shader string from the sources below
+ # and compiles it with the standalone Khronos glslangValidator (no GPU needed).
+ #
+-# Usage: python3 scripts/glsl_validate.py [repo_root]
++# Usage: python3 tools/glsl_validate.py [repo_root]
+ # Exit 0 = all shaders compile; 1 = any compile error (print verbatim).
+ import os, re, shutil, subprocess, sys, tempfile
+ 
+@@ -51,17 +51,20 @@
+ 
+ def main() -> int:
+     root = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
++    if not shutil.which(GLSLANG):
++        print("[FAIL] glslangValidator is unavailable; install it or set GLSLANG.", file=sys.stderr)
++        return 1
+     failures = 0
+     checked = 0
+     with tempfile.TemporaryDirectory() as td:
+         for rel in SOURCES:
+             path = os.path.join(root, rel)
+             if not os.path.isfile(path):
+-                print(f"[SKIP] missing {rel}")
++                print(f"[FAIL] missing {rel}")
++                failures += 1
+                 continue
+             text = open(path, "r", encoding="utf-8").read()
+             for m in BLOCK_RE.finditer(text):
+-                checked += 1
+                 name, body = m.group(1), m.group(2)
+                 # GLSL requires #version on the FIRST line of the string after
+                 # the raw-string opener; files store it on the next line, so
+@@ -69,17 +72,30 @@
+                 # AND keep line numbers identical to the driver's view.
+                 body = body[1:] if body.startswith("\n") else body
+                 stage = stage_of(name, body)
+-                sp = os.path.join(td, f"{name}.{stage}")
+-                open(sp, "w", encoding="utf-8").write(body)
+-                r = subprocess.run([GLSLANG, sp], capture_output=True, text=True)
+-                ok = r.returncode == 0
+-                status = "PASS" if ok else "FAIL"
+-                print(f"[{status}] {rel} :: {name} ({stage})")
+-                if not ok:
+-                    failures += 1
+-                    err = (r.stderr or r.stdout or "").strip()
+-                    for line in err.splitlines():
+-                        print("      " + line)
++                # The application specializes PBR at runtime. Compile BOTH
++                # branches: the default macro alone misses the exact-area path.
++                variants = [(name, body)]
++                if name == "kPbrFragment":
++                    first, rest = body.split("\n", 1)
++                    variants = [(f"{name}_area{mode}",
++                                 first + f"\n#define AREA_FAST_BUILD {mode}\n" + rest)
++                                for mode in (0, 1)]
++                for label, source in variants:
++                    checked += 1
++                    sp = os.path.join(td, f"{label}.{stage}")
++                    with open(sp, "w", encoding="utf-8") as shader_file:
++                        shader_file.write(source)
++                    r = subprocess.run([GLSLANG, sp], capture_output=True, text=True)
++                    ok = r.returncode == 0
++                    status = "PASS" if ok else "FAIL"
++                    print(f"[{status}] {rel} :: {label} ({stage})")
++                    if not ok:
++                        failures += 1
++                        for line in (r.stdout + r.stderr).strip().splitlines():
++                            print("      " + line)
++    if checked == 0:
++        failures += 1
++        print("[FAIL] no shaders found")
+     print(f"--- {checked} shaders checked, {failures} failed ---")
+     return 1 if failures else 0
+ 
+--- a/engine/src/assets/OBJ.cpp
++++ b/engine/src/assets/OBJ.cpp
+@@ -289,13 +289,17 @@
+     // Raw OBJ pools.
+     std::vector<Vec3> positions;
+     std::vector<Vec3> normals;
+-    std::vector<float> texCoordsUv;  // parsed, ignored
++    bool hasTexCoords = false;  // only presence matters: UVs are not consumed
+ 
+     // Output assembly.
+     std::vector<Vertex>                     outVertices;
+     std::vector<std::uint32_t>              outIndices;
+     std::unordered_map<std::uint64_t, std::uint32_t> dedupe;
+ 
++    // Reuse per-line/per-face scratch instead of allocating for every triangle.
++    std::istringstream stream;
++    std::string tag, token;
++    std::vector<std::array<int, 3>> triangles;
+     std::string line;
+     int lineNo = 0;
+     bool fileHasNormals = false;
+@@ -316,8 +320,8 @@
+         const std::size_t hash = line.find('#');
+         if (hash != std::string::npos) line.erase(hash);
+ 
+-        std::istringstream stream(line);
+-        std::string tag;
++        stream.clear();
++        stream.str(line);
+         if (!(stream >> tag)) continue;
+ 
+         if (tag == "v") {
+@@ -332,10 +336,7 @@
+                 fileHasNormals = true;
+             }
+         } else if (tag == "vt") {
+-            float u = 0.0f, v = 0.0f, w = 0.0f;
+-            stream >> u >> v;  // w optional
+-            texCoordsUv.push_back(u);
+-            texCoordsUv.push_back(v);
++            hasTexCoords = true;
+         } else if (tag == "f") {
+             // Collect the polygon's corners first.
+             struct Corner { int pos; int nrm; bool hasNrm; };
+@@ -343,7 +344,6 @@
+             int cornerCount = 0;
+             bool faceValid = true;
+ 
+-            std::string token;
+             while (stream >> token) {
+                 if (cornerCount >= 64) {  // absurd polygon guard
+                     faceValid = false;
+@@ -387,7 +387,6 @@
+             // NaN normals downstream. Triangle faces emit {0,1,2} --
+             // identical output to the old fan for every shipped asset
+             // (cornell geometry + bundled models are triangle-authored).
+-            std::vector<std::array<int, 3>> triangles;
+             if (!triangulatePolygon(corners, cornerCount, positions, triangles)) {
+                 ++skippedFaces;
+                 continue;
+@@ -454,8 +453,9 @@
+                     const std::uint32_t nIdx = static_cast<std::uint32_t>(nrmIndex);
+                     const std::uint64_t key = cornerKey(static_cast<std::uint32_t>(corner.pos), nIdx);
+ 
+-                    auto it = dedupe.find(key);
+-                    if (it != dedupe.end()) {
++                    const std::uint32_t newIndex = static_cast<std::uint32_t>(outVertices.size());
++                    const auto [it, inserted] = dedupe.try_emplace(key, newIndex);
++                    if (!inserted) {
+                         outIndices.push_back(it->second);
+                         continue;
+                     }
+@@ -467,10 +467,8 @@
+                     out.nx = n.x; out.ny = n.y; out.nz = n.z;
+                     out.r = 1.0f; out.g = 1.0f; out.b = 1.0f;  // white; PBR albedo tints
+ 
+-                    const std::uint32_t newIndex = static_cast<std::uint32_t>(outVertices.size());
+                     outVertices.push_back(out);
+                     outIndices.push_back(newIndex);
+-                    dedupe.emplace(key, newIndex);
+                 }
+             }
+         }
+@@ -488,7 +486,7 @@
+     if (skippedFaces > 0) {
+         warn("skipped " + std::to_string(skippedFaces) + " invalid face(s)");
+     }
+-    if (texCoordsUv.size() > 0) {
++    if (hasTexCoords) {
+         warn("texcoords ignored (texturing lands with the material milestone)");
+     }
+ 

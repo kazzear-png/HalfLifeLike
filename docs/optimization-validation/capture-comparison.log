@@ -1,0 +1,5 @@
+1x1: identical PPM bytes; 3 writes median 3.444 -> 3.416 ms
+7x3: identical PPM bytes; 3 writes median 6.598 -> 28.407 ms
+960x540: identical PPM bytes; 3 writes median 112.722 -> 20.990 ms
+1920x1080: identical PPM bytes; 3 writes median 342.328 -> 32.168 ms
+Write failure (/dev/full) correctly reported.

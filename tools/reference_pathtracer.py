@@ -54,13 +54,14 @@ class AABB:
         self.metalness = float(metalness)
         self.is_emitter = False
 
-    def intersect(self, ro, rd):
+    def intersect(self, ro, rd, *, normals=True):
         """Slab test. Returns (t, normal); t=inf on miss."""
         n = ro.shape[0]
         t0 = np.full(n, EPS)
         t1 = np.full(n, np.inf)
-        axis = np.full(n, -1, dtype=np.int64)
-        sign = np.zeros(n, dtype=np.int64)
+        if normals:
+            axis = np.full(n, -1, dtype=np.int64)
+            sign = np.zeros(n, dtype=np.int64)
         for a in range(3):
             rd_a = rd[:, a]
             parallel = np.abs(rd_a) < 1e-12
@@ -75,14 +76,16 @@ class AABB:
             tb = np.where(parallel & outside, -np.inf, tb)
             near = np.minimum(ta, tb)
             far = np.maximum(ta, tb)
-            s = (tb < ta).astype(np.int64)          # entering from the max side
             upd = (near > t0) & (far >= EPS)
             t0 = np.where(upd, near, t0)
-            axis = np.where(upd, a, axis)
-            sign = np.where(upd, s, sign)
+            if normals:
+                axis = np.where(upd, a, axis)
+                sign = np.where(upd, (tb < ta).astype(np.int64), sign)
             t1 = np.minimum(t1, far)
         hit = (t0 <= t1) & (t0 > EPS)
         t = np.where(hit, t0, np.inf)
+        if not normals:
+            return t, None
         out = np.zeros_like(ro)
         idx = np.nonzero(hit)[0]
         if idx.size:
@@ -100,7 +103,7 @@ class EmitterQuad:
         self.radiance = float(gc.EMITTER["radiance"])
         self.is_emitter = True
 
-    def intersect(self, ro, rd):
+    def intersect(self, ro, rd, *, normals=True):
         rd_y = rd[:, 1]
         t = np.where(np.abs(rd_y) < 1e-12, np.inf,
                      (self.y - ro[:, 1]) / np.where(np.abs(rd_y) < 1e-12, 1.0, rd_y))
@@ -109,6 +112,8 @@ class EmitterQuad:
         hit = (t > EPS) & (x >= self.xmin) & (x <= self.xmax) \
             & (z >= self.zmin) & (z <= self.zmax)
         t = np.where(hit, t, np.inf)
+        if not normals:
+            return t, None
         n = np.zeros_like(ro)
         n[:, 1] = 1.0   # geometric normal +Y; the light emits from the -Y side
         return t, n
@@ -123,7 +128,7 @@ class Sphere:
         self.metalness = float(metalness)
         self.is_emitter = False
 
-    def intersect(self, ro, rd):
+    def intersect(self, ro, rd, *, normals=True):
         oc = ro - self.c
         b = np.einsum("ij,ij->i", oc, rd)
         c = np.einsum("ij,ij->i", oc, oc) - self.r * self.r
@@ -133,6 +138,8 @@ class Sphere:
         t = -b - sq
         hit &= t > EPS
         t = np.where(hit, t, np.inf)
+        if not normals:
+            return t, None
         n = np.zeros_like(ro)
         idx = np.nonzero(hit)[0]
         if idx.size:
@@ -216,10 +223,13 @@ def eval_bsdf(n, v, l, albedo, rough, metal):
 # Path tracing (vectorized over all active paths)
 # ---------------------------------------------------------------------------
 
-def trace(prims, emitter, ro_all, rd_all, rng, bounces):
+def trace(prims, emitter, ro_all, rd_all, rng, bounces, direct_only=False):
     """Radiance for a batch of camera rays. Emission is counted only on
     primary hits (NEE covers every subsequent direct event); the emitter
     surface itself is a black absorber for every non-primary event."""
+    # Own mutable path state; subsequent bounces must advance their rays.
+    ro_all = ro_all.copy()
+    rd_all = rd_all.copy()
     n_all = ro_all.shape[0]
     emitter_idx = next(i for i, p in enumerate(prims) if p.is_emitter)
     # Per-primitive material tables (indexed by prim_idx below). NEVER use a
@@ -248,7 +258,7 @@ def trace(prims, emitter, ro_all, rd_all, rng, bounces):
         for pi, pr in enumerate(prims):
             t, nn = pr.intersect(o, d)
             closer = t < best_t
-            best_t = np.where(closer, t, best_t)
+            np.copyto(best_t, t, where=closer)
             best_n[closer] = nn[closer]
             best_p[closer] = pi
         hit = np.isfinite(best_t)
@@ -261,14 +271,14 @@ def trace(prims, emitter, ro_all, rd_all, rng, bounces):
 
         # Keep surface hits; the emitter surface absorbs everything else
         # (it emits, it does not reflect).
-        keep = hit & (primary | (best_p != emitter_idx))
+        keep = hit & (best_p != emitter_idx)
         alive = alive[keep]
         if alive.size == 0:
             break
         o = ro_all[alive]
         d = rd_all[alive]
         t = best_t[keep]
-        n = best_n[keep].copy()
+        n = best_n[keep]  # Boolean indexing already makes an independent copy.
         flip = np.einsum("ij,ij->i", n, d) > 0.0
         n[flip] = -n[flip]
         p = o + t[:, None] * d
@@ -296,13 +306,19 @@ def trace(prims, emitter, ro_all, rd_all, rng, bounces):
         for pi, pr in enumerate(prims):
             if pr.is_emitter:
                 continue
-            t_s, _ = pr.intersect(soff, wl)
+            t_s, _ = pr.intersect(soff, wl, normals=False)
             vis &= ~(np.isfinite(t_s) & (t_s < smax))
         ok = (nol > 0.0) & (cos_e > 0.0) & vis
         if ok.any():
             f = eval_bsdf(n[ok], -d[ok], wl[ok], albedo[ok], rough[ok], metal[ok])
             g = (nol[ok] * cos_e[ok] / dist2[ok])[:, None]
             rad[alive[ok]] += thr[alive[ok]] * f * (emitter.radiance * emitter.area) * g
+
+        # Direct-only validation mode stops after primary-surface NEE. This is
+        # the apples-to-apples reference for the realtime PPC visibility solver:
+        # true rectangular-emitter sampling + exact visibility, but no GI bounces.
+        if direct_only:
+            break
 
         # --- BSDF-sampled bounce ---
         nov = np.clip(np.einsum("ij,ij->i", n, -d), 1e-4, 1.0)
@@ -360,12 +376,16 @@ def trace(prims, emitter, ro_all, rd_all, rng, bounces):
         pdf_l_spec = d_ggx(noh2, a * a) * noh2 / (4.0 * voh2)
         pdf_l_spec = np.maximum(pdf_l_spec, 1e-12)
 
-        wgt = np.where(
-            pick_spec[:, None],
-            f * (nol_c / (p_spec * pdf_l_spec))[:, None],
-            f * (math.pi / (1.0 - p_spec))[:, None])
-        wgt = np.where((valid & (nol_b > 0.0))[:, None], wgt, 0.0)
+        # The direction was sampled from a MIXTURE. Evaluating the full
+        # BSDF with only the selected component PDF counts overlapping lobes
+        # twice; divide by the complete mixture density instead.
+        pdf = p_spec * pdf_l_spec + (1.0 - p_spec) * (nol_c / math.pi)
+        wgt = f * (nol_c / np.maximum(pdf, 1e-12))[:, None]
+        valid &= nol_b > 0.0
+        wgt = np.where(valid[:, None], wgt, 0.0)
         thr[alive] *= wgt
+        ro_all[alive] = p + n * OFFSET
+        rd_all[alive] = l
 
         # Russian roulette after 3 bounces
         if bounce >= 3:
@@ -519,6 +539,8 @@ def main():
     ap.add_argument("--res", type=int, default=1280)
     ap.add_argument("--spp", type=int, default=96)
     ap.add_argument("--bounces", type=int, default=8)
+    ap.add_argument("--direct-only", action="store_true",
+                    help="primary-surface direct area-light NEE only; no indirect bounces")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", default=None,
                     help="output PPM path (required unless --acc-out is used)")
@@ -564,18 +586,21 @@ def main():
     assert acc.shape == (n, 3), "accumulator shape mismatch: %s vs (%d, 3)" % (acc.shape, n)
 
     total = spp_end - spp_start
-    print("path tracing %s: %dx%d, spp [%d..%d), %d bounces, seed %d" %
-          (args.variant, w, h, spp_start, spp_end, args.bounces, args.seed), flush=True)
+    mode = "direct-only" if args.direct_only else "%d bounces" % args.bounces
+    print("path tracing %s: %dx%d, spp [%d..%d), %s, seed %d" %
+          (args.variant, w, h, spp_start, spp_end, mode, args.seed), flush=True)
     for s in range(spp_start, spp_end):
         # Per-spp stream: deterministic per index, independent of chunking.
         rng = np.random.RandomState(args.seed * 1000003 + s)
         jit = rng.random((n, 2)) - 0.5
         ro, rd = camera_rays(w, h, gc.CAMERA, jit)
-        acc += trace(prims, emitter, ro, rd, rng, args.bounces)
+        acc += trace(prims, emitter, ro, rd, rng, args.bounces, args.direct_only)
         if (s + 1) % 16 == 0:
             print("  spp %d/%d" % (s + 1, spp_end), flush=True)
 
     if args.acc_out:
+        acc_parent = os.path.dirname(os.path.abspath(args.acc_out))
+        os.makedirs(acc_parent, exist_ok=True)
         np.save(args.acc_out, acc)
         print("accumulator written: %s (spp %d..%d)" % (args.acc_out, spp_start, spp_end))
         return
@@ -586,7 +611,8 @@ def main():
     img = acc / divisor
     img = linear_to_srgb(aces_film(img * gc.EXPOSURE))
     img_u8 = (np.clip(img, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8).reshape(h, w, 3)
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    out_parent = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(out_parent, exist_ok=True)
     write_ppm(args.out, img_u8)
     print("wrote %s (%dx%d PPM, normalized by %d spp)" % (args.out, w, h, divisor))
 

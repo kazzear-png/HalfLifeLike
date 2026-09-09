@@ -1,0 +1,10 @@
+^C:\GAME PROJECT\BUILD-VS2026-X64\_DEPS\GLFW-SRC\SRC\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" "-SC:/Game project" "-BC:/Game project/build-vs2026-x64" --check-stamp-file "C:/Game project/build-vs2026-x64/_deps/glfw-build/src/CMakeFiles/generate.stamp"
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

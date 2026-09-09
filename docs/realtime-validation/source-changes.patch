@@ -1,0 +1,1232 @@
+--- a/IMAGE_CAPTURE.md
++++ b/IMAGE_CAPTURE.md
+@@ -1,3 +1,5 @@
++Realtime GI is now on by default in supported Cornell scenes. Allow at least 64 frames for a settled capture. Use `--gi 0` to compare corrected direct lighting. Old screenshots include the previous emitter-angle defect and are not pixel-equality targets. See REALTIME_GI.md.
++
+ # Image capture / PPC validation
+ 
+ The sandbox writes the final post-tonemap framebuffer as binary PPM.
+--- a/OPTIMIZATION_REVIEW.md
++++ b/OPTIMIZATION_REVIEW.md
+@@ -1,3 +1,5 @@
++> Historical report for the preceding CPU-optimization revision. Its unchanged-shader/reference claims describe that revision only. This branch adds lighting and reference-transport corrections; see [REALTIME_GI.md](REALTIME_GI.md).
++
+ # Optimization review
+ 
+ This update removes redundant CPU work and improves capture/report reliability. It preserves the existing shader algorithms, quality settings, scene assets, reference images, and rendering order. It does not claim that every possible optimization is exhausted or that GPU performance has been verified.
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,5 @@
++> **Realtime GI update:** Cornell scenes now enable GPU-updated one-bounce diffuse color bleeding by default. Read [REALTIME_GI.md](REALTIME_GI.md) for controls, the lighting correction, scope, and validation. Use `--gi 0` for corrected direct-only lighting.
++
+ # Engine
+ 
+ A small, dependency-light C++17 3D engine core for Windows, macOS, and Linux.
+--- /dev/null
++++ b/REALTIME_GI.md
+@@ -0,0 +1,90 @@
++# Realtime diffuse transport update
++
++The Cornell solver now adds **one realtime diffuse bounce**. Colored walls can illuminate the boxes and floor. The direct-light emitter-angle defect is corrected. This is an OpenGL 3.3 implementation using GPU shader ray queries over the existing analytic Cornell geometry; it does not use RTX hardware traversal or a baked lighting file.
++
++## Design: shared work, measured cost
++
++The new `engine::DiffuseGI` computes incoming indirect irradiance in a small atlas attached to world-space surfaces. The scene renderer samples that atlas instead of launching secondary rays independently for every screen pixel. Geometry, normals, and materials come from the same loaded Cornell meshes used to draw the scene.
++
++A single intersection routine handles both nearest-surface bounce rays and light-visibility rays. It supports axis-aligned boxes, bounded room planes, and analytic spheres. The estimator samples one diffuse surface interaction followed by the rectangular emitter, with the correct material factors and light-sampling PDF. It mixes emitter-area and cosine-hemisphere sampling near large lights to reduce variance without clipping radiance. Direct emitter hits are excluded from the indirect cache, so the existing direct-light term is not counted twice.
++
++The atlas updates **every rendered frame**. Two GPU textures hold the current estimate and its history. Initial frames use a running average; after the configured history length, updates use an exponential average with weight `1/history`. `setScene()` automatically resets history when geometry or materials change; `setLight()` resets it when the source changes. Camera movement does not require reprojection because the cache lives on surfaces. No cache is saved or loaded from disk.
++
++At the defaults (16×16 interior texels per face, 8 paths per update), Cornell01 has 17 active faces including its two boxes. Including the filtering border, that launches 44,064 bounce paths per frame, each with at most one additional light-visibility ray. Inactive atlas faces exit immediately. Both RGBA16F atlas textures together occupy 497,664 bytes (486 KiB). These are work/memory counts, **not measured RTX 3060 timings**.
++
++The existing PPC direct-light solver remains responsible for detailed direct shadows. Its rect-emitter approximation now includes `max(L.y, 0)` and rejects receivers above the one-sided emitter. The existing exact-area variant remains available. Replacing those direct-shadow algorithms wholesale with the coarse cache would sacrifice detail; this update shares diffuse transport at the surface level while preserving the established direct-shadow path.
++
++## Run and compare
++
++Build the project normally in Release mode. On a single-configuration build:
++
++```sh
++cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
++cmake --build build --config Release
++```
++
++The executable is `build/bin/sandbox` on single-configuration builds, or typically `build/bin/Release/sandbox.exe` with Visual Studio. Example Windows commands from the project root:
++
++```powershell
++# Corrected direct light only
++.\build\bin\Release\sandbox.exe --scene cornell01 --benchmark 1000 --gi 0 --out direct.ppm --report direct.txt
++
++# Realtime color bounce, default quality
++.\build\bin\Release\sandbox.exe --scene cornell01 --benchmark 1000 --gi 1 --out bounce.ppm --report bounce.txt
++
++# Same GI workload with timer queries disabled: checks measurement overhead
++.\build\bin\Release\sandbox.exe --scene cornell01 --benchmark 1000 --gi 1 --gpu-timing 0 --out bounce-no-timer.ppm --report bounce-no-timer.txt
++
++# Higher sampling and surface detail, at additional GPU cost
++.\build\bin\Release\sandbox.exe --scene cornell01 --benchmark 1000 --gi 1 --gi-rays 32 --gi-res 32 --gi-history 64 --out bounce-quality.ppm --report bounce-quality.txt
++```
++
++Repeat for cornell02 and cornell03. Hold scene, resolution, MSAA, exposure, frame count, and compiler settings constant. Use at least 64 frames for ordinary screenshots so startup noise has settled. GI is stochastic but its sequence is deterministic for a fixed execution path/frame count; screenshots from different frame numbers need not be identical.
++
++| Option | Default | Range / meaning |
++|---|---:|---|
++| `--gi` | 1 | 0/1; active for Cornell scenes with shadows and area lighting enabled |
++| `--gi-rays` | 8 | 1–64 paths per active cache texel per frame |
++| `--gi-res` | 16 | 4–64 interior texels per face dimension; cost grows approximately quadratically |
++| `--gi-history` | 32 | 1–128; averaging time constant, with explicit invalidation on edits |
++| `--gpu-timing` | 1 | 0/1; disables only timing queries, preserving benchmark pacing/workload |
++| `--area-fast` | 1 | Existing PPC / exact-area direct-light variant selection |
++
++The benchmark's GPU query encloses the GI update as well as scene drawing and tonemapping. The report lists the extra GI pass separately from mesh draw calls. The old “GPU wait” label has been replaced by “timer-section”: that interval includes polling, result retrieval, error checking and query begin, so it does not isolate a driver wait. The report no longer claims that CPU optimization is exhausted.
++
++## Scope and limitations
++
++- This release handles the analytic Cornell scenes, not arbitrary triangle-mesh GI in the demo. Imported demo models do not silently use their bounding boxes as GI geometry.
++- It adds diffuse-to-diffuse indirect transport. Metals receive no diffuse bounce; indirect glossy reflections, caustics, transmission, and additional bounces are not implemented.
++- The low-resolution cache and finite sample budget can produce visible noise, coarse shading, filtering artifacts near occluder edges, and sphere-face seams. GI-only diagnostics make this particularly visible. Increase rays/history for lower variance and resolution for finer detail, while measuring the extra cost.
++- Analytic spheres approximate the tessellated Cornell sphere meshes. Planes and axis-aligned boxes use their loaded bounds.
++- The frozen scene still has no moving-object editor. The GI API supports invalidating edited scene/light data; a future dynamic scene system must call those setters and also update the direct renderer's corresponding data.
++- No frame-rate guarantee has been established for an RTX 3060. The default controls are a starting point for measurement.
++
++## Reference tracer corrections
++
++The previous multibounce reference loop sampled new directions but never wrote new ray origins/directions back for the next bounce. It repeatedly revisited the initial camera intersection. It also divided full-BSDF contributions by only the selected lobe's PDF instead of the complete mixture PDF, and allowed primary emitter hits to continue shading.
++
++These are corrected in `tools/reference_pathtracer.py`. The tracer now owns mutable path state, advances rays after each bounce, uses the mixture density, and terminates emitter hits after counting primary emission. Existing reference PPMs are preserved as historical assets; they have **not** been silently regenerated and should not be treated as validated multibounce truth for this release. The old `optimization_regression.py` is a historical pre-GI comparator and will intentionally disagree with the corrected multibounce tracer.
++
++## Verification
++
++```sh
++python3 tools/run_cpu_tests.py
++python3 tools/run_cpu_tests.py --sanitize undefined
++python3 tools/reference_transport_tests.py
++python3 tools/benchmark_compare.py --self-test
++python3 tools/glsl_validate.py .
++```
++
++For Linux with installed EGL/OpenGL libraries, a C++17 compiler, NumPy, and Pillow:
++
++```sh
++python3 tools/verify_realtime_gi.py --out gi-validation
++# Optional full PPC + GI test; software-driver execution may be slow:
++python3 tools/verify_realtime_gi.py --full-lighting --width 128 --frames 2 --out full-validation
++```
++
++The default EGL test renders **indirect lighting only** through real engine meshes, HDR targets, and the actual GI update/sampling shaders, so failures can be isolated from the older PPC shader. A black emitter in these diagnostic images is intentional. It compiles all 15 shader variants, renders the three Cornell variants with GI off/on, checks indirect light reaches an otherwise dark box face, and checks a light-off edit clears the previous lighting immediately.
++
++Completed checks: 423 CPU checks (also under UndefinedBehaviorSanitizer), 15 real GLSL shader compilations, all three Cornell indirect-only GL renders, and immediate light-off history reset. Full PPC rendering encountered software-driver limitations, including a link crash also reproduced with the original shader. RTX 3060 performance and full application rendering remain unverified. Validation logs and selected diagnostic images are in `docs/realtime-validation/`. Historical CPU-optimization notes remain in `OPTIMIZATION_REVIEW.md`; their unchanged-pixel claims apply only to that earlier revision, not to the intentional lighting changes here.
+--- /dev/null
++++ b/docs/realtime-validation/RESULTS.md
+@@ -0,0 +1,19 @@
++# Verification results
++
++- All 423 existing CPU checks passed (math 87, frustum 32, OBJ 34, BRDF 38, benchmark 232).
++- The CPU suites also passed with UndefinedBehaviorSanitizer, including linkage of the new GI module.
++- The edited sandbox translation unit and GI implementation compiled with GCC C++17, `-O2 -Wall -Wextra -Wpedantic`, without warnings.
++- All Python tool files passed syntax checks.
++- All 15 assembled shader variants compiled on a headless Mesa OpenGL context: PBR with both area-light solvers and GI off/on, existing utility shaders, and the new GI shaders.
++- Real engine meshes/HDR targets and the actual GI update/sampling shaders rendered all three Cornell scenes at 640×360, with GI off and on. Indirect-only renders used 48 updates, 8 paths per texel, and the default 16×16 cache faces/history 32.
++- The selected previously unlit tall-box face increased from mean display value 0.13 to 16.72 in the indirect-only test.
++- A light-off edit cleared the indirect lighting on the very next update. The resulting image contained only the tonemap's near-black dither (maximum <= 2).
++- Reference tests confirmed ray advancement, preservation of caller input arrays, no repeated lighting on an escaping path, emitter termination, and mixture-PDF energy integration. The image-metric tool's 16 existing self-checks passed.
++
++The included PNGs show **only indirect lighting**, not the final direct+indirect image. Their black emitter and dark overall exposure are intentional. Noise and coarse spatial detail remain visible at this budget, particularly in cornell03.
++
++## Full-renderer and hardware limits
++
++The complete PPC + GI render was attempted with two software-driver paths. The first took excessively long on the initial full-scene draw and was stopped. The second (Mesa softpipe) crashed while linking the PBR shader. A separate test reproduced the same softpipe crash when linking the original, unmodified PBR shader from the uploaded ZIP. These attempts do not establish the final full-renderer result on the target GPU.
++
++The GLFW application was not linked or interactively exercised here. The available compiler checks, assembled GLSL compilation, and real GI integration are narrower than running the complete application on Windows/NVIDIA. RTX 3060 frame times, full direct+GI screenshots, resize/minimize interactions, and quality comparisons against the corrected multibounce reference remain target-machine checks. No FPS improvement or no-regression guarantee is claimed.
+--- a/engine/CMakeLists.txt
++++ b/engine/CMakeLists.txt
+@@ -7,6 +7,7 @@
+     src/platform/Input.cpp
+     src/platform/Window.cpp
+     src/rendering/Camera.cpp
++    src/rendering/DiffuseGI.cpp
+     src/rendering/GL.cpp
+     src/rendering/Mesh.cpp
+     src/rendering/Renderer.cpp
+--- /dev/null
++++ b/engine/src/rendering/DiffuseGI.cpp
+@@ -0,0 +1,345 @@
++#include "rendering/DiffuseGI.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <string>
++
++namespace engine {
++namespace {
++const char* kGiCommon = R"GLSL(
++uniform sampler2D uGiAtlas;
++uniform int uGiResolution;
++uniform int uGiSurface;
++uniform vec4 uGiSurfaceLo;
++uniform vec4 uGiSurfaceHi;
++
++// Face order -X,+X,-Y,+Y,-Z,+Z. Sphere tiles use normalized cube directions.
++vec3 giFaceNormal(int face) {
++    vec3 n = vec3(0.0);
++    n[face / 2] = (face % 2 == 0) ? -1.0 : 1.0;
++    return n;
++}
++vec3 giFaceVector(int face, vec2 uv) {
++    vec3 p = giFaceNormal(face);
++    int axis = face / 2;
++    p[(axis + 1) % 3] = uv.x * 2.0 - 1.0;
++    p[(axis + 2) % 3] = uv.y * 2.0 - 1.0;
++    return p;
++}
++vec3 giSurfacePoint(vec4 lo, vec4 hi, int face, vec2 uv, out vec3 n) {
++    vec3 q = giFaceVector(face, uv);
++    if (lo.w > 0.5) {
++        n = normalize(q);
++        return (lo.xyz + hi.xyz) * 0.5 + n * ((hi.x - lo.x) * 0.5);
++    }
++    n = giFaceNormal(face);
++    return mix(lo.xyz, hi.xyz, q * 0.5 + 0.5);
++}
++vec3 giLookup(vec3 p, vec3 normal) {
++    if (uGiSurface < 0) return vec3(0.0);
++    vec3 n = normal;
++    if (uGiSurfaceLo.w > 0.5)
++        n = normalize(p - (uGiSurfaceLo.xyz + uGiSurfaceHi.xyz) * 0.5);
++    vec3 an = abs(n);
++    int axis = (an.x >= an.y && an.x >= an.z) ? 0 : ((an.y >= an.z) ? 1 : 2);
++    int face = axis * 2 + ((n[axis] >= 0.0) ? 1 : 0);
++    vec2 uv;
++    int a = (axis + 1) % 3, b = (axis + 2) % 3;
++    if (uGiSurfaceLo.w > 0.5) {
++        vec3 q = n / max(abs(n[axis]), 1e-8);
++        uv = vec2(q[a], q[b]) * 0.5 + 0.5;
++    } else {
++        vec3 q = (p - uGiSurfaceLo.xyz) / max(uGiSurfaceHi.xyz - uGiSurfaceLo.xyz, vec3(1e-8));
++        uv = vec2(q[a], q[b]);
++    }
++    float r = float(uGiResolution);
++    float tile = r + 2.0;
++    vec2 pixel = vec2(float(face), float(uGiSurface)) * tile + 1.0 + clamp(uv, 0.0, 1.0) * r;
++    return texture(uGiAtlas, pixel / vec2(textureSize(uGiAtlas, 0))).rgb;
++}
++)GLSL";
++
++const char* kGiVertex = R"GLSL(
++#version 330 core
++void main() {
++    vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
++    gl_Position = vec4(p, 0.0, 1.0);
++}
++)GLSL";
++
++const char* kGiUpdateFragment = R"GLSL(
++#version 330 core
++out vec4 FragColor;
++uniform int uGiCount;
++uniform vec4 uGiLo[16];
++uniform vec4 uGiHi[16];
++uniform vec4 uGiMaterial[16];
++uniform vec4 uGiLight; // center xyz, emitted radiance
++uniform vec4 uGiPatch; // half size x,z
++uniform int uGiRays;
++uniform int uGiFrame;
++uniform float uGiBlend;
++const float giPi = 3.14159265358979323846;
++const float giEpsilon = 0.001;
++
++uint giHash(uint x) {
++    x ^= x >> 16u; x *= 0x7feb352du; x ^= x >> 15u;
++    x *= 0x846ca68bu; x ^= x >> 16u; return x;
++}
++float giRandom(inout uint state) {
++    state = giHash(state + 0x9e3779b9u);
++    return float(state >> 8u) * (1.0 / 16777216.0);
++}
++// One intersection implementation for bounce rays and light visibility rays.
++// Handles parallel rays and zero-thickness room planes without inverse infinities.
++bool giIntersect(int id, vec3 o, vec3 d, out float t, out vec3 n) {
++    vec4 lo = uGiLo[id], hi = uGiHi[id];
++    if (lo.w > 0.5) {
++        vec3 c = (lo.xyz + hi.xyz) * 0.5;
++        float radius = (hi.x - lo.x) * 0.5;
++        vec3 oc = o - c;
++        float b = dot(oc, d), v = dot(oc, oc) - radius * radius;
++        float disc = b * b - v;
++        if (disc < 0.0) return false;
++        float root = sqrt(disc);
++        t = -b - root;
++        if (t <= giEpsilon) t = -b + root;
++        if (t <= giEpsilon) return false;
++        n = normalize(o + t * d - c);
++    } else {
++        float nearT = -1e30, farT = 1e30;
++        vec3 nearN = vec3(0.0), farN = vec3(0.0);
++        for (int a = 0; a < 3; ++a) {
++            if (abs(d[a]) < 1e-8) {
++                if (o[a] < lo[a] || o[a] > hi[a]) return false;
++            } else {
++                float ta = (lo[a] - o[a]) / d[a], tb = (hi[a] - o[a]) / d[a];
++                vec3 entry = vec3(0.0); entry[a] = d[a] > 0.0 ? -1.0 : 1.0;
++                float nt = min(ta, tb), ft = max(ta, tb);
++                if (nt > nearT) { nearT = nt; nearN = entry; }
++                if (ft < farT) { farT = ft; farN = -entry; }
++                if (nearT > farT) return false;
++            }
++        }
++        t = nearT; n = nearN;
++        if (t <= giEpsilon) { t = farT; n = farN; }
++        if (t <= giEpsilon || t >= 1e29) return false;
++    }
++    if (dot(n, d) > 0.0) n = -n;
++    return true;
++}
++int giTrace(vec3 o, vec3 d, float limit, out vec3 point, out vec3 normal) {
++    int found = -1;
++    float best = limit;
++    for (int i = 0; i < uGiCount; ++i) {
++        float t; vec3 n;
++        if (giIntersect(i, o, d, t, n) && t < best) {
++            best = t; normal = n; found = i;
++        }
++    }
++    point = o + best * d;
++    return found;
++}
++bool giOccluded(vec3 o, vec3 d, float limit) {
++    for (int i = 0; i < uGiCount; ++i) {
++        float t; vec3 n;
++        if (giIntersect(i, o, d, t, n) && t < limit) return true;
++    }
++    return false;
++}
++// Direct diffuse radiance leaving a secondary surface. One sample of the
++// rectangular emitter using a complete mixture PDF and exact segment visibility.
++vec3 giDirectDiffuse(int id, vec3 p, vec3 n, vec3 v, inout uint rng) {
++    if (p.y >= uGiLight.y - giEpsilon) return vec3(0.0);
++    float area = 4.0 * uGiPatch.x * uGiPatch.y;
++    vec3 centerRay = uGiLight.xyz - p;
++    float centerD2 = dot(centerRay, centerRay);
++    // Mix area sampling with cosine-hemisphere sampling. Near a large emitter,
++    // pure area sampling has a near-singular 1/r^2 weight and bright outliers.
++    // This adaptive mixture stays unbiased and needs no radiance clamp/blur.
++    float areaProbability = clamp(centerD2 / (centerD2 + area), 0.05, 0.95);
++    float choose = giRandom(rng), u = giRandom(rng), vSample = giRandom(rng);
++    vec3 q, l;
++    float d2;
++    if (choose < areaProbability) {
++        q = uGiLight.xyz + vec3((2.0*u-1.0)*uGiPatch.x,0.0,(2.0*vSample-1.0)*uGiPatch.y);
++        vec3 delta = q - p;
++        d2 = max(dot(delta, delta), 1e-8);
++        l = delta / sqrt(d2);
++    } else {
++        vec3 tangent = normalize(cross(abs(n.y)<0.9 ? vec3(0,1,0) : vec3(1,0,0), n));
++        float phi = 2.0*giPi*vSample, radius = sqrt(u);
++        l = tangent*(radius*cos(phi)) + cross(n,tangent)*(radius*sin(phi)) + n*sqrt(1.0-u);
++        if (l.y <= 1e-8) return vec3(0.0);
++        float t = (uGiLight.y-p.y)/l.y;
++        q = p+t*l;
++        if (abs(q.x-uGiLight.x)>uGiPatch.x || abs(q.z-uGiLight.z)>uGiPatch.y) return vec3(0.0);
++        d2 = t*t;
++    }
++    float cosN = max(dot(n, l), 0.0), cosE = max(l.y, 0.0);
++    if (cosN <= 0.0 || cosE <= 0.0) return vec3(0.0);
++    float pdf = areaProbability * d2 / (area * cosE) + (1.0-areaProbability)*cosN/giPi;
++    // Visibility uses the offset origin's actual segment to the same light point.
++    vec3 origin = p + n * (2.0 * giEpsilon);
++    vec3 shadow = q - origin;
++    float shadowLength = length(shadow);
++    if (giOccluded(origin, shadow / shadowLength, shadowLength - giEpsilon)) return vec3(0.0);
++    vec4 mat = uGiMaterial[id];
++    vec3 f0 = mix(vec3(0.04), mat.rgb, mat.a);
++    vec3 h = l + v;
++    h = dot(h, h) > 1e-8 ? normalize(h) : n;
++    float f = pow(1.0 - clamp(dot(v, h), 0.0, 1.0), 5.0);
++    vec3 kd = (1.0 - (f0 + (1.0 - f0) * f)) * (1.0 - mat.a);
++    return kd * mat.rgb / giPi * (uGiLight.w * cosN / max(pdf, 1e-12));
++}
++void main() {
++    int tile = uGiResolution + 2;
++    ivec2 cell = ivec2(gl_FragCoord.xy);
++    int face = cell.x / tile, id = cell.y / tile;
++    if (id >= uGiCount || uGiLight.w <= 0.0 || (int(uGiHi[id].w) & (1 << face)) == 0) {
++        FragColor = vec4(0.0); return;
++    }
++    vec2 uv = clamp((vec2(cell % tile) - 0.5) / float(uGiResolution), 0.001, 0.999);
++    vec3 n;
++    vec3 p = giSurfacePoint(uGiLo[id], uGiHi[id], face, uv, n);
++    vec3 origin = p + n * (2.0 * giEpsilon);
++    vec3 tangent = normalize(cross(abs(n.y) < 0.9 ? vec3(0,1,0) : vec3(1,0,0), n));
++    vec3 bitangent = cross(n, tangent);
++    uint rng = giHash(uint(cell.x) + uint(cell.y) * 4099u + uint(uGiFrame) * 104729u);
++    vec3 sum = vec3(0.0);
++    for (int s = 0; s < uGiRays; ++s) {
++        float u = giRandom(rng), phi = 2.0 * giPi * giRandom(rng);
++        float r = sqrt(u);
++        vec3 d = tangent * (r * cos(phi)) + bitangent * (r * sin(phi)) + n * sqrt(1.0 - u);
++        vec3 hitP, hitN;
++        int hit = giTrace(origin, d, 100.0, hitP, hitN);
++        // E/pi estimator for cosine-weighted hemisphere samples. The emitter
++        // is excluded from the ray scene: its direct term is already rendered.
++        if (hit >= 0) sum += giDirectDiffuse(hit, hitP, hitN, -d, rng);
++    }
++    vec3 estimate = sum / float(uGiRays);
++    // First frame never reads uninitialized texture memory. Later frames use
++    // a capped averaging time constant; scene/light edits explicitly reset it.
++    if (uGiBlend < 1.0) estimate = mix(texelFetch(uGiAtlas, cell, 0).rgb, estimate, uGiBlend);
++    FragColor = vec4(estimate, 1.0);
++}
++)GLSL";
++}
++
++const char* DiffuseGI::samplingSource() { return kGiCommon; }
++DiffuseGI::~DiffuseGI() { release(); }
++void DiffuseGI::release() {
++    for (int i = 0; i < 2; ++i) {
++        if (m_fbo[i]) gl::DeleteFramebuffers(1, &m_fbo[i]);
++        if (m_texture[i]) gl::DeleteTextures(1, &m_texture[i]);
++        m_fbo[i] = m_texture[i] = 0;
++    }
++    if (m_vao) gl::DeleteVertexArrays(1, &m_vao);
++    m_vao = 0;
++    m_shader = Shader{};
++}
++bool DiffuseGI::init(int resolution, int rays, int history) {
++    if (resolution < 4 || resolution > 64 || rays < 1 || rays > 64 || history < 1 || history > 128) return false;
++    release();
++    m_resolution = resolution; m_rays = rays; m_history = history;
++    std::string source(kGiUpdateFragment);
++    const std::string version = "#version 330 core\n";
++    source.insert(source.find(version) + version.size(), kGiCommon);
++    m_shader = Shader::fromSource(kGiVertex, source.c_str());
++    if (!m_shader.valid()) return false;
++    gl::GenVertexArrays(1, &m_vao);
++    const int tile = resolution + 2;
++    for (int i = 0; i < 2; ++i) {
++        gl::GenTextures(1, &m_texture[i]);
++        gl::BindTexture(gl::Texture2D, m_texture[i]);
++        gl::TexImage2D(gl::Texture2D, 0, gl::RGBA16F, 6 * tile, kMaxSurfaces * tile, 0, gl::RGBA, gl::HalfFloat, nullptr);
++        gl::TexParameteri(gl::Texture2D, gl::TextureMinFilter, gl::Linear);
++        gl::TexParameteri(gl::Texture2D, gl::TextureMagFilter, gl::Linear);
++        gl::TexParameteri(gl::Texture2D, gl::TextureWrapS, gl::ClampToEdge);
++        gl::TexParameteri(gl::Texture2D, gl::TextureWrapT, gl::ClampToEdge);
++        gl::GenFramebuffers(1, &m_fbo[i]);
++        gl::BindFramebuffer(gl::Framebuffer, m_fbo[i]);
++        gl::FramebufferTexture2D(gl::Framebuffer, gl::ColorAttachment0, gl::Texture2D, m_texture[i], 0);
++        if (gl::CheckFramebufferStatus(gl::Framebuffer) != gl::FramebufferComplete) {
++            std::fprintf(stderr, "[GI] Incomplete surface atlas.\n");
++            gl::BindFramebuffer(gl::Framebuffer, 0); release(); return false;
++        }
++    }
++    gl::BindFramebuffer(gl::Framebuffer, 0);
++    gl::BindTexture(gl::Texture2D, 0);
++    resetHistory();
++    return true;
++}
++bool DiffuseGI::setScene(const std::vector<GiSurface>& surfaces) {
++    if (surfaces.size() > kMaxSurfaces) return false;
++    for (const auto& s : surfaces) {
++        for (int a = 0; a < 4; ++a)
++            if (!std::isfinite(s.lo[a]) || !std::isfinite(s.hi[a]) || !std::isfinite(s.material[a])) return false;
++        for (int a = 0; a < 3; ++a)
++            if (s.lo[a] > s.hi[a] || s.material[a] < 0 || s.material[a] > 1) return false;
++        if ((s.lo[3] != 0 && s.lo[3] != 1) || s.hi[3] < 1 || s.hi[3] > 63 ||
++            s.hi[3] != std::floor(s.hi[3]) || s.material[3] < 0 || s.material[3] > 1) return false;
++        if (s.lo[3] == 1 && s.hi[0] <= s.lo[0]) return false;
++    }
++    bool same = surfaces.size() == m_surfaces.size();
++    if (same) for (std::size_t i = 0; i < surfaces.size(); ++i)
++        same = same && surfaces[i].lo == m_surfaces[i].lo && surfaces[i].hi == m_surfaces[i].hi && surfaces[i].material == m_surfaces[i].material;
++    if (!same) { m_surfaces = surfaces; resetHistory(); }
++    return true;
++}
++void DiffuseGI::setLight(const Vec3& center, float hx, float hz, float radiance) {
++    if (!std::isfinite(center.x) || !std::isfinite(center.y) || !std::isfinite(center.z) ||
++        !std::isfinite(hx) || !std::isfinite(hz) || !std::isfinite(radiance) || hx <= 0 || hz <= 0 || radiance < 0) return;
++    std::array<float,4> light{center.x, center.y, center.z, radiance}, patch{hx,hz,0,0};
++    if (light != m_light || patch != m_patch) { m_light = light; m_patch = patch; resetHistory(); }
++}
++void DiffuseGI::resetHistory() { m_frame = m_historyFrames = 0; m_uniformsDirty = true; }
++void DiffuseGI::update() {
++    if (!valid() || m_surfaces.empty()) return;
++    int back = 1 - m_front;
++    gl::BindFramebuffer(gl::Framebuffer, m_fbo[back]);
++    gl::Viewport(0, 0, 6 * (m_resolution + 2), kMaxSurfaces * (m_resolution + 2));
++    gl::Disable(gl::DepthTest);
++    m_shader.bind();
++    if (m_uniformsDirty) {
++        float lo[kMaxSurfaces * 4]{}, hi[kMaxSurfaces * 4]{}, mat[kMaxSurfaces * 4]{};
++        for (std::size_t i = 0; i < m_surfaces.size(); ++i) {
++            std::copy(m_surfaces[i].lo.begin(), m_surfaces[i].lo.end(), lo + i * 4);
++            std::copy(m_surfaces[i].hi.begin(), m_surfaces[i].hi.end(), hi + i * 4);
++            std::copy(m_surfaces[i].material.begin(), m_surfaces[i].material.end(), mat + i * 4);
++        }
++        m_shader.setInt("uGiCount", surfaceCount());
++        m_shader.setInt("uGiResolution", m_resolution);
++        m_shader.setInt("uGiRays", m_rays);
++        m_shader.setInt("uGiAtlas", 2);
++        m_shader.setFloat4Array("uGiLo[0]", lo, surfaceCount());
++        m_shader.setFloat4Array("uGiHi[0]", hi, surfaceCount());
++        m_shader.setFloat4Array("uGiMaterial[0]", mat, surfaceCount());
++        m_shader.setFloat4("uGiLight", m_light[0],m_light[1],m_light[2],m_light[3]);
++        m_shader.setFloat4("uGiPatch", m_patch[0],m_patch[1],0,0);
++        m_uniformsDirty = false;
++    }
++    m_shader.setInt("uGiFrame", static_cast<int>(m_frame));
++    m_shader.setFloat("uGiBlend", 1.0f / static_cast<float>(std::min(m_historyFrames + 1u, static_cast<unsigned>(m_history))));
++    gl::ActiveTexture(gl::Texture0 + 2);
++    gl::BindTexture(gl::Texture2D, m_texture[m_front]);
++    gl::BindVertexArray(m_vao);
++    gl::DrawArrays(gl::Triangles, 0, 3);
++    gl::BindVertexArray(0);
++    gl::Enable(gl::DepthTest);
++    m_front = back;
++    m_frame = (m_frame + 1) % 1048576u;
++    m_historyFrames = std::min(m_historyFrames + 1u, static_cast<unsigned>(m_history));
++}
++void DiffuseGI::bind(Shader& shader, int index, unsigned unit) const {
++    if (!valid() || index < 0 || index >= surfaceCount()) { shader.setInt("uGiSurface", -1); return; }
++    gl::ActiveTexture(gl::Texture0 + unit);
++    gl::BindTexture(gl::Texture2D, m_texture[m_front]);
++    shader.setInt("uGiAtlas", static_cast<int>(unit));
++    shader.setInt("uGiResolution", m_resolution);
++    shader.setInt("uGiSurface", index);
++    const auto& s = m_surfaces[static_cast<std::size_t>(index)];
++    shader.setFloat4("uGiSurfaceLo", s.lo[0],s.lo[1],s.lo[2],s.lo[3]);
++    shader.setFloat4("uGiSurfaceHi", s.hi[0],s.hi[1],s.hi[2],s.hi[3]);
++}
++}
+--- /dev/null
++++ b/engine/src/rendering/DiffuseGI.h
+@@ -0,0 +1,51 @@
++#pragma once
++#include "math/Frustum.h"
++#include "rendering/Shader.h"
++#include <array>
++#include <vector>
++
++namespace engine {
++// Exact AABBs/planes and analytic spheres for the Cornell laboratory. Not a
++// replacement for triangle/BVH traversal in arbitrary imported scenes.
++struct GiSurface {
++    std::array<float, 4> lo{};       // xyz bounds, w: 0 box/plane, 1 sphere
++    std::array<float, 4> hi{};       // xyz bounds, w: six-bit active-face mask
++    std::array<float, 4> material{}; // linear albedo rgb, metalness
++};
++
++// GPU-updated, world-surface diffuse transport cache. Stores incoming
++// irradiance / pi from ONE indirect diffuse bounce; no direct emitter hits,
++// no baked data, no screen-space history, no recursive cache feedback.
++class DiffuseGI {
++public:
++    static constexpr int kMaxSurfaces = 16;
++    DiffuseGI() = default;
++    ~DiffuseGI();
++    DiffuseGI(const DiffuseGI&) = delete;
++    DiffuseGI& operator=(const DiffuseGI&) = delete;
++    bool init(int resolution = 16, int rays = 8, int history = 32);
++    // Scene/light changes invalidate history. Call these when editing either.
++    bool setScene(const std::vector<GiSurface>& surfaces);
++    void setLight(const Vec3& center, float halfX, float halfZ, float radiance);
++    void resetHistory();
++    void update(); // changes FBO/viewport; caller restores its scene target
++    void bind(Shader& target, int surfaceIndex, unsigned textureUnit = 2) const;
++    bool valid() const { return m_fbo[0] != 0 && m_shader.valid(); }
++    int resolution() const { return m_resolution; }
++    int rays() const { return m_rays; }
++    int history() const { return m_history; }
++    int surfaceCount() const { return static_cast<int>(m_surfaces.size()); }
++    // Inject after #version in the scene shader. Also shared by update shader.
++    static const char* samplingSource();
++private:
++    void release();
++    Shader m_shader;
++    gl::GLuint m_fbo[2]{}, m_texture[2]{}, m_vao = 0;
++    int m_resolution = 16, m_rays = 8, m_history = 32, m_front = 0;
++    unsigned m_frame = 0, m_historyFrames = 0;
++    bool m_uniformsDirty = true;
++    std::vector<GiSurface> m_surfaces;
++    std::array<float, 4> m_light{0, 5.49f, 0, 12};
++    std::array<float, 4> m_patch{0.65f, 0.525f, 0, 0};
++};
++}
+--- a/engine/src/rendering/Renderer.cpp
++++ b/engine/src/rendering/Renderer.cpp
+@@ -376,6 +376,11 @@
+     gl::Clear(gl::ColorBufferBit | gl::DepthBufferBit);
+ }
+ 
++void Renderer::bindSceneTarget(int width, int height) {
++    gl::BindFramebuffer(gl::Framebuffer, m_hdrActive ? m_msaaFbo : 0);
++    gl::Viewport(0, 0, width, height);
++}
++
+ void Renderer::drawTonemapPass() {
+     // 1) Resolve multisample scene into the resolve texture.
+     gl::BindFramebuffer(gl::ReadFramebuffer, m_msaaFbo);
+--- a/engine/src/rendering/Renderer.h
++++ b/engine/src/rendering/Renderer.h
+@@ -60,6 +60,8 @@
+ 
+     // Begins a frame (binds + clears the render target, resets per-frame stats).
+     void beginFrame();
++    // Restore scene FBO/viewport after an auxiliary pass, without clearing.
++    void bindSceneTarget(int width, int height);
+ 
+     // Ends a frame: resolve (MSAA -> texture) + tonemap to the backbuffer.
+     void endFrame();
+--- /dev/null
++++ b/engine/tests/gi_gl_tests.cpp
+@@ -0,0 +1,109 @@
++// Headless integration harness used by tools/verify_realtime_gi.py.
++// Uses real engine meshes, shaders, HDR targets and GI code with an EGL context.
++#include "rendering/DiffuseGI.h"
++#include "rendering/Renderer.h"
++#include "rendering/Mesh.h"
++#include "rendering/Camera.h"
++#include "assets/OBJ.h"
++#include "cornell_scene_gen.h"
++#include "shaders.h"
++#include <string>
++#include <cstring>
++#include <cstdio>
++#include <vector>
++
++#ifndef GI_TEST_WIDTH
++#define GI_TEST_WIDTH 640
++#endif
++static constexpr int width = GI_TEST_WIDTH, height = width * 9 / 16;
++
++extern "C" int gi_render_test(engine::gl::ProcAddressFn resolver, const char* geometry,
++                              const char* output, int variant, int frames, int giOn, int darkReset, int giOnly) {
++    using namespace engine;
++    if (!gl::load(resolver)) return 1;
++    Renderer renderer; renderer.init(); renderer.setClearColor(0,0,0,1);
++    if (!renderer.initHDR(width,height,4)) return 2;
++    Camera camera; camera.setPosition(Vec3(0,2.75f,8.35f));
++    camera.setPerspective(cornell::kCameraFovYRadians,static_cast<float>(width)/height,0.1f,100);
++    std::string source = shaders::kPbrFragment;
++    const std::string version = "#version 330 core\n";
++    source.insert(source.find(version)+version.size(),std::string("#define AREA_FAST_BUILD 1\n#define SURFACE_GI_BUILD 1\n")+DiffuseGI::samplingSource());
++    if (giOnly) source = std::string("#version 330 core\n") + DiffuseGI::samplingSource() +
++        "in vec3 vWorldPos; in vec3 vNormal; uniform vec3 uAlbedo; uniform float uMetalness; out vec4 FragColor;\n"
++        "void main(){FragColor=vec4(0.96*(1.0-uMetalness)*uAlbedo*giLookup(vWorldPos,normalize(vNormal)),1.0);}";
++    std::fprintf(stderr,"[GI test] Building scene shader\n");
++    Shader shader = Shader::fromSource(shaders::kPbrVertex,source.c_str());
++    Shader unlit = Shader::fromSource(shaders::kUnlitVertex,shaders::kUnlitFragment);
++    if (!shader.valid() || !unlit.valid()) return 3;
++    std::fprintf(stderr,"[GI test] Scene shader linked\n");
++    const auto* def = cornell::kVariants[variant];
++    std::vector<Mesh> meshes(def->meshCount);
++    std::vector<const cornell::MaterialDef*> materials(def->meshCount,nullptr);
++    std::vector<int> giIndices(def->meshCount,-1);
++    std::vector<GiSurface> surfaces;
++    float boxesLo[16]{},boxesHi[16]{},spheres[16]{};
++    int boxes=0,sphereCount=0,emitter=-1;
++    for (unsigned i=0;i<def->meshCount;++i) {
++        auto model=loadOBJ(std::string(geometry)+"/"+def->meshes[i].file,LoadObjOptions{false,0.0f});
++        if(!model.ok || !meshes[i].create(model.vertices.data(),static_cast<unsigned>(model.vertices.size()),model.indices.data(),static_cast<unsigned>(model.indices.size())))return 4;
++        for(const auto& entry:cornell::kMaterialTable)
++            if(std::strcmp(entry.name,def->meshes[i].material)==0)materials[i]=&entry.def;
++        if(!materials[i]) {emitter=static_cast<int>(i);continue;}
++        Aabb b;b.seed(Vec3(model.vertices[0].x,model.vertices[0].y,model.vertices[0].z));
++        for(const auto& v:model.vertices)b.grow(Vec3(v.x,v.y,v.z));
++        bool sphere=std::strncmp(def->meshes[i].material,"sphere_",7)==0;
++        int mask=63;
++        if(!sphere){
++            float e[3]={b.max.x-b.min.x,b.max.y-b.min.y,b.max.z-b.min.z};
++            float n[3]={model.vertices[0].nx,model.vertices[0].ny,model.vertices[0].nz};
++            for(int a=0;a<3;++a)if(e[a]<1e-6f)mask=1<<(a*2+(n[a]>0?1:0));
++        }
++        GiSurface s;
++        s.lo={b.min.x,b.min.y,b.min.z,sphere?1.0f:0.0f};
++        s.hi={b.max.x,b.max.y,b.max.z,static_cast<float>(mask)};
++        auto* m=materials[i];s.material={m->albedo[0],m->albedo[1],m->albedo[2],m->metalness};
++        giIndices[i]=static_cast<int>(surfaces.size());surfaces.push_back(s);
++        if(sphere){
++            float* a=spheres+4*sphereCount++;a[0]=(b.min.x+b.max.x)*.5f;a[1]=(b.min.y+b.max.y)*.5f;a[2]=(b.min.z+b.max.z)*.5f;a[3]=(b.max.x-b.min.x)*.5f;
++        } else if(std::strncmp(def->meshes[i].material,"block_",6)==0 || std::strcmp(def->meshes[i].material,"baffle")==0){
++            float* a=boxesLo+4*boxes;float* c=boxesHi+4*boxes++;
++            a[0]=b.min.x;a[1]=b.min.z;a[2]=b.min.y;c[0]=b.max.x;c[1]=b.max.z;c[2]=b.max.y;
++        }
++    }
++    DiffuseGI gi;
++    std::fprintf(stderr,"[GI test] Building GI shader\n");
++    if(!gi.setScene(surfaces) || !gi.init(16,8,32))return 5;
++    std::fprintf(stderr,"[GI test] GI shader linked\n");
++    shader.bind();
++    shader.setMat4("uViewProj",camera.viewProjection());shader.setMat4("uModel",Mat4::identity());shader.setMat4("uNormalMat",Mat4::identity());
++    shader.setFloat3("uViewPos",camera.position());shader.setInt("uAreaOn",1);shader.setInt("uShadowOn",1);
++    shader.setFloat3("uAreaCenter",0,5.49f,0);shader.setFloat("uAreaLe",12);shader.setFloat("uShadowBias",.01f);
++    shader.setFloat4("uEmitterHalf",.65f,.525f,0,0);
++    shader.setInt("uShadowBoxCount",boxes);shader.setFloat4Array("uShadowBoxMin[0]",boxesLo,boxes);shader.setFloat4Array("uShadowBoxMax[0]",boxesHi,boxes);
++    shader.setInt("uShadowSphereCount",sphereCount);shader.setFloat4Array("uShadowSphere[0]",spheres,sphereCount);
++    unlit.bind();unlit.setMat4("uViewProj",camera.viewProjection());unlit.setMat4("uModel",Mat4::identity());unlit.setFloat3("uTint",giOnly?0:12,giOnly?0:12,giOnly?0:12);
++    for(int frame=0;frame<frames;++frame){
++        if (frame % 16 == 0) std::fprintf(stderr,"[GI test] frame %d/%d\n",frame,frames);
++        if(darkReset && frame==frames-1){
++            gi.setLight(Vec3(0,5.49f,0),.65f,.525f,0);
++            shader.bind();shader.setFloat("uAreaLe",0);unlit.bind();unlit.setFloat3("uTint",0,0,0);
++        }
++        renderer.setViewport(0,0,width,height);renderer.beginFrame();
++        if(giOn){gi.update();renderer.bindSceneTarget(width,height);}
++        shader.bind();
++        for(unsigned i=0;i<meshes.size();++i){
++            auto* mat=materials[i];if(!mat)continue;
++            shader.setFloat3("uAlbedo",mat->albedo[0],mat->albedo[1],mat->albedo[2]);shader.setFloat("uRoughness",mat->roughness);shader.setFloat("uMetalness",mat->metalness);
++            if(giOn)gi.bind(shader,giIndices[i]);else shader.setInt("uGiSurface",-1);
++            renderer.drawIndexed(meshes[i]);
++        }
++        unlit.bind();if(emitter>=0)renderer.drawIndexed(meshes[emitter]);renderer.endFrame();
++    }
++    std::vector<unsigned char> pixels(width*height*4);
++    if(!renderer.readBackbufferPixels(width,height,pixels.data()))return 6;
++    FILE* f=std::fopen(output,"wb");if(!f)return 7;
++    std::fprintf(f,"P6\n%d %d\n255\n",width,height);
++    for(int y=height-1;y>=0;--y)for(int x=0;x<width;++x)std::fwrite(&pixels[(y*width+x)*4],1,3,f);
++    if(std::fclose(f)!=0)return 8;
++    return gl::GetError()==gl::NoError?0:9;
++}
+--- a/sandbox/src/main.cpp
++++ b/sandbox/src/main.cpp
+@@ -33,6 +33,7 @@
+ #include "math/Mat4.h"
+ #include "math/Vec3.h"
+ #include "rendering/Camera.h"
++#include "rendering/DiffuseGI.h"
+ #include "rendering/Lighting.h"
+ #include "rendering/Mesh.h"
+ #include "rendering/Shader.h"
+@@ -368,6 +369,8 @@
+     std::vector<engine::Mesh>  meshes;        // parallel to def->meshes
+     std::vector<bool>          meshLoaded;
+     std::vector<const cornell::MaterialDef*> meshMaterials;
++    std::vector<engine::GiSurface> giSurfaces;
++    std::vector<int> meshGiIndex;
+     std::vector<engine::Aabb>  meshAabb;      // M5.3: world AABBs (frustum culling)
+     engine::Mesh               emitterQuad;   // unlit emissive draw
+     engine::Aabb               emitterAabb{}; // M5.3: emitter world AABB
+@@ -875,6 +878,8 @@
+     scene.meshes.resize(scene.def->meshCount);
+     scene.meshLoaded.assign(scene.def->meshCount, false);
+     scene.meshMaterials.resize(scene.def->meshCount);
++    scene.meshGiIndex.assign(scene.def->meshCount, -1);
++    scene.giSurfaces.clear();
+     scene.meshAabb.assign(scene.def->meshCount, engine::Aabb{});
+ 
+     engine::LoadObjOptions opts;
+@@ -936,6 +941,23 @@
+                 scene.occluders.boxCount++;
+             }
+         }
++        if (const auto* material = scene.meshMaterials[i]) {
++            engine::GiSurface surface;
++            const auto& b = scene.meshAabb[i];
++            const bool sphere = std::strncmp(scene.def->meshes[i].material, "sphere_", 7) == 0;
++            int mask = 63;
++            if (!sphere) {
++                const float extent[3] = {b.max.x-b.min.x, b.max.y-b.min.y, b.max.z-b.min.z};
++                const float normal[3] = {model.vertices[0].nx,model.vertices[0].ny,model.vertices[0].nz};
++                for (int axis = 0; axis < 3; ++axis)
++                    if (extent[axis] < 1e-6f) mask = 1 << (axis * 2 + (normal[axis] > 0 ? 1 : 0));
++            }
++            surface.lo = {b.min.x,b.min.y,b.min.z,sphere ? 1.0f : 0.0f};
++            surface.hi = {b.max.x,b.max.y,b.max.z,static_cast<float>(mask)};
++            surface.material = {material->albedo[0],material->albedo[1],material->albedo[2],material->metalness};
++            scene.meshGiIndex[i] = static_cast<int>(scene.giSurfaces.size());
++            scene.giSurfaces.push_back(surface);
++        }
+         scene.meshLoaded[i] = scene.meshes[i].create(
+             model.vertices.data(), static_cast<std::uint32_t>(model.vertices.size()),
+             model.indices.data(), static_cast<std::uint32_t>(model.indices.size()));
+@@ -979,6 +1001,8 @@
+     int  shadowJitter = kShadowJitterDefault; // --shadow-jitter 0|1 (M4.0.9 diagnostic)
+     int  shadowLateral = kShadowLateralDefault; // --shadow-lateral 0|1 (M4.0.9.1, centroid path)
+     int  areaLight = kAreaLightDefault;       // --area-light 0|1
++    int giEnabled = 1, giRays = 8, giResolution = 16, giHistory = 32;
++    int gpuTiming = 1;
+     int  areaFast = 1;                      // --area-fast 0|1 (1 = realtime path, 0 = exact validation solver)
+     bool marchStepOverridden = false;         // --shadow-step seen (binds BOTH paths)
+     std::string dumpHeightfieldPrefix; // --dump-heightfield p: write <p>_hmax/_hmin.ppm
+@@ -988,7 +1012,23 @@
+     int  msaaSamples = 4;              // --msaa N (M5.4: GPU-cost ablation; 4 = frozen standard)
+     for (int i = 1; i < argc; ++i) {
+         const char* value = nullptr;
+-        if (std::strcmp(argv[i], "--frames") == 0) {
++        if (std::strcmp(argv[i], "--gi") == 0 || std::strcmp(argv[i], "--gi-rays") == 0 ||
++            std::strcmp(argv[i], "--gi-res") == 0 || std::strcmp(argv[i], "--gi-history") == 0 ||
++            std::strcmp(argv[i], "--gpu-timing") == 0) {
++            const std::string option = argv[i];
++            int parsed = 0;
++            const int lo = option == "--gi-res" ? 4 : ((option == "--gi" || option == "--gpu-timing") ? 0 : 1);
++            const int hi = option == "--gi-history" ? 128 : ((option == "--gi" || option == "--gpu-timing") ? 1 : 64);
++            if (!requireValue(argc, argv, i, option.c_str(), value) || !parseIntArg(value, parsed) || parsed < lo || parsed > hi) {
++                std::fprintf(stderr, "[Sandbox] %s requires an integer in [%d,%d].\n", option.c_str(),lo,hi);
++                return 1;
++            }
++            if (option == "--gi") giEnabled = parsed;
++            else if (option == "--gi-rays") giRays = parsed;
++            else if (option == "--gi-res") giResolution = parsed;
++            else if (option == "--gi-history") giHistory = parsed;
++            else gpuTiming = parsed;
++        } else if (std::strcmp(argv[i], "--frames") == 0) {
+             if (!requireValue(argc, argv, i, "--frames", value)) {
+                 return 1;  // diagnostic already printed
+             }
+@@ -1293,6 +1333,7 @@
+         }
+     }
+     const bool benchMode = benchmarkFrames > 0;
++    const bool giWanted = giEnabled != 0 && cornellVariant >= 0 && shadowsEnabled && areaLight == 1;
+     if (benchMode && screenshotFrames == 0) {
+         screenshotFrames = benchmarkFrames;   // a benchmark run also captures its final frame
+     }
+@@ -1340,7 +1381,7 @@
+     if (cornellVariant >= 0) {
+         renderer.setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+         renderer.setExposure(cornell::kExposure);
+-        renderer.enableGpuTiming(benchMode);
++        renderer.enableGpuTiming(benchMode && gpuTiming != 0);
+     }
+ 
+     // --- shaders ------------------------------------------------------------
+@@ -1356,6 +1397,11 @@
+         pbrFragmentSource.insert(versionPos + versionLine.size(),
+                                  areaFast ? "#define AREA_FAST_BUILD 1\n"
+                                           : "#define AREA_FAST_BUILD 0\n");
++    }
++    if (versionPos != std::string::npos) {
++        pbrFragmentSource.insert(versionPos + versionLine.size(),
++            giWanted ? std::string("#define SURFACE_GI_BUILD 1\n") + engine::DiffuseGI::samplingSource()
++                     : "#define SURFACE_GI_BUILD 0\n");
+     }
+     engine::Shader pbrShader  = engine::Shader::fromSource(
+         shaders::kPbrVertex, pbrFragmentSource.c_str());
+@@ -1641,6 +1687,23 @@
+     presentTimes.reserve(framePeriods.capacity());
+     std::chrono::steady_clock::time_point lastEntry = std::chrono::steady_clock::now();
+ 
++    engine::DiffuseGI diffuseGI;
++    const bool giActive = giWanted && shadowsActive;
++    if (giActive) {
++        if (!diffuseGI.setScene(cornell.giSurfaces) || !diffuseGI.init(giResolution, giRays, giHistory)) {
++            std::fprintf(stderr, "[GI] Initialization failed; cannot provide requested realtime GI.\n");
++            return 1;
++        }
++        diffuseGI.setLight(engine::Vec3(0.5f*(cornell::kEmitterMin[0]+cornell::kEmitterMax[0]),
++                          cornell::kEmitterMin[1],0.5f*(cornell::kEmitterMin[2]+cornell::kEmitterMax[2])),
++                          0.5f*(cornell::kEmitterMax[0]-cornell::kEmitterMin[0]),
++                          0.5f*(cornell::kEmitterMax[2]-cornell::kEmitterMin[2]),cornell::kEmitterRadiance);
++        std::printf("[GI] Realtime one-bounce diffuse: %d surfaces, %dx%d per face, %d rays/update, history %d.\n",
++                    diffuseGI.surfaceCount(),giResolution,giResolution,giRays,giHistory);
++    } else {
++        std::printf("[GI] Off (requires Cornell scene, shadows and area lighting enabled).\n");
++    }
++
+     // M5.3 per-run pacing / upload / culling state --------------------------------
+     bool cornellStaticUploaded = false; // frozen-scene uniforms are up in the program
+     int  lastFbw = -1, lastFbh = -1;    // viewport/aspect change detection
+@@ -1820,8 +1883,12 @@
+ 
+         // --- frame ---------------------------------------------------------------
+         renderer.beginFrame();
+-
++        if (giActive) {
++            diffuseGI.update();
++            renderer.bindSceneTarget(fbw, fbh);
++        }
+         pbrShader.bind();
++        if (giWanted && !giActive) pbrShader.setInt("uGiSurface", -1);
+ 
+         // M5.3 STATIC UPLOAD (the Sodium/ImmediatelyFast pattern applied to
+         // a FROZEN scene): every cornell-path uniform below is constant for
+@@ -2004,6 +2071,7 @@
+                     pbrShader.setFloat("uMetalness", mat->metalness);
+                     lastMaterial = mat;
+                 }
++                if (giActive) diffuseGI.bind(pbrShader, cornell.meshGiIndex[i]);
+                 renderer.drawIndexed(cornell.meshes[i]);
+             }
+ 
+@@ -2187,9 +2255,12 @@
+         const std::uint32_t lightCount = (cornellVariant >= 0)
+             ? cornell.def->lightCount : static_cast<std::uint32_t>(kOrbitLightCount);
+ 
+-        char lines[28][1024];   // M4.0.7: shadow line; M5.3: +culling; M5.4: +decomposition
++        char lines[32][1024];   // M4.0.7: shadow line; M5.3: +culling; M5.4: +decomposition
+         int n = 0;
+         std::snprintf(lines[n++], sizeof(lines[0]), "=== benchmark report ===");
++        std::snprintf(lines[n++], sizeof(lines[0]), "gi: %s  surface-res: %d  rays/update: %d  history: %d  auxiliary passes/frame: %d",
++                      giActive ? "realtime one-bounce diffuse" : "off",giResolution,giRays,giHistory,giActive ? 1 : 0);
++        std::snprintf(lines[n++], sizeof(lines[0]), "gpu-timing requested: %s (--gpu-timing 0 disables query overhead)",gpuTiming ? "on" : "off");
+         std::snprintf(lines[n++], sizeof(lines[0]), "standard: %s", cornellVariant >= 0 ? cornell::kStandard : "n/a (demo scene)");
+         std::snprintf(lines[n++], sizeof(lines[0]), "scene: %s", sceneName.c_str());
+         std::snprintf(lines[n++], sizeof(lines[0]), "resolution: %dx%d  vsync: %s  msaa: %d%s", fbw, fbh,
+@@ -2203,7 +2274,7 @@
+             std::snprintf(lines[n++], sizeof(lines[0]), "fps avg: n/a (no frames measured)");
+         }
+         if (cAvg >= 0.0) {
+-            std::snprintf(lines[n++], sizeof(lines[0]), "cpu ms: avg %.3f  min %.3f  p95 %.3f (legacy total: submit + gpu-wait)", cAvg, cMin, c95);
++            std::snprintf(lines[n++], sizeof(lines[0]), "cpu ms: avg %.3f  min %.3f  p95 %.3f (callback wall time, includes driver calls)", cAvg, cMin, c95);
+         }
+         if (gAvg >= 0.0) {
+             std::snprintf(lines[n++], sizeof(lines[0]), "gpu ms: avg %.3f  min %.3f  p95 %.3f (timer query)", gAvg, gMin, g95);
+@@ -2216,7 +2287,7 @@
+                           "submit ms: avg %.3f  min %.3f  p95 %.3f (app + driver GL submit work)",
+                           sAvg, sMin, s95);
+             std::snprintf(lines[n++], sizeof(lines[0]),
+-                          "gpu-wait ms: avg %.3f  min %.3f  p95 %.3f (timer readback in beginFrame)",
++                          "timer-section ms: avg %.3f  min %.3f  p95 %.3f (poll/read/error/begin combined; not isolated GPU wait)",
+                           dAvg, dMin, d95);
+             std::snprintf(lines[n++], sizeof(lines[0]),
+                           "present ms: avg %.3f  min %.3f  p95 %.3f (SwapBuffers, 1-frame-offset)",
+@@ -2227,7 +2298,7 @@
+                               lAvg, lMin, l95);
+             }
+             std::snprintf(lines[n++], sizeof(lines[0]),
+-                          "budget: submit %.3f + gpu-wait %.3f + present %.3f + loop %.3f = %.3f  (frame %.3f)",
++                          "budget: submit %.3f + timer-section %.3f + present %.3f + loop %.3f = %.3f  (frame %.3f)",
+                           sAvg, dAvg, pAvg, (lAvg >= 0.0 ? lAvg : 0.0),
+                           sAvg + dAvg + pAvg + (lAvg >= 0.0 ? lAvg : 0.0), fAvg);
+         }
+@@ -2243,7 +2314,7 @@
+                           1000.0 / gAvg, 1000.0 / sAvg);
+             const char* verdict =
+                 (gAvg >= sAvg)
+-                    ? "GPU-throughput bound -- fragment work sets fps; CPU levers are exhausted"
++                    ? "GPU work / driver pacing dominant; verify with --gpu-timing 0"
+                     : (pAvg > sAvg)
+                         ? "present-queue bound -- SwapBuffers driver wait dominates"
+                         : "CPU-submit bound -- app/driver submission work dominates";
+--- a/sandbox/src/shaders.h
++++ b/sandbox/src/shaders.h
+@@ -1180,13 +1180,15 @@
+     float dist2 = max(dot(toLight, toLight), 1e-5);
+     float dist = sqrt(dist2);
+     vec3 L = toLight / dist;
+-    if (dot(N, L) <= 0.0) return vec3(0.0);
++    if (dot(N, L) <= 0.0 || L.y <= 0.0) return vec3(0.0);
+ 
+     float vis = ppcAreaVisibility(P);
+     if (vis <= 0.0) return vec3(0.0);
+ 
+     float emitterArea = 4.0 * uEmitterHalf.x * uEmitterHalf.y;
+-    vec3 radiance = vec3(uAreaLe * emitterArea * vis / dist2);
++    // One-sided emitter faces -Y. Reject its back side before expensive visibility.
++    float emitterCos = max(L.y, 0.0);
++    vec3 radiance = vec3(uAreaLe * emitterArea * emitterCos * vis / dist2);
+     return shadeLight(N, V, L, radiance, albedo, alpha, f0, metalness);
+ }
+ 
+@@ -1990,6 +1992,11 @@
+ 
+     // --- sun (directional, no falloff) ---
+     vec3 color = ambient;
++#if SURFACE_GI_BUILD
++    // Cache is incoming indirect irradiance/pi; apply the receiver material
++    // exactly once. Direct emitter light is not part of the cache.
++    color += kD * albedo * giLookup(vWorldPos, N);
++#endif
+     color += shadeLight(N, V, uSunDirection, uSunColor * uSunIntensity,
+                         albedo, alpha, f0, uMetalness);
+ 
+--- /dev/null
++++ b/tools/egl_test_context.py
+@@ -0,0 +1,25 @@
++"""Linux headless test context using installed EGL/OpenGL libraries via ctypes."""
++import ctypes as c
++E=c.CDLL('libEGL.so.1')
++def bind(lib,name,restype,args):
++ f=getattr(lib,name);f.restype=restype;f.argtypes=args;return f
++ptr=c.c_void_p;I=c.c_int;U=c.c_uint
++getproc=bind(E,'eglGetProcAddress',ptr,[c.c_char_p])
++getdisplay=c.CFUNCTYPE(ptr,U,ptr,c.POINTER(I))(getproc(b'eglGetPlatformDisplayEXT'))
++display=getdisplay(0x31DD,None,None)
++init=bind(E,'eglInitialize',U,[ptr,c.POINTER(I),c.POINTER(I)])
++a=I();b=I();assert init(display,c.byref(a),c.byref(b)), 'EGL initialize failed'
++assert bind(E,'eglBindAPI',U,[U])(0x30A2)
++attrs=(I*9)(0x3033,1,0x3040,8,0x3024,8,0x3025,24,0x3038)
++config=ptr();count=I()
++assert bind(E,'eglChooseConfig',U,[ptr,c.POINTER(I),c.POINTER(ptr),I,c.POINTER(I)])(display,attrs,c.byref(config),1,c.byref(count)) and count.value
++ctxattrs=(I*7)(0x3098,3,0x30FB,3,0x30FD,1,0x3038)
++context=bind(E,'eglCreateContext',ptr,[ptr,ptr,ptr,c.POINTER(I)])(display,config,None,ctxattrs)
++assert context
++pattrs=(I*5)(0x3057,640,0x3056,360,0x3038)
++surface=bind(E,'eglCreatePbufferSurface',ptr,[ptr,ptr,c.POINTER(I)])(display,config,pattrs)
++assert surface
++assert bind(E,'eglMakeCurrent',U,[ptr,ptr,ptr,ptr])(display,surface,surface,context)
++G=c.CDLL('libGL.so.1')
++def gl(name,result,args):return bind(G,name,result,args)
++print('Headless GL:',gl('glGetString',c.c_char_p,[U])(0x1F02).decode())
+--- a/tools/glsl_validate.py
++++ b/tools/glsl_validate.py
+@@ -30,6 +30,7 @@
+     "sandbox/src/shaders.h",
+     "engine/src/rendering/Renderer.cpp",
+     "engine/src/rendering/ShadowHeightfield.cpp",
++    "engine/src/rendering/DiffuseGI.cpp",
+ ]
+ 
+ BLOCK_RE = re.compile(r'const char\*\s+(\w+)\s*=\s*R"GLSL\((.*?)\)GLSL"', re.S)
+@@ -56,6 +57,10 @@
+         return 1
+     failures = 0
+     checked = 0
++    gi_path = os.path.join(root, "engine/src/rendering/DiffuseGI.cpp")
++    with open(gi_path, encoding="utf-8") as gi_file:
++        gi_blocks = dict(BLOCK_RE.findall(gi_file.read()))
++    common = gi_blocks["kGiCommon"]
+     with tempfile.TemporaryDirectory() as td:
+         for rel in SOURCES:
+             path = os.path.join(root, rel)
+@@ -66,6 +71,8 @@
+             text = open(path, "r", encoding="utf-8").read()
+             for m in BLOCK_RE.finditer(text):
+                 name, body = m.group(1), m.group(2)
++                if name == "kGiCommon":
++                    continue
+                 # GLSL requires #version on the FIRST line of the string after
+                 # the raw-string opener; files store it on the next line, so
+                 # trim a single leading newline to match the shipped semantics
+@@ -77,9 +84,13 @@
+                 variants = [(name, body)]
+                 if name == "kPbrFragment":
+                     first, rest = body.split("\n", 1)
+-                    variants = [(f"{name}_area{mode}",
+-                                 first + f"\n#define AREA_FAST_BUILD {mode}\n" + rest)
+-                                for mode in (0, 1)]
++                    variants = [(f"{name}_area{mode}_gi{enabled}",
++                                 first + f"\n#define AREA_FAST_BUILD {mode}\n#define SURFACE_GI_BUILD {enabled}\n"
++                                 + (common if enabled else "") + rest)
++                                for mode in (0, 1) for enabled in (0, 1)]
++                elif name == "kGiUpdateFragment":
++                    first, rest = body.split("\n", 1)
++                    variants = [(name, first + "\n" + common + rest)]
+                 for label, source in variants:
+                     checked += 1
+                     sp = os.path.join(td, f"{label}.{stage}")
+--- a/tools/optimization_regression.py
++++ b/tools/optimization_regression.py
+@@ -1,5 +1,8 @@
+ #!/usr/bin/env python3
+-"""Compare reference-tracer output exactly against an unpacked original project.
++"""Historical comparator for the pre-GI CPU optimization revision.
++
++The current branch intentionally corrects multibounce transport and will differ
++from older baselines. Use reference_transport_tests.py for the current checks.
+ 
+ Usage: python3 tools/optimization_regression.py --baseline /path/to/original
+ Requires NumPy. Reports local CPU timings, not renderer FPS.
+--- a/tools/reference_pathtracer.py
++++ b/tools/reference_pathtracer.py
+@@ -227,6 +227,9 @@
+     """Radiance for a batch of camera rays. Emission is counted only on
+     primary hits (NEE covers every subsequent direct event); the emitter
+     surface itself is a black absorber for every non-primary event."""
++    # Own mutable path state; subsequent bounces must advance their rays.
++    ro_all = ro_all.copy()
++    rd_all = rd_all.copy()
+     n_all = ro_all.shape[0]
+     emitter_idx = next(i for i, p in enumerate(prims) if p.is_emitter)
+     # Per-primitive material tables (indexed by prim_idx below). NEVER use a
+@@ -268,7 +271,7 @@
+ 
+         # Keep surface hits; the emitter surface absorbs everything else
+         # (it emits, it does not reflect).
+-        keep = hit & (primary | (best_p != emitter_idx))
++        keep = hit & (best_p != emitter_idx)
+         alive = alive[keep]
+         if alive.size == 0:
+             break
+@@ -373,12 +376,16 @@
+         pdf_l_spec = d_ggx(noh2, a * a) * noh2 / (4.0 * voh2)
+         pdf_l_spec = np.maximum(pdf_l_spec, 1e-12)
+ 
+-        wgt = np.where(
+-            pick_spec[:, None],
+-            f * (nol_c / (p_spec * pdf_l_spec))[:, None],
+-            f * (math.pi / (1.0 - p_spec))[:, None])
+-        wgt = np.where((valid & (nol_b > 0.0))[:, None], wgt, 0.0)
++        # The direction was sampled from a MIXTURE. Evaluating the full
++        # BSDF with only the selected component PDF counts overlapping lobes
++        # twice; divide by the complete mixture density instead.
++        pdf = p_spec * pdf_l_spec + (1.0 - p_spec) * (nol_c / math.pi)
++        wgt = f * (nol_c / np.maximum(pdf, 1e-12))[:, None]
++        valid &= nol_b > 0.0
++        wgt = np.where(valid[:, None], wgt, 0.0)
+         thr[alive] *= wgt
++        ro_all[alive] = p + n * OFFSET
++        rd_all[alive] = l
+ 
+         # Russian roulette after 3 bounces
+         if bounce >= 3:
+--- /dev/null
++++ b/tools/reference_transport_tests.py
+@@ -0,0 +1,59 @@
++#!/usr/bin/env python3
++"""Behavior tests for ray advancement and diffuse/specular mixture transport."""
++import numpy as np
++import reference_pathtracer as r
++
++class Diffuse:
++    is_emitter = False
++    albedo = np.array([0.5, 0.5, 0.5])
++    roughness = 0.9
++    metalness = 0.0
++    def __init__(self): self.primary_origins = []
++    def intersect(self, ro, rd, *, normals=True):
++        if not normals:
++            return np.full(len(ro), np.inf), None
++        self.primary_origins.append(ro.copy())
++        # Hit an upward-facing diffuse plane only from the initial ray origin.
++        initial = ro[:,1] > 0.5
++        t = np.where(initial, 1.0, np.inf)
++        n = np.zeros_like(ro); n[:,1] = 1
++        return t,n
++
++class Emitter:
++    is_emitter = True
++    radiance = 1.0
++    xmin, xmax, zmin, zmax, y, area = -0.5,0.5,-0.5,0.5,2.0,1.0
++    def intersect(self,ro,rd,*,normals=True):
++        return np.full(len(ro),np.inf),np.zeros_like(ro) if normals else None
++
++# After the first bounce, the next query must originate at the first surface,
++# not at the camera again. Input arrays must remain intact for callers.
++n=2048;origin=np.tile([0.,1.,0.],(n,1));direction=np.tile([0.,-1.,0.],(n,1))
++prim=Diffuse();emitter=Emitter()
++a=r.trace([prim,emitter],emitter,origin,direction,np.random.RandomState(7),3)
++assert len(prim.primary_origins)==2
++assert np.allclose(prim.primary_origins[1][:,1],r.OFFSET)
++assert np.all(origin[:,1]==1) and np.all(direction[:,1]==-1)
++b=r.trace([Diffuse(),emitter],emitter,origin,direction,np.random.RandomState(7),1)
++np.testing.assert_array_equal(a,b) # Escaping rays cannot collect the same direct light twice.
++print('PASS ray advancement, immutable inputs, escaping-path energy')
++
++# A primary emitter hit contributes emission once and then terminates.
++class VisibleEmitter(Emitter):
++    def intersect(self,ro,rd,*,normals=True):
++        return np.ones(len(ro)),np.tile([0.,1.,0.],(len(ro),1))
++v=VisibleEmitter()
++out=r.trace([v],v,origin,direction,np.random.RandomState(7),6)
++np.testing.assert_array_equal(out,np.ones((n,3)))
++print('PASS emitter termination')
++
++# Integrate a Lambertian unit furnace using a mixture of cosine and uniform
++# hemisphere proposals. Correct mixture weighting should return albedo once.
++rng=np.random.RandomState(9);count=400000;p=0.4
++choose=rng.random(count)<p
++u=rng.random(count)
++cos=np.where(choose,u,np.sqrt(u))
++pdf=p/(2*np.pi)+(1-p)*cos/np.pi
++estimate=np.mean(0.5/np.pi*cos/pdf)
++assert abs(estimate-.5)<.003,estimate
++print('PASS mixture-PDF energy:',estimate)
+--- a/tools/run_cpu_tests.py
++++ b/tools/run_cpu_tests.py
+@@ -21,7 +21,7 @@
+     root = Path(__file__).resolve().parents[1]
+     sources = ['math/Mat4.cpp', 'math/Frustum.cpp', 'rendering/Camera.cpp',
+                'assets/OBJ.cpp', 'rendering/ShadowHeightfield.cpp',
+-               'rendering/Shader.cpp', 'rendering/GL.cpp']
++               'rendering/Shader.cpp', 'rendering/GL.cpp', 'rendering/DiffuseGI.cpp']
+     flags = ['-std=c++17', '-O1' if args.sanitize else '-O2',
+              '-I' + str(root / 'engine/src'), '-I' + str(root / 'sandbox/src')]
+     if args.sanitize:
+--- /dev/null
++++ b/tools/verify_realtime_gi.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Linux EGL integration test: real shader compilation, rendering, and history reset.
++
++python3 tools/verify_realtime_gi.py --out gi-validation
++Requires installed EGL/OpenGL, a C++17 compiler, Python, Pillow and NumPy.
++Software Mesa validates behavior but does not establish RTX performance.
++"""
++import argparse
++import ctypes as c
++from pathlib import Path
++import re
++import subprocess
++import tempfile
++
++
++def main():
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--out',type=Path,default=Path('gi-validation'))
++    parser.add_argument('--compile-only',action='store_true')
++    parser.add_argument('--full-lighting',action='store_true',help='render existing PPC direct lighting too; can compile slowly on software drivers')
++    parser.add_argument('--width',type=int,default=640)
++    parser.add_argument('--frames',type=int,default=48)
++    args=parser.parse_args()
++    if args.width<64 or args.width>640:parser.error('width must be between 64 and 640')
++    if args.frames<2:parser.error('frames must be at least 2')
++    import egl_test_context as ctx
++    root=Path(__file__).resolve().parents[1]
++    regex=re.compile(r'const char\*\s+(\w+)\s*=\s*R"GLSL\((.*?)\)GLSL"',re.S)
++    gi=dict(regex.findall((root/'engine/src/rendering/DiffuseGI.cpp').read_text()))
++    create=ctx.gl('glCreateShader',ctx.U,[ctx.U])
++    source=ctx.gl('glShaderSource',None,[ctx.U,ctx.I,c.POINTER(c.c_char_p),c.POINTER(ctx.I)])
++    compile_shader=ctx.gl('glCompileShader',None,[ctx.U])
++    status=ctx.gl('glGetShaderiv',None,[ctx.U,ctx.U,c.POINTER(ctx.I)])
++    log=ctx.gl('glGetShaderInfoLog',None,[ctx.U,ctx.I,c.POINTER(ctx.I),c.c_char_p])
++    delete=ctx.gl('glDeleteShader',None,[ctx.U])
++    count=0
++    for rel in ['sandbox/src/shaders.h','engine/src/rendering/Renderer.cpp','engine/src/rendering/ShadowHeightfield.cpp','engine/src/rendering/DiffuseGI.cpp']:
++        for name,body in regex.findall((root/rel).read_text()):
++            if name=='kGiCommon':continue
++            variants=[('',body)]
++            if name=='kPbrFragment':
++                variants=[]
++                for area in (0,1):
++                    for enable in (0,1):
++                        insert=f'#define AREA_FAST_BUILD {area}\n#define SURFACE_GI_BUILD {enable}\n'+(gi['kGiCommon'] if enable else '')
++                        variants.append((f'_area{area}_gi{enable}',body.replace('#version 330 core\n','#version 330 core\n'+insert,1)))
++            if name=='kGiUpdateFragment':
++                variants=[('',body.replace('#version 330 core\n','#version 330 core\n'+gi['kGiCommon'],1))]
++            for suffix,text in variants:
++                shader=create(0x8B31 if name.lower().endswith(('vertex','vs')) else 0x8B30)
++                src=c.c_char_p(text.encode());source(shader,1,c.byref(src),None);compile_shader(shader)
++                ok=ctx.I();status(shader,0x8B81,c.byref(ok))
++                if not ok.value:
++                    buf=c.create_string_buffer(16000);log(shader,len(buf),None,buf)
++                    raise RuntimeError(name+suffix+'\n'+buf.value.decode())
++                delete(shader);count+=1;print('PASS',name+suffix,flush=True)
++    print(count,'shader variants compiled',flush=True)
++    if args.compile_only:return
++    args.out.mkdir(parents=True,exist_ok=True)
++    print('Render mode:', 'full direct + indirect' if args.full_lighting else 'indirect-only diagnostic',flush=True)
++    with tempfile.TemporaryDirectory(prefix='gi-test-build-') as build:
++        library=Path(build)/'gi-tests.so'
++        src=['assets/OBJ.cpp','math/Mat4.cpp','math/Frustum.cpp','rendering/Camera.cpp','rendering/GL.cpp','rendering/Shader.cpp','rendering/Mesh.cpp','rendering/Renderer.cpp','rendering/DiffuseGI.cpp']
++        subprocess.run(['g++',f'-DGI_TEST_WIDTH={args.width}','-std=c++17','-O2','-shared','-fPIC','-I'+str(root/'engine/src'),'-I'+str(root/'sandbox/src'),str(root/'engine/tests/gi_gl_tests.cpp'),*[str(root/'engine/src'/s) for s in src],'-o',str(library)],check=True)
++        lib=c.CDLL(str(library))
++        callback=c.CFUNCTYPE(ctx.ptr,c.c_char_p)(lambda name:ctx.getproc(name))
++        render=lib.gi_render_test;render.restype=ctx.I
++        render.argtypes=[type(callback),c.c_char_p,c.c_char_p,ctx.I,ctx.I,ctx.I,ctx.I,ctx.I]
++        geo=str(root/'benchmarks/cornell_box/geometry').encode()
++        for variant in range(3):
++            for enabled in (0,1):
++                name=f'cornell0{variant+1}-gi{enabled}'
++                code=render(callback,geo,str(args.out/(name+'.ppm')).encode(),variant,args.frames if enabled else 1,enabled,0,0 if args.full_lighting else 1)
++                if code:raise RuntimeError(f'{name}: GL integration code {code}')
++                print('PASS rendered',name,flush=True)
++        code=render(callback,geo,str(args.out/'dark-reset.ppm').encode(),0,4,1,1,0 if args.full_lighting else 1)
++        if code:raise RuntimeError(f'dark reset: GL integration code {code}')
++    from PIL import Image
++    import numpy as np
++    dark=np.array(Image.open(args.out/'dark-reset.ppm'))
++    assert dark.max()<=2, 'Light-off reset retained stale GI'
++    a=np.array(Image.open(args.out/'cornell01-gi0.ppm')).astype(float)
++    b=np.array(Image.open(args.out/'cornell01-gi1.ppm')).astype(float)
++    # Front of the tall box receives no direct light; bounce must illuminate it.
++    scale=args.width/640
++    region=(slice(int(175*scale),int(325*scale)),slice(int(235*scale),int(278*scale)))
++    before=a[region].mean();after=b[region].mean()
++    assert after>before+5,(before,after)
++    print(f'PASS indirect light on unlit box: {before:.2f} -> {after:.2f}')
++    print('PASS light-off history invalidation')
++    for p in args.out.glob('*.ppm'):
++        Image.open(p).save(p.with_suffix('.png'))
++    print('Headless integration passed. Measure actual frame costs on the target GPU.')
++
++if __name__=='__main__':main()

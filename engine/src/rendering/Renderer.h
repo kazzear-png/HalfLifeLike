@@ -60,6 +60,8 @@ public:
 
     // Begins a frame (binds + clears the render target, resets per-frame stats).
     void beginFrame();
+    // Restore scene FBO/viewport after an auxiliary pass, without clearing.
+    void bindSceneTarget(int width, int height);
 
     // Ends a frame: resolve (MSAA -> texture) + tonemap to the backbuffer.
     void endFrame();
@@ -81,16 +83,34 @@ public:
     // blocking read (GL_QUERY_RESULT) sat at the top of beginFrame() INSIDE
     // the benchmark's measured cpu-ms window, which is why cpu ms mirrored
     // gpu ms on GPU-bound frames (the CPU finished submitting, then slept in
-    // that read until the GPU retired the previous frame). The ring gives the
-    // GPU up to kTimerRingSize frames of slack; a slot that is still pending
-    // when its turn to re-arm comes (GPU 4+ frames behind -- pathological)
-    // falls back to one blocking read so per-frame timing never drops. If a
-    // driver misbehaves, timing disables itself and lastGpuFrameMs() keeps
-    // reporting a negative value ("n/a"). Frames with no completed sample
-    // report n/a (the benchmark skips them rather than double-counting).
+    // that read until the GPU retired the previous frame).
+    //
+    // M5.6: the ring is 64 deep and the overflow path no longer blocks. On
+    // the hardware ledger a 4-deep ring overflowed EVERY frame (real app CPU
+    // ~1.1 ms vs GPU ~6.2 ms: the GPU falls behind ~5 ms per frame, so the
+    // slot up for re-arm was never retired) -- the "rare" blocking fallback
+    // was the steady-state path and cpu ms STILL mirrored gpu ms. Now an
+    // unretired slot means this frame simply does not arm a query (the slot
+    // drains later; that frame reports n/a and the benchmark skips it): a
+    // benchmark must never wait on the thing it measures. A blocked CPU now
+    // can only be (a) real app/GL-driver submit work or (b) the present
+    // queue at SwapBuffers -- both measured and reported separately by the
+    // sandbox (submit ms / gpu-wait ms / present ms).
     void enableGpuTiming(bool enable);
     float lastGpuFrameMs() const { return m_gpuFrameMs; }
     bool gpuTimingActive() const { return m_gpuTimingOn; }
+
+    // M5.4: wall time beginFrame() spent in the timer-drain section this
+    // frame (query availability polls + result reads). With the skip-not-
+    // block overflow policy this should sit in the microseconds; a large
+    // value means the DRIVER blocks inside query reads and the report will
+    // show it as its own line.
+    float lastDrainWaitMs() const { return m_drainWaitMs; }
+
+    // M5.4 telemetry: total query results drained / frames where arming was
+    // skipped because the oldest slot was still in flight.
+    std::uint64_t timerSamplesCollected() const { return m_timerSamples; }
+    std::uint64_t timerOverflowSkips() const { return m_timerOverflowSkips; }
 
 private:
     // --- GL object handles (kept internal; never exposed through the API) ---
@@ -114,14 +134,19 @@ private:
 
     RenderStats m_stats;
 
-    // M3.3 / M5.2: GPU frame timing (timer-query ring, non-blocking readback).
-    static constexpr int kTimerRingSize = 4;
+    // M3.3 / M5.2 / M5.4: GPU frame timing (timer-query ring, non-blocking
+    // readback, skip-not-block overflow).
+    static constexpr int kTimerRingSize = 64;
     bool m_gpuTimingWanted = false;   // caller asked for timing
     bool m_gpuTimingOn    = false;    // driver accepted it
-    bool m_timerSlotPending[kTimerRingSize] = {false, false, false, false};
-    gl::GLuint m_timerQueries[kTimerRingSize] = {0, 0, 0, 0};
-    int  m_timerRingIndex = 0;         // slot armed by this frame's BeginQuery
+    bool m_timerSlotPending[kTimerRingSize] = {};
+    gl::GLuint m_timerQueries[kTimerRingSize] = {};
+    int  m_timerRingIndex = 0;         // next slot to arm (oldest pending first)
+    bool m_timerArmedThisFrame = false; // M5.4: BeginQuery issued (endFrame pairs it)
     float m_gpuFrameMs = -1.0f;       // < 0 == "n/a" (no completed sample this frame)
+    float m_drainWaitMs = 0.0f;       // M5.4: drain-section wall time this frame
+    std::uint64_t m_timerSamples = 0;       // M5.4: results drained (lifetime)
+    std::uint64_t m_timerOverflowSkips = 0; // M5.4: frames that armed no query
 
     // Internal helpers (require a current GL context).
     void destroyHDRTargets();

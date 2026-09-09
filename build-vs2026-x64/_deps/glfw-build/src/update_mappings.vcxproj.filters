@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Game project\build-vs2026-x64\CMakeFiles\5c9386382d90ec92668ee7e1256d7562\update_mappings.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+    <CustomBuild Include="C:\Game project\build-vs2026-x64\_deps\glfw-src\src\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="C:\Game project\build-vs2026-x64\_deps\glfw-src\src\mappings.h.in">
+      <Filter>Header Files</Filter>
+    </None>
+    <None Include="C:\Game project\build-vs2026-x64\_deps\glfw-src\CMake\GenerateMappings.cmake" />
+    <None Include="C:\Game project\build-vs2026-x64\_deps\glfw-build\src\CMakeFiles\update_mappings" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{A176DF59-970D-3AE5-A9E1-07E07FC621F4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{29350218-E9D4-314C-8154-D00678BA7266}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

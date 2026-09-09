@@ -1,0 +1,10 @@
+^C:\GAME PROJECT\BUILD-VS2026-X64\CMAKEFILES\9A2DA3B14BB816A2808A5643CE100A1D\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" "-SC:/Game project" "-BC:/Game project/build-vs2026-x64" --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file "C:/Game project/build-vs2026-x64/Engine.slnx"
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

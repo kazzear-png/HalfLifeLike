@@ -6,6 +6,228 @@ sections Added / Changed / Removed / Deprecated / Fixed as needed.
 
 ---
 
+## 0.5.5 — M5.5: correctness hardening (GL leak, GLFW lifetime, Mat4 guards, OBJ ear-clip + strict parsing, strict CLI)
+
+Diagnosis. An external audit of the tree found five real correctness defects
+that no benchmark can catch — exactly the class the 0.5.4 frame-budget work
+was blind to, because none of them move a millisecond: (1)
+`ShadowHeightfield::create()` called `destroy()` on failure paths BEFORE the
+half-built GL names were assigned to members, so every failed create leaked
+one R16F texture + FBO + depth renderbuffer into the context; (2) `Window`
+tracked GLFW's global lifetime as a single bool, which terminates GLFW under
+a still-live window the moment two Window instances overlap in time (and
+leaves the flag set after a failed construction); (3) `Mat4::perspective /
+lookAt / inverse` fed degenerate input straight into `tan()`, `1/x`, and
+`normalize()` — a zero aspect or an up-vector parallel to the view direction
+produced NaN/Inf matrices that silently poisoned frustum planes and normal
+matrices; (4) the OBJ importer fan-triangulated every polygon from corner 0,
+which for CONCAVE faces emits triangles outside the authored shape, parsed
+corner tokens with `atoll` (so `"1.5"` silently became corner 1: geometry
+corruption), and pushed one synthetic normal PER CORNER into the normals pool
+(6 entries for a normal-less quad, ~3480 for a 60-gon); (5) the CLI parsed
+every numeric option with `atoi/atof`, which read `"--benchmark potato"` as 0
+(silently disabling the benchmark), `"--width xyz"` as 0 (a 0x0 window), and
+silently ignored misspelled options entirely (`--benchmak 500` ran the
+interactive demo). All five are fixed; rendering is byte-identical.
+
+### Fixed
+
+- **`ShadowHeightfield::create()` is leak-free on every failure path.** Both
+  capture targets are built under LOCAL ownership and transferred to the
+  members only after both framebuffer-completeness checks pass; the failure
+  paths delete through the locals (plus `destroy()` for the capture program,
+  which the paths had already claimed). `destroy()` additionally releases
+  the program and resets the cached uniform locations, so a failed `create()`
+  leaves the object fully clean instead of half-valid. Parameters are
+  finite-checked (NaN slab bounds previously passed the `minY >= maxY`
+  guard and produced a NaN capture frustum).
+- **`Window` reference-counts the GLFW global lifetime** (`s_glfwRefCount`).
+  Each successfully created window owns one reference; the count reaching
+  zero — and only zero — calls `glfwTerminate()`. A failed
+  `glfwCreateWindow()` releases its reference in the constructor, so the
+  destructor cannot double-decrement. Overlapping Window instances no longer
+  terminate GLFW under a live window.
+- **`Mat4` degenerate-input guards.** `perspective` rejects non-finite
+  input, aspect/near/far <= 0, near >= far, and fov at the tan poles;
+  `lookAt` rejects non-finite vectors, zero-length direction/up, and an up
+  parallel to the view direction; `inverse` rejects non-finite
+  elements/determinant and scales the singularity threshold by the matrix
+  magnitude (`det ~ scale^4`) instead of the old exact `det == 0.0f` test
+  that let near-singular large-element matrices through into the 1/det
+  division as silent garbage. All three fall back to the established
+  identity contract; valid inputs are bit-identical (verified by the
+  unchanged perspective/lookAt/inverse pins plus new not-identity guards).
+- **OBJ polygons are ear-clipped, not fan-triangulated.** Newell normal for
+  the projection axis, winding-aware convexity test, containment-checked ear
+  clipping with a no-ear guard for non-simple polygons — correct for concave
+  faces where the corner-0 fan emitted triangles outside the polygon.
+  Triangle faces emit `{0,1,2}` exactly like the fan, and every shipped
+  asset (cornell geometry + bundled models) is triangle-authored, so
+  vertex/index output for the frozen standard is unchanged by construction.
+- **OBJ corner tokens parse strictly** (`strtoll` with full-consumption,
+  ERANGE, and end-pointer checks): `"1.5"`, `"2x"`, `"x"`, and empty tokens
+  now fail the face loudly (`skippedFaces` + warning) instead of silently
+  becoming corners 1/2/0. Emission resolves all three normal indices before
+  writing any index, so a bad triangle can never emit a partial 1-2 index
+  pair that would corrupt the index stream.
+- **OBJ synthetic normals: one per triangle, not one per corner** (a
+  normal-less quad pushes 2 pool entries, not 6; a 60-gon ~58, not ~3480).
+  Flat shading is unchanged — the synthetic normal IS the triangle normal
+  and the (pos, nrm) dedupe key keeps indexing uniform.
+- **Strict CLI parsing** (`parseIntArg`/`parseFloatArg`/`requireValue`):
+  every numeric option rejects non-numeric, partial-numeric, and
+  out-of-range values with the offending text quoted; `--frames` /
+  `--benchmark` require >= 0, `--width/--height` 1..16384; all existing
+  per-option range diagnostics are preserved. The option chain ends in an
+  `else { unknown or malformed option }` hard failure, so misspelled flags
+  and truncated `--opt`-without-value command lines exit 1 with the
+  offending argument instead of running the wrong experiment silently.
+- `worldToTexel` hardening: null out-pointers, non-finite coordinates and
+  bounds, and degenerate/inverted footprints are refused (a NaN coordinate
+  previously sailed through every comparison and produced NaN texel indices
+  for the registration probes). **The continuous `uv * res` scale is
+  deliberately kept** (the audit patch proposed `* (res-1)`): this function
+  is the exact CPU twin of the GLSL march's `texture(uv)` sample and is
+  pinned by bench_tests ("maxX -> continuous column res", texel-center
+  round trip `i+0.5`); the boundary value `res` is a valid continuous
+  coordinate, and the array-indexing consumer clamps (documented at both
+  sites). Changing the scale would desynchronize every CPU diagnostic from
+  the shader the diagnostics exist to check.
+
+### Added
+
+- math_tests: degenerate-guard block — perspective/lookAt/inverse fallbacks
+  for zero aspect, inverted planes, fov~pi, eye==target, parallel up, NaN
+  inputs, large-element singular inverse; plus NOT-identity pins proving the
+  guards never over-trigger on valid input.
+- obj_tests: concave-polygon fixture (square with a notch, area 3.0) pinning
+  exactly 3 triangles, exact-tiling area sum, corner-set membership, and
+  centroid containment; malformed-corner fixture pinning 5 rejected faces /
+  3 vertices / skip warning.
+- bench_tests: worldToTexel rejection pins (NaN coordinate, NaN bound,
+  zero-width, inverted, zero resolution, null out pointers).
+
+### Verification
+
+- Byte-identical rendering: cornell01 300 frames @ 960x540 md5
+  `1ef386d5210bb25aa53a6231f720ad7d` (unchanged since 0.5.2) on the final
+  binary; field verify OK (coverage 15.65%, top 3.299 m), registration
+  probes 7/7 PASS.
+- Culling A/B: `--cull 1` vs `--cull 0` PPM-identical (cornell01, 200
+  frames).
+- Test suites: math 87 / frustum 32 / obj 34 / brdf 38 / bench 232 = 423
+  checks, 0 failures (was 392; +31 new).
+- CLI rejection matrix: `--benchmark potato`, `--width xyz`,
+  `--benchmak 500` (typo), trailing `--frames` (missing value),
+  `--dynamic-fps hello`, `--frames -5` — all exit 1 with a single precise
+  diagnostic; valid invocations unchanged.
+- OBJ byte-stability: all shipped assets are triangle-authored (verified by
+  face-corner scan: no `f` line with 4+ corners in cornell geometry or the
+  bundled models), so the ear-clip change is output-identical for the frozen
+  standard by construction, not just by measurement.
+- Build banner bumped to `0.5.5`.
+
+---
+
+## 0.5.4 — M5.4: frame-budget decomposition (submit / gpu-wait / present / loop) + skip-not-block timer ring
+
+Diagnosis. The 0.5.3 hardware report read `fps 137.9 (was 156), frame 7.250,
+cpu 6.911 (min 1.100), gpu 6.243` — and that single line contains the whole
+story: the min frame proves the app's real CPU cost is ~1.1 ms, the GPU timer
+proves the frame is GPU-throughput-bound (6.243 ms -> hard ceiling 160 fps),
+and the gap between avg cpu and min cpu is ~5.8 ms of CPU time that is NOT
+application work — it is the CPU parked somewhere inside the frame window
+waiting on the GPU. The 0.5.2 timer ring was supposed to remove that wait,
+but with real app CPU at ~1.1 ms against ~6.2 ms of GPU work the GPU falls
+behind ~5 ms per frame, so the 4-deep ring was full at EVERY re-arm and the
+"rare pathological blocking fallback" (`GL_QUERY_RESULT` on a pending slot)
+was the steady-state path — the lockstep survived one layer down, and cpu ms
+kept mirroring gpu ms. Two conclusions followed. First, the metric was lying:
+"cpu ms" was ~84% driver wait, and every CPU-side optimization of the last
+three releases was optimizing a component that never set the frame rate (the
+156 fps baseline was already at 99% of the GPU ceiling; Amdahl says the
+remaining CPU levers were worth ~4% at most). Second, the benchmark could
+not have told us any of this even in principle — it reported one blurred
+number where the frame budget has four distinct components. Both are fixed
+here: no CPU wait is legal inside the measured window, and the report now
+prints where every millisecond of the frame goes.
+
+### Changed
+
+- **Timer ring: 8 deep, and the overflow path no longer blocks.** When the
+  slot up for re-arm is still in flight (GPU 8+ frames behind), the frame
+  simply does not arm a query: the ring index stays put, the slot drains on
+  a later frame, and that frame reports `n/a` for gpu ms (the benchmark
+  already skips n/a samples rather than double-counting). A benchmark must
+  never wait on the thing it measures. Ring telemetry (samples collected /
+  overflow skips) is exposed so a nonzero skip count on hardware names a
+  present queue deeper than the ring — which would mean the CPU is being
+  throttled at SwapBuffers instead (see the new present metric).
+- **`Renderer::lastDrainWaitMs()`**: wall time the beginFrame() drain section
+  took (availability polls + result reads of already-complete queries).
+  Expected in the microseconds; a large value means the DRIVER blocks inside
+  query reads, and it now shows up as its own report line instead of hiding
+  inside "cpu ms".
+- **`Application::lastPresentMs()`**: SwapBuffers wall time, measured inside
+  `run()` after the frame callback returns. The driver's present-queue
+  throttle parks a CPU that outran the GPU HERE — outside the callback's
+  cpu-ms window — so present cost is now a first-class metric.
+- The `cpu ms` report line is labeled what it is: `legacy total: submit +
+  gpu-wait`. The four-component decomposition below it is the new truth.
+- Build banner bumped to `0.5.4` (rendering byte-identical again; md5 cannot
+  distinguish builds).
+
+### Added
+
+- **Benchmark report frame-budget decomposition** (sums exactly to the frame
+  average — verified: `3.746 + 0.005 + 0.100 + 0.005 = 3.856` vs frame
+  `3.855` on the 64x36 llvmpipe ledger):
+  `submit ms` (app + driver GL submit work = cpu minus gpu-wait),
+  `gpu-wait ms` (timer readback wait in beginFrame),
+  `present ms` (SwapBuffers, one-frame-offset series),
+  `loop ms` (event poll + run overhead),
+  `budget: submit + gpu-wait + present + loop = total (frame)`,
+  `gpu timer: ring 8  samples N  overflow skips K`,
+  `ceiling: gpu X fps (1000/gpu ms)  submit Y fps (1000/submit ms)`, and a
+  plain-language `verdict:` line (GPU-throughput bound / present-queue bound
+  / CPU-submit bound) so the next hardware run names its own bottleneck.
+  Per-frame alignment: framePeriods[k] spans cpu[k-1] + present[k-1] +
+  poll[k] (poll runs before entry), so the loop term pairs with the previous
+  cpu sample — the first measured frame is skipped for that series.
+- **CLI `--msaa N`** (1 = off, 4 = frozen cornell-box/1.0 standard, default
+  4): the GPU-cost ablation lever for the resolve-bandwidth + per-sample
+  coverage component of the fragment budget. Non-default values print a
+  stderr warning ("ablation run, NOT the frozen standard -- do not ledger
+  this image") and a report annotation; the 1x path also logs
+  `[Renderer] HDR active: RGBA16F, 1x (no MSAA, --msaa lever)`.
+- The report's `resolution:` line now carries the active `msaa:` count.
+
+### Fixed
+
+- **The loop-series pairing bug caught during verification**: the first cut
+  computed `loop = frame - cpu - present` with the CURRENT frame's cpu,
+  which double-books the callback against a period that ends before the
+  callback runs — under bursty software-GL timing it produced a phantom
+  `loop p95 = 24.6 ms`. The corrected pairing (previous frame's cpu) sums
+  the budget to the frame average to within 0.001 ms on both verification
+  ledgers.
+
+### Verification
+
+- Byte-identical rendering: cornell01 300 frames @ 960x540 md5
+  `1ef386d5210bb25aa53a6231f720ad7d` (unchanged from 0.5.2/0.5.3).
+- Culling A/B: `--cull 1` vs `--cull 0` PPM-identical on cornell01/02/03,
+  culled draws/frame pinned at 0.0.
+- Test suites: math 73 / frustum 32 / obj 24 / brdf 38 / bench 225 = 392
+  checks, 0 failures.
+- llvmpipe 64x36 ledger: gpu-wait 0.005 ms avg (the drain is genuinely
+  non-blocking now), ring 1999/2000 samples, 0 overflow skips, budget sums
+  to the frame average (see above). Software GL cannot reproduce the
+  hardware present-queue behavior — the whole point of the decomposition is
+  that the NEXT hardware run will.
+
+---
+
 ## 0.5.3 — M5.3: mod-inspired efficiency pass (upload-once frozen uniforms, frustum culling, dynamic-fps pacing)
 
 The M5.1/M5.2 ledger closed every CPU-GPU sync point, but the frame loop still

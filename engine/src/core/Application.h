@@ -48,6 +48,15 @@ public:
     // clearing + submitting geometry. dt is clamped to kMaxDeltaTime.
     void run(const std::function<void(float dt)>& onFrame);
 
+    // M5.4: wall time the LAST SwapBuffers call took (measured inside run(),
+    // after the frame callback returned). On GPU-bound frames the driver's
+    // present-queue throttle parks the CPU HERE -- outside the callback's
+    // cpu-ms window -- so the benchmark can report submit work, GPU wait and
+    // present wait as three separate lines instead of one blurred "cpu ms".
+    // Read from the NEXT frame's callback: the value belongs to the previous
+    // frame's swap (the report treats it as its own one-frame-offset series).
+    float lastPresentMs() const { return m_lastPresentMs; }
+
     double fps() const { return m_fps; }
 
 private:
@@ -59,6 +68,7 @@ private:
     std::string m_baseTitle;
     std::uint64_t m_lastDrawCalls = 0;
     std::uint64_t m_lastTriangles = 0;
+    float m_lastPresentMs = 0.0f;   // M5.4: SwapBuffers wall time (see run())
 };
 
 } // namespace engine

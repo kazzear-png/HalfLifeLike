@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Game project/build-vs2026-x64/cmake_install.cmake",
+		"C:/Game project/build-vs2026-x64/_deps/glfw-build/cmake_install.cmake",
+		"C:/Game project/build-vs2026-x64/_deps/glfw-build/src/cmake_install.cmake",
+		"C:/Game project/build-vs2026-x64/engine/cmake_install.cmake",
+		"C:/Game project/build-vs2026-x64/sandbox/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

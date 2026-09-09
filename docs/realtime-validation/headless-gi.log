@@ -1,0 +1,75 @@
+Headless GL: 4.5 (Core Profile) Mesa 25.2.8-0ubuntu0.24.04.2
+PASS kPbrVertex
+PASS kPbrFragment_area0_gi0
+PASS kPbrFragment_area0_gi1
+PASS kPbrFragment_area1_gi0
+PASS kPbrFragment_area1_gi1
+PASS kUnlitVertex
+PASS kUnlitFragment
+PASS kHeightfieldDumpVertex
+PASS kHeightfieldDumpFragment
+PASS kTonemapVS
+PASS kTonemapFS
+PASS kHeightVS
+PASS kHeightFS
+PASS kGiVertex
+PASS kGiUpdateFragment
+15 shader variants compiled
+Render mode: indirect-only diagnostic
+[GI test] Building scene shader
+[GI test] Scene shader linked
+[GI test] Building GI shader
+[GI test] GI shader linked
+[GI test] frame 0/1
+PASS rendered cornell01-gi0
+[GI test] Building scene shader
+[GI test] Scene shader linked
+[GI test] Building GI shader
+[GI test] GI shader linked
+[GI test] frame 0/48
+[GI test] frame 16/48
+[GI test] frame 32/48
+PASS rendered cornell01-gi1
+[GI test] Building scene shader
+[GI test] Scene shader linked
+[GI test] Building GI shader
+[GI test] GI shader linked
+[GI test] frame 0/1
+PASS rendered cornell02-gi0
+[GI test] Building scene shader
+[GI test] Scene shader linked
+[GI test] Building GI shader
+[GI test] GI shader linked
+[GI test] frame 0/48
+[GI test] frame 16/48
+[GI test] frame 32/48
+PASS rendered cornell02-gi1
+[GI test] Building scene shader
+[GI test] Scene shader linked
+[GI test] Building GI shader
+[GI test] GI shader linked
+[GI test] frame 0/1
+PASS rendered cornell03-gi0
+[GI test] Building scene shader
+[GI test] Scene shader linked
+[GI test] Building GI shader
+[GI test] GI shader linked
+[GI test] frame 0/48
+[GI test] frame 16/48
+[GI test] frame 32/48
+PASS rendered cornell03-gi1
+[GI test] Building scene shader
+[GI test] Scene shader linked
+[GI test] Building GI shader
+[GI test] GI shader linked
+[GI test] frame 0/4
+PASS indirect light on unlit box: 0.13 -> 16.72
+PASS light-off history invalidation
+Headless integration passed. Measure actual frame costs on the target GPU.
+[Renderer] HDR active: RGBA16F, 4x MSAA, 640x360
+[Renderer] HDR active: RGBA16F, 4x MSAA, 640x360
+[Renderer] HDR active: RGBA16F, 4x MSAA, 640x360
+[Renderer] HDR active: RGBA16F, 4x MSAA, 640x360
+[Renderer] HDR active: RGBA16F, 4x MSAA, 640x360
+[Renderer] HDR active: RGBA16F, 4x MSAA, 640x360
+[Renderer] HDR active: RGBA16F, 4x MSAA, 640x360

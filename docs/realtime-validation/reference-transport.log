@@ -1,0 +1,3 @@
+PASS ray advancement, immutable inputs, escaping-path energy
+PASS emitter termination
+PASS mixture-PDF energy: 0.49982239469496026

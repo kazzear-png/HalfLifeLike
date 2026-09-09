@@ -7,6 +7,7 @@ add_library(engine STATIC
     src/platform/Input.cpp
     src/platform/Window.cpp
     src/rendering/Camera.cpp
+    src/rendering/DiffuseGI.cpp
     src/rendering/GL.cpp
     src/rendering/Mesh.cpp
     src/rendering/Renderer.cpp

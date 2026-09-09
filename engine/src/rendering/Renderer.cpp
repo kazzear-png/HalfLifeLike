@@ -3,6 +3,7 @@
 #include "rendering/Mesh.h"
 #include "rendering/Shader.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -120,6 +121,10 @@ void Renderer::enableGpuTiming(bool enable) {
     m_gpuTimingWanted = enable;
     m_gpuTimingOn = enable;
     m_gpuFrameMs = -1.0f;
+    m_timerArmedThisFrame = false;
+    m_timerSamples = 0;         // M5.4: per-session telemetry reset
+    m_timerOverflowSkips = 0;
+    m_drainWaitMs = 0.0f;
     for (int i = 0; i < kTimerRingSize; ++i) {
         m_timerSlotPending[i] = false;
     }
@@ -240,10 +245,19 @@ bool Renderer::initHDR(int width, int height, int msaaSamples) {
         }
     }
 
-    if (m_samples == 0 && !createHDRTargets(width, height, 1)) {
-        std::fprintf(stderr, "[Renderer] HDR targets unavailable; continuing in direct mode.\n");
-        m_hdrActive = false;
-        return false;
+    if (m_samples == 0) {
+        if (createHDRTargets(width, height, 1)) {
+            // Explicit single-sample request (the --msaa ablation lever);
+            // the fallback path above already announced itself.
+            if (msaaSamples <= 1) {
+                std::printf("[Renderer] HDR active: RGBA16F, 1x (no MSAA, --msaa lever), %dx%d\n",
+                            width, height);
+            }
+        } else {
+            std::fprintf(stderr, "[Renderer] HDR targets unavailable; continuing in direct mode.\n");
+            m_hdrActive = false;
+            return false;
+        }
     }
 
     // Empty VAO for the attribute-less tonemap triangle (core profile
@@ -299,48 +313,72 @@ void Renderer::beginFrame() {
     m_stats.reset();  // frame starts here
 
     if (m_gpuTimingOn) {
-        // M5.2: drain completed query results NON-BLOCKINGLY before re-arming.
-        // Slots are visited oldest -> newest (queries on one target retire in
-        // issue order, so the first not-ready slot means nothing newer is done
-        // either). Every drained value refreshes m_gpuFrameMs; a frame with no
-        // completed sample reports n/a (-1) and the benchmark skips it.
+        // M5.2/M5.4: drain completed query results NON-BLOCKINGLY, then arm
+        // the next slot -- or SKIP arming when the ring is full (GPU 8+
+        // frames behind). Slots are visited oldest -> newest (queries on one
+        // target retire in issue order, so the first not-ready slot means
+        // nothing newer is done either); the only GL calls here are an
+        // availability poll and result reads of ALREADY-COMPLETE queries
+        // (per spec, GL_QUERY_RESULT after GL_QUERY_RESULT_AVAILABLE == 1
+        // returns immediately) -- no path may block on GPU progress.
         m_gpuFrameMs = -1.0f;
-        for (int i = 0; i < kTimerRingSize; ++i) {
-            const int slot = (m_timerRingIndex + i) % kTimerRingSize;
-            if (!m_timerSlotPending[slot]) {
-                continue;
-            }
+        m_timerArmedThisFrame = false;
+        const auto drainStart = std::chrono::steady_clock::now();
+
+        // M5.6: query ONLY the slot that is about to be reused. With a
+        // 64-deep ring this result is ~64 submitted frames old, so normal
+        // drivers have retired it long before this poll. The old code walked
+        // from oldest into progressively newer queries until it found one
+        // still in flight; on some drivers even GL_QUERY_RESULT_AVAILABLE
+        // then synchronized with the GPU (~5.9 ms in the reported run).
+        // Never probing young queries removes that self-inflicted lockstep.
+        const int slot = m_timerRingIndex;
+        if (m_timerSlotPending[slot]) {
             gl::GLint available = 0;
-            gl::GetQueryObjectiv(m_timerQueries[slot], gl::QueryResultAvailable, &available);
-            if (available == 0) {
-                if (i != 0) {
-                    break;  // in-order retirement: stop at the first gap
+            gl::GetQueryObjectiv(m_timerQueries[slot],
+                                 gl::QueryResultAvailable, &available);
+            if (available != 0) {
+                gl::GLuint64 ns = 0;
+                gl::GetQueryObjectui64v(m_timerQueries[slot],
+                                        gl::QueryResult, &ns);
+                m_timerSlotPending[slot] = false;
+                if (gl::GetError() != gl::NoError || ns == 0) {
+                    m_gpuTimingOn = false;
+                    std::fprintf(stderr,
+                                 "[Renderer] GPU timer query failed; timing disabled.\n");
+                } else {
+                    m_gpuFrameMs = static_cast<float>(
+                        static_cast<double>(ns) / 1e6);
+                    ++m_timerSamples;
                 }
-                // The slot we must re-arm THIS frame is a full ring old and
-                // still not retired (GPU 4+ frames behind -- pathological).
-                // One blocking read so its sample is not lost; this is the
-                // rare fallback, not the steady-state path.
             }
-            gl::GLuint64 ns = 0;
-            gl::GetQueryObjectui64v(m_timerQueries[slot], gl::QueryResult, &ns);
-            m_timerSlotPending[slot] = false;
-            if (gl::GetError() != gl::NoError || ns == 0) {
-                m_gpuTimingOn = false;   // driver misbehaved; report n/a
-                std::fprintf(stderr, "[Renderer] GPU timer query failed; timing disabled.\n");
-                break;
-            }
-            m_gpuFrameMs = static_cast<float>(static_cast<double>(ns) / 1e6);
         }
-        // (a driver failure above clears m_gpuTimingOn; do not re-arm then)
+
         if (m_gpuTimingOn) {
-            gl::BeginQuery(gl::TimeElapsed, m_timerQueries[m_timerRingIndex]);
+            if (m_timerSlotPending[m_timerRingIndex]) {
+                // Even a 64-frame-old query is not ready: do not wait.
+                ++m_timerOverflowSkips;
+            } else {
+                gl::BeginQuery(gl::TimeElapsed,
+                               m_timerQueries[m_timerRingIndex]);
+                m_timerArmedThisFrame = true;
+            }
         }
+        m_drainWaitMs = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - drainStart).count();
+    } else {
+        m_drainWaitMs = 0.0f;
     }
 
     if (m_hdrActive) {
         gl::BindFramebuffer(gl::Framebuffer, m_msaaFbo);
     }
     gl::Clear(gl::ColorBufferBit | gl::DepthBufferBit);
+}
+
+void Renderer::bindSceneTarget(int width, int height) {
+    gl::BindFramebuffer(gl::Framebuffer, m_hdrActive ? m_msaaFbo : 0);
+    gl::Viewport(0, 0, width, height);
 }
 
 void Renderer::drawTonemapPass() {
@@ -393,10 +431,15 @@ void Renderer::endFrame() {
     if (m_hdrActive) {
         drawTonemapPass();
     }
-    if (m_gpuTimingOn) {
+    if (m_gpuTimingOn && m_timerArmedThisFrame) {
+        // Pair the beginFrame() BeginQuery. Ring bookkeeping lives here: the
+        // slot this frame armed is m_timerQueries[m_timerRingIndex] and the
+        // index only advances when a query actually closed -- a skipped frame
+        // (M5.4 overflow) leaves both untouched for the next frame's drain.
         gl::EndQuery(gl::TimeElapsed);
         m_timerSlotPending[m_timerRingIndex] = true;
         m_timerRingIndex = (m_timerRingIndex + 1) % kTimerRingSize;
+        m_timerArmedThisFrame = false;
     }
 
     // M5.1 PERF: once-per-frame error tripwire (replaces the per-draw check

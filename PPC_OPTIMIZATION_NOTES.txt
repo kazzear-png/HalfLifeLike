@@ -1,0 +1,18 @@
+M5.7 PPC solver performance patch
+
+Changes in sandbox/src/shaders.h:
+- Exact projected-AABB reject before 8-point hull construction and emitter clipping.
+- Early return when a single/combined box footprint fully covers the emitter.
+- Exact clipped-polygon AABB reject before box-box convex intersection.
+- Skip sphere fallback when box visibility is zero or no spheres are active.
+
+These are exact rejection/early-out optimizations; they do not intentionally change PPC shadow quality or sample count.
+
+M5.7.1 capture/reference fixes
+- Screenshot and report parent directories are now created automatically.
+  Example: sandbox --scene cornell01 --benchmark 1000 --out captures/ppc/cornell01.ppm
+- tools/reference_pathtracer.py now accepts --direct-only for an apples-to-apples
+  direct rectangular-area-light reference (NEE + exact visibility, no GI bounces).
+- Python reference output and accumulator parent directories are created automatically,
+  including plain filenames such as --out shot.ppm.
+- --area-light 0 CLI wording now correctly identifies the legacy 16-point grid path.

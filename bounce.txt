@@ -1,0 +1,24 @@
+=== benchmark report ===
+gi: realtime one-bounce diffuse  surface-res: 16  rays/update: 8  history: 32  auxiliary passes/frame: 1
+gpu-timing requested: on (--gpu-timing 0 disables query overhead)
+standard: cornell-box/1.0
+scene: cornell01
+resolution: 1280x720  vsync: off  msaa: 4
+frames: 1000 (warmup 100 discarded)
+fps avg: 279.7
+frame ms: avg 3.576  min 2.287  p95 4.330
+cpu ms: avg 3.354  min 2.115  p95 4.064 (callback wall time, includes driver calls)
+gpu ms: avg 3.071  min 2.748  p95 3.946 (timer query)
+submit ms: avg 0.198  min 0.108  p95 0.354 (app + driver GL submit work)
+timer-section ms: avg 3.156  min 1.913  p95 3.807 (poll/read/error/begin combined; not isolated GPU wait)
+present ms: avg 0.195  min 0.133  p95 0.308 (SwapBuffers, 1-frame-offset)
+loop ms: avg 0.027  min 0.006  p95 0.042 (event poll + run overhead)
+budget: submit 0.198 + timer-section 3.156 + present 0.195 + loop 0.027 = 3.575  (frame 3.576)
+gpu timer: ring 64  samples 936  overflow skips 0
+ceiling: gpu 326 fps (1000/gpu ms)  submit 5054 fps (1000/submit ms)
+verdict: GPU work / driver pacing dominant; verify with --gpu-timing 0
+draw calls: 8  triangles: 36  lights: 16
+culling: on (frustum aabb, conservative)  culled draws/frame: avg 0.0  max 0
+exposure: 1.00 (fixed)  vram: not reported (no core GL query)
+shadows: on (PPC projected-polygon area visibility)
+shadow mode: area light PPC projected polygon coverage  Le: 12.00  patch: 1.30 x 1.05 m  occluders: 2 box(es) + 0 sphere(s)  analytic box projection + emitter clip/union, no march/sampling

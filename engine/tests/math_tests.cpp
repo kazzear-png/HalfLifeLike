@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 #ifdef _WIN32
 #include <io.h>   // _isatty: detect a double-clicked console run
@@ -236,6 +237,86 @@ void testInverse() {
         if (!std::isfinite(singInv.data()[i])) allFinite = false;
     }
     expectTrue(allFinite, "singular inverse contains no NaN/Inf");
+
+    // M5.5: singular matrix with LARGE elements (maxElement = 1e4). The old
+    // `det == 0.0f` test only caught exact zeros; a near-zero float det on a
+    // large-scale matrix fell into the 1/det division and produced garbage
+    // (not NaN -- silently wrong). The scaled detEpsilon catches this class.
+    engine::Mat4 nearSingular;
+    nearSingular.m[0]  = 1.0e4f;
+    nearSingular.m[5]  = 1.0e4f;
+    nearSingular.m[10] = 1.0e4f;
+    nearSingular.m[15] = 0.0f;        // rank 3 in a 1e4-scaled frame: det == 0
+    const engine::Mat4 nearInv = nearSingular.inverse();
+    expectTrue(matricesEqual(nearInv, engine::Mat4::identity(), 1e-6f),
+               "large-element singular inverse falls back to identity");
+}
+
+// M5.5: degenerate-input guards for the matrix constructors. The old code
+// fed garbage straight into tan()/1/x: zero aspect, inverted planes, up
+// parallel to the view direction, NaN anywhere -- all produced NaN/Inf
+// matrices that poisoned every downstream transform (frustum planes, normal
+// matrices). The guards fall back to identity; pinned here so they can
+// never silently regress.
+void testDegenerateGuards() {
+    std::printf("[math] degenerate input guards (M5.5)\n");
+    const float eps = 1e-6f;
+
+    // --- perspective: zero/negative aspect, inverted planes, tan poles -----
+    const engine::Mat4 badAspect = engine::Mat4::perspective(1.0f, 0.0f, 0.1f, 100.0f);
+    expectTrue(matricesEqual(badAspect, engine::Mat4::identity(), eps),
+               "perspective(aspect=0) falls back to identity");
+    const engine::Mat4 badPlanes = engine::Mat4::perspective(1.0f, 1.0f, 1.0f, 1.0f);
+    expectTrue(matricesEqual(badPlanes, engine::Mat4::identity(), eps),
+               "perspective(near==far) falls back to identity");
+    const engine::Mat4 badFov = engine::Mat4::perspective(3.14159265f, 1.0f, 0.1f, 100.0f);
+    expectTrue(matricesEqual(badFov, engine::Mat4::identity(), eps),
+               "perspective(fov~pi) falls back to identity");
+    const engine::Mat4 negNear = engine::Mat4::perspective(1.0f, 1.0f, -0.1f, 100.0f);
+    expectTrue(matricesEqual(negNear, engine::Mat4::identity(), eps),
+               "perspective(near<=0) falls back to identity");
+
+    // --- lookAt: zero direction, up parallel to view, zero up --------------
+    const engine::Mat4 badCamera = engine::Mat4::lookAt(
+        engine::Vec3(0.0f, 0.0f, 0.0f), engine::Vec3(0.0f, 0.0f, 0.0f), engine::Vec3(0.0f, 1.0f, 0.0f));
+    expectTrue(matricesEqual(badCamera, engine::Mat4::identity(), eps),
+               "lookAt(eye==target) falls back to identity");
+    const engine::Mat4 parallelUp = engine::Mat4::lookAt(
+        engine::Vec3(0.0f, 0.0f, 0.0f), engine::Vec3(0.0f, 1.0f, 0.0f), engine::Vec3(0.0f, 1.0f, 0.0f));
+    expectTrue(matricesEqual(parallelUp, engine::Mat4::identity(), eps),
+               "lookAt(up parallel to view) falls back to identity");
+    const engine::Mat4 zeroUp = engine::Mat4::lookAt(
+        engine::Vec3(0.0f, 0.0f, 0.0f), engine::Vec3(0.0f, 0.0f, 1.0f), engine::Vec3(0.0f, 0.0f, 0.0f));
+    expectTrue(matricesEqual(zeroUp, engine::Mat4::identity(), eps),
+               "lookAt(zero up) falls back to identity");
+
+    // --- NaN input: rejected to identity, never propagated -----------------
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const engine::Mat4 nanPersp = engine::Mat4::perspective(nan, 1.0f, 0.1f, 100.0f);
+    expectTrue(matricesEqual(nanPersp, engine::Mat4::identity(), eps),
+               "perspective(NaN fov) falls back to identity");
+    const engine::Mat4 nanLook = engine::Mat4::lookAt(
+        engine::Vec3(nan, 0.0f, 0.0f), engine::Vec3(0.0f, 0.0f, -1.0f), engine::Vec3(0.0f, 1.0f, 0.0f));
+    expectTrue(matricesEqual(nanLook, engine::Mat4::identity(), eps),
+               "lookAt(NaN eye) falls back to identity");
+    const engine::Mat4 nanInv = engine::Mat4::translate(engine::Vec3(nan, 0.0f, 0.0f)).inverse();
+    bool nanInvFinite = true;
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(nanInv.data()[i])) nanInvFinite = false;
+    }
+    expectTrue(nanInvFinite, "inverse(NaN matrix) contains no NaN/Inf");
+
+    // --- guards must NOT over-trigger on valid input ------------------------
+    const engine::Mat4 goodPersp = engine::Mat4::perspective(1.0f, 16.0f/9.0f, 0.1f, 100.0f);
+    expectTrue(!matricesEqual(goodPersp, engine::Mat4::identity(), eps),
+               "valid perspective is NOT identity (guard does not over-trigger)");
+    const engine::Mat4 goodLook = engine::Mat4::lookAt(
+        engine::Vec3(0.0f, 0.0f, 5.0f), engine::Vec3(0.0f, 0.0f, 0.0f), engine::Vec3(0.0f, 1.0f, 0.0f));
+    expectTrue(!matricesEqual(goodLook, engine::Mat4::identity(), eps),
+               "valid lookAt is NOT identity (guard does not over-trigger)");
+    const engine::Mat4 goodInv = engine::Mat4::translate(engine::Vec3(1.0f, 2.0f, 3.0f)).inverse();
+    expectTrue(!matricesEqual(goodInv, engine::Mat4::identity(), eps),
+               "valid inverse is NOT identity (guard does not over-trigger)");
 }
 
 } // namespace
@@ -250,6 +331,7 @@ int main() {
     testCamera();
     testTranspose();
     testInverse();
+    testDegenerateGuards();
 
     std::printf("[math] %d checks, %d failure(s)\n", g_checks, g_failures);
     pauseIfInteractive();

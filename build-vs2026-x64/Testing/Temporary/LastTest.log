@@ -1,0 +1,147 @@
+Start testing: Sep 09 14:34 Eastern Daylight Time
+----------------------------------------------------------
+1/5 Testing: math_tests
+1/5 Test: math_tests
+Command: "C:/Game project/build-vs2026-x64/bin/Release/engine_math_tests.exe"
+Directory: C:/Game project/build-vs2026-x64/engine
+"math_tests" start time: Sep 09 14:34 Eastern Daylight Time
+Output:
+----------------------------------------------------------
+[math] Vec3 basics
+[math] identity laws
+[math] translation
+[math] rotation
+[math] perspective
+[math] lookAt
+[math] camera
+[math] transpose
+[math] inverse
+[math] degenerate input guards (M5.5)
+[math] 87 checks, 0 failure(s)
+
+Press Enter to close...
+<end of output>
+Test time = 444.68 sec
+----------------------------------------------------------
+Test Passed.
+"math_tests" end time: Sep 09 14:41 Eastern Daylight Time
+"math_tests" time elapsed: 00:07:24
+----------------------------------------------------------
+
+2/5 Testing: frustum_tests
+2/5 Test: frustum_tests
+Command: "C:/Game project/build-vs2026-x64/bin/Release/engine_frustum_tests.exe"
+Directory: C:/Game project/build-vs2026-x64/engine
+"frustum_tests" start time: Sep 09 14:41 Eastern Daylight Time
+Output:
+----------------------------------------------------------
+frustum_tests: 32 checks, 0 failures
+
+Press Enter to close...
+<end of output>
+Test time =   0.20 sec
+----------------------------------------------------------
+Test Passed.
+"frustum_tests" end time: Sep 09 14:41 Eastern Daylight Time
+"frustum_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/5 Testing: obj_tests
+3/5 Test: obj_tests
+Command: "C:/Game project/build-vs2026-x64/bin/Release/engine_obj_tests.exe"
+Directory: C:/Game project/engine/tests
+"obj_tests" start time: Sep 09 14:41 Eastern Daylight Time
+Output:
+----------------------------------------------------------
+[obj] basic triangle (v//vn)
+[obj] quad with texcoords (v/vt/vn)
+[obj] pentagon, negative indices, no normals
+[obj] degenerate face skipped
+[obj] concave polygon ear-clipped (M5.5)
+[obj] malformed corner tokens rejected (M5.5)
+[obj] missing file + normalization option
+[obj] 34 checks, 0 failure(s)
+
+Press Enter to close...
+<end of output>
+Test time =   0.93 sec
+----------------------------------------------------------
+Test Passed.
+"obj_tests" end time: Sep 09 14:41 Eastern Daylight Time
+"obj_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/5 Testing: brdf_tests
+4/5 Test: brdf_tests
+Command: "C:/Game project/build-vs2026-x64/bin/Release/engine_brdf_tests.exe"
+Directory: C:/Game project/build-vs2026-x64/engine
+"brdf_tests" start time: Sep 09 14:41 Eastern Daylight Time
+Output:
+----------------------------------------------------------
+=== engine BRDF reference tests (M3.2) ===
+[brdf] V: simplified form vs independent Lambda derivation
+  alpha 0.05: max relative deviation 3.04e-07
+  alpha 0.10: max relative deviation 2.55e-07
+  alpha 0.20: max relative deviation 2.15e-07
+  alpha 0.35: max relative deviation 2.30e-07
+  alpha 0.50: max relative deviation 1.87e-07
+  alpha 0.70: max relative deviation 2.28e-07
+  alpha 0.90: max relative deviation 2.26e-07
+  alpha 1.00: max relative deviation 2.09e-07
+[brdf] closed-form anchors
+[brdf] Fresnel anchors
+[brdf] ambient split rules
+[brdf] white-furnace reference integrals (F = 1)
+  NoV 0.30 alpha 0.15: 0.893143 (ref 0.893292)
+  NoV 0.30 alpha 0.35: 0.799870 (ref 0.799860)
+  NoV 0.30 alpha 0.70: 0.669245 (ref 0.669239)
+  NoV 0.70 alpha 0.15: 0.956676 (ref 0.956664)
+  NoV 0.70 alpha 0.35: 0.803036 (ref 0.803029)
+  NoV 0.70 alpha 0.70: 0.542642 (ref 0.542640)
+  NoV 1.00 alpha 0.15: 0.969490 (ref 0.971766)
+  NoV 1.00 alpha 0.35: 0.833658 (ref 0.833726)
+  NoV 1.00 alpha 0.70: 0.503717 (ref 0.503717)
+[brdf] M3.1 regression reference (old squared-term form)
+  old form deviates 15.0% from exact Smith at NoV=NoL=0.975, alpha=0.7
+[brdf] 38 checks, 0 failure(s)
+
+Press Enter to close...
+<end of output>
+Test time =   0.40 sec
+----------------------------------------------------------
+Test Passed.
+"brdf_tests" end time: Sep 09 14:41 Eastern Daylight Time
+"brdf_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/5 Testing: bench_tests
+5/5 Test: bench_tests
+Command: "C:/Game project/build-vs2026-x64/bin/Release/engine_bench_tests.exe"
+Directory: C:/Game project/build-vs2026-x64/engine
+"bench_tests" start time: Sep 09 14:41 Eastern Daylight Time
+Output:
+----------------------------------------------------------
+=== engine benchmark tests (cornell-box/1.0 + M4 shadow march) ===
+[bench] frozen standard pins (cornell-box/1.0)
+[bench] point-light grid flux model
+[bench] geometry on disk matches the generated pins
+[bench] frozen normal orientation (M3.3.1 regression pins)
+[bench] heightfield shadow march (M4 contract pins)
+[bench] soft-penumbra shadow march (M4.0.7 contract pins)
+[bench] bracket refinement (M4.0.8 contract pins)
+[bench] centroid rig march + parallax window (M4.0.9 contract pins)
+[bench] area-light transport: exact visible-patch form factor + backprojection (M5.0 fixtures)
+[bench] shadow capture matrices (M4 contract pins)
+[bench] world->texel mapping (M4.0.4 registration pins)
+[bench] 232 checks, 0 failure(s)
+
+Press Enter to close...
+<end of output>
+Test time =   0.56 sec
+----------------------------------------------------------
+Test Passed.
+"bench_tests" end time: Sep 09 14:41 Eastern Daylight Time
+"bench_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Sep 09 14:41 Eastern Daylight Time

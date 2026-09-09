@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>   // braced range-for in testWorldToTexelMapping (MSVC discipline)
+#include <limits>             // M5.5: quiet_NaN for worldToTexel hardening pins
 #include <string>
 #include <utility>
 #include <vector>
@@ -1473,6 +1474,35 @@ void testWorldToTexelMapping() {
         expectNear(c, float(i) + 0.5f, 1e-3f, "round trip column");
         expectNear(r, float(i) + 0.5f, 1e-3f, "round trip row");
     }
+
+    // M5.5: input hardening. NaN coordinates/bounds used to sail through and
+    // produce NaN texel indices (every comparison false) -- a NaN col/row fed
+    // the registration probes' array indexing. Null out-pointers and
+    // degenerate footprints must refuse as well. The CONTINUOUS *res scale
+    // above is unchanged (it is the march's exact CPU twin; the boundary
+    // value res is handled by clamping at the array-indexing consumer).
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    expectTrue(!engine::ShadowHeightfield::worldToTexel(
+                   nan, 0.0f, minX, maxX, minZ, maxZ, res, &c, &r),
+               "NaN x refused");
+    expectTrue(!engine::ShadowHeightfield::worldToTexel(
+                   0.0f, 0.0f, nan, maxX, minZ, maxZ, res, &c, &r),
+               "NaN bound refused");
+    expectTrue(!engine::ShadowHeightfield::worldToTexel(
+                   0.0f, 0.0f, minX, minX, minZ, maxZ, res, &c, &r),
+               "zero-width footprint refused");
+    expectTrue(!engine::ShadowHeightfield::worldToTexel(
+                   0.0f, 0.0f, minX, maxX, maxZ, minZ, res, &c, &r),
+               "inverted z footprint refused");
+    expectTrue(!engine::ShadowHeightfield::worldToTexel(
+                   0.0f, 0.0f, minX, maxX, minZ, maxZ, 0u, &c, &r),
+               "zero resolution refused");
+    expectTrue(!engine::ShadowHeightfield::worldToTexel(
+                   0.0f, 0.0f, minX, maxX, minZ, maxZ, res, nullptr, &r),
+               "null outCol refused");
+    expectTrue(!engine::ShadowHeightfield::worldToTexel(
+                   0.0f, 0.0f, minX, maxX, minZ, maxZ, res, &c, nullptr),
+               "null outRow refused");
 }
 
 // ---------------------------------------------------------------------------

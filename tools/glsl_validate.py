@@ -5,7 +5,7 @@
 # script extracts every R"GLSL(...)GLSL" shader string from the sources below
 # and compiles it with the standalone Khronos glslangValidator (no GPU needed).
 #
-# Usage: python3 scripts/glsl_validate.py [repo_root]
+# Usage: python3 tools/glsl_validate.py [repo_root]
 # Exit 0 = all shaders compile; 1 = any compile error (print verbatim).
 import os, re, shutil, subprocess, sys, tempfile
 
@@ -30,6 +30,7 @@ SOURCES = [
     "sandbox/src/shaders.h",
     "engine/src/rendering/Renderer.cpp",
     "engine/src/rendering/ShadowHeightfield.cpp",
+    "engine/src/rendering/DiffuseGI.cpp",
 ]
 
 BLOCK_RE = re.compile(r'const char\*\s+(\w+)\s*=\s*R"GLSL\((.*?)\)GLSL"', re.S)
@@ -51,35 +52,61 @@ def stage_of(name: str, body: str) -> str:
 
 def main() -> int:
     root = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+    if not shutil.which(GLSLANG):
+        print("[FAIL] glslangValidator is unavailable; install it or set GLSLANG.", file=sys.stderr)
+        return 1
     failures = 0
     checked = 0
+    gi_path = os.path.join(root, "engine/src/rendering/DiffuseGI.cpp")
+    with open(gi_path, encoding="utf-8") as gi_file:
+        gi_blocks = dict(BLOCK_RE.findall(gi_file.read()))
+    common = gi_blocks["kGiCommon"]
     with tempfile.TemporaryDirectory() as td:
         for rel in SOURCES:
             path = os.path.join(root, rel)
             if not os.path.isfile(path):
-                print(f"[SKIP] missing {rel}")
+                print(f"[FAIL] missing {rel}")
+                failures += 1
                 continue
             text = open(path, "r", encoding="utf-8").read()
             for m in BLOCK_RE.finditer(text):
-                checked += 1
                 name, body = m.group(1), m.group(2)
+                if name == "kGiCommon":
+                    continue
                 # GLSL requires #version on the FIRST line of the string after
                 # the raw-string opener; files store it on the next line, so
                 # trim a single leading newline to match the shipped semantics
                 # AND keep line numbers identical to the driver's view.
                 body = body[1:] if body.startswith("\n") else body
                 stage = stage_of(name, body)
-                sp = os.path.join(td, f"{name}.{stage}")
-                open(sp, "w", encoding="utf-8").write(body)
-                r = subprocess.run([GLSLANG, sp], capture_output=True, text=True)
-                ok = r.returncode == 0
-                status = "PASS" if ok else "FAIL"
-                print(f"[{status}] {rel} :: {name} ({stage})")
-                if not ok:
-                    failures += 1
-                    err = (r.stderr or r.stdout or "").strip()
-                    for line in err.splitlines():
-                        print("      " + line)
+                # The application specializes PBR at runtime. Compile BOTH
+                # branches: the default macro alone misses the exact-area path.
+                variants = [(name, body)]
+                if name == "kPbrFragment":
+                    first, rest = body.split("\n", 1)
+                    variants = [(f"{name}_area{mode}_gi{enabled}",
+                                 first + f"\n#define AREA_FAST_BUILD {mode}\n#define SURFACE_GI_BUILD {enabled}\n"
+                                 + (common if enabled else "") + rest)
+                                for mode in (0, 1) for enabled in (0, 1)]
+                elif name == "kGiUpdateFragment":
+                    first, rest = body.split("\n", 1)
+                    variants = [(name, first + "\n" + common + rest)]
+                for label, source in variants:
+                    checked += 1
+                    sp = os.path.join(td, f"{label}.{stage}")
+                    with open(sp, "w", encoding="utf-8") as shader_file:
+                        shader_file.write(source)
+                    r = subprocess.run([GLSLANG, sp], capture_output=True, text=True)
+                    ok = r.returncode == 0
+                    status = "PASS" if ok else "FAIL"
+                    print(f"[{status}] {rel} :: {label} ({stage})")
+                    if not ok:
+                        failures += 1
+                        for line in (r.stdout + r.stderr).strip().splitlines():
+                            print("      " + line)
+    if checked == 0:
+        failures += 1
+        print("[FAIL] no shaders found")
     print(f"--- {checked} shaders checked, {failures} failed ---")
     return 1 if failures else 0
 

@@ -1,18 +1,59 @@
 #include "math/Mat4.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace engine {
+
+namespace {
+
+// M5.5: shared numerical floor for the matrix constructors below. Guards
+// exist because the old code fed garbage inputs straight into tan()/1/x
+// divisions: a zero aspect, an inverted near/far pair, or a NaN up-vector
+// produced NaN/Inf matrices that then poisoned every downstream transform
+// (frustum planes, normal matrices) instead of failing loudly to identity.
+constexpr float kMathEpsilon = 1.0e-6f;
+
+bool finiteVec3(const Vec3& v) {
+    return std::isfinite(v.x) &&
+           std::isfinite(v.y) &&
+           std::isfinite(v.z);
+}
+
+} // namespace
 
 Mat4 Mat4::identity() {
     return Mat4{};
 }
 
 Mat4 Mat4::perspective(float fovYRadians, float aspect, float nearZ, float farZ) {
+    constexpr float kPi = 3.14159265358979323846f;
+
+    // Degenerate projection -> identity (a no-op transform), never a
+    // NaN matrix. Valid callers (Camera, tests) are unaffected: the guards
+    // only reject non-finite input, zero/negative aspect, near >= far, and
+    // fov approaching 0 or pi (tan explodes towards both ends).
+    if (!std::isfinite(fovYRadians) ||
+        !std::isfinite(aspect) ||
+        !std::isfinite(nearZ) ||
+        !std::isfinite(farZ) ||
+        fovYRadians <= kMathEpsilon ||
+        fovYRadians >= kPi - kMathEpsilon ||
+        aspect <= kMathEpsilon ||
+        nearZ <= kMathEpsilon ||
+        farZ <= nearZ + kMathEpsilon) {
+        return Mat4::identity();
+    }
+
+    const float tanHalf = std::tan(fovYRadians * 0.5f);
+    if (!std::isfinite(tanHalf) || std::fabs(tanHalf) <= kMathEpsilon) {
+        return Mat4::identity();
+    }
+
     Mat4 out;
     for (float& v : out.m) v = 0.0f;
 
-    const float f = 1.0f / std::tan(fovYRadians * 0.5f);
+    const float f = 1.0f / tanHalf;
     out.m[0]  = f / aspect;
     out.m[5]  = f;
     out.m[10] = (farZ + nearZ) / (nearZ - farZ);
@@ -22,9 +63,33 @@ Mat4 Mat4::perspective(float fovYRadians, float aspect, float nearZ, float farZ)
 }
 
 Mat4 Mat4::lookAt(Vec3 eye, Vec3 target, Vec3 up) {
-    const Vec3 fwd   = normalize(target - eye);
-    const Vec3 right = normalize(cross(fwd, up));
-    const Vec3 upv   = cross(right, fwd);
+    // Degenerate camera -> identity. The old code normalized a possibly
+    // zero-length direction (NaN per-component) or a up parallel to the view
+    // direction (right = 0/0). Identity is the established fallback contract
+    // (see inverse()); a future tryInverse()-style bool out-param API can
+    // make the failure explicit for callers that care.
+    if (!finiteVec3(eye) ||
+        !finiteVec3(target) ||
+        !finiteVec3(up)) {
+        return Mat4::identity();
+    }
+
+    const Vec3 forwardDelta = target - eye;
+    if (length(forwardDelta) <= kMathEpsilon ||
+        length(up) <= kMathEpsilon) {
+        return Mat4::identity();
+    }
+
+    const Vec3 fwd = normalize(forwardDelta);
+
+    const Vec3 rightUnnormalized = cross(fwd, up);
+    if (length(rightUnnormalized) <= kMathEpsilon) {
+        // Up is parallel (or nearly parallel) to the view direction.
+        return Mat4::identity();
+    }
+
+    const Vec3 right = normalize(rightUnnormalized);
+    const Vec3 upv   = normalize(cross(right, fwd));
 
     Mat4 out;  // identity
     out.m[0]  = right.x;  out.m[4]  = right.y;  out.m[8]  = right.z;
@@ -95,8 +160,33 @@ Mat4 Mat4::inverse() const {
     const float b11 = a22 * a33 - a23 * a32;
 
     float det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
-    if (det == 0.0f) {
-        return Mat4::identity();  // singular: return identity rather than NaNs
+
+    // M5.5: the old `det == 0.0f` test missed two failure classes. (1) A
+    // near-singular matrix with LARGE elements can have det == 0 only in
+    // exact arithmetic but a tiny nonzero float det in practice -- dividing
+    // produced garbage, not NaN, and garbage slipped downstream silently.
+    // (2) An all-NaN/Inf input made every comparison false, fell through,
+    // and returned NaNs. Test the elements are finite, and scale the
+    // determinant threshold by the matrix magnitude (det ~ scale^4).
+    const float maxElement = std::max({
+        std::fabs(a00), std::fabs(a01), std::fabs(a02), std::fabs(a03),
+        std::fabs(a10), std::fabs(a11), std::fabs(a12), std::fabs(a13),
+        std::fabs(a20), std::fabs(a21), std::fabs(a22), std::fabs(a23),
+        std::fabs(a30), std::fabs(a31), std::fabs(a32), std::fabs(a33)
+    });
+
+    if (!std::isfinite(det) ||
+        !std::isfinite(maxElement) ||
+        maxElement <= kMathEpsilon) {
+        return Mat4::identity();  // degenerate: identity rather than NaNs
+    }
+
+    // Determinant scales roughly with the fourth power of the matrix's
+    // magnitude -- compare against an element-scaled epsilon, not zero.
+    const float scale = std::max(1.0f, maxElement);
+    const float detEpsilon = kMathEpsilon * scale * scale * scale * scale;
+    if (std::fabs(det) <= detEpsilon) {
+        return Mat4::identity();  // singular: identity rather than NaNs
     }
     det = 1.0f / det;
 

@@ -19,6 +19,15 @@ endif()
 # (needed on CMake 4.x; harmless on older CMake).
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
+# Populate dependencies directly on modern CMake instead of configuring a
+# nested ExternalProject build (especially costly with Visual Studio).
+if(POLICY CMP0168)
+    cmake_policy(SET CMP0168 NEW)
+endif()
+# Use extraction-time timestamps so changed dependency archives rebuild.
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
 include(FetchContent)
 
 # ---- GLFW: windowing, GL context, input. Our ONLY third-party dependency. ----
@@ -29,7 +38,6 @@ set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     glfw
     URL https://github.com/glfw/glfw/archive/refs/tags/3.4.zip
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE   # CMP0135: new behavior (silences the dev warning)
 )
 FetchContent_MakeAvailable(glfw)
 

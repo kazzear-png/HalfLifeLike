@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Game project\build-vs2026-x64\CMakeFiles\5c9386382d90ec92668ee7e1256d7562\RUN_TESTS_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{A176DF59-970D-3AE5-A9E1-07E07FC621F4}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

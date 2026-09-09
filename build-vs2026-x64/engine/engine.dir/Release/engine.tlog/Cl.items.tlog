@@ -1,0 +1,13 @@
+C:\Game project\engine\src\assets\OBJ.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\OBJ.obj
+C:\Game project\engine\src\core\Application.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Application.obj
+C:\Game project\engine\src\math\Frustum.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Frustum.obj
+C:\Game project\engine\src\math\Mat4.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Mat4.obj
+C:\Game project\engine\src\platform\Input.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Input.obj
+C:\Game project\engine\src\platform\Window.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Window.obj
+C:\Game project\engine\src\rendering\Camera.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Camera.obj
+C:\Game project\engine\src\rendering\DiffuseGI.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\DiffuseGI.obj
+C:\Game project\engine\src\rendering\GL.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\GL.obj
+C:\Game project\engine\src\rendering\Mesh.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Mesh.obj
+C:\Game project\engine\src\rendering\Renderer.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Renderer.obj
+C:\Game project\engine\src\rendering\Shader.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\Shader.obj
+C:\Game project\engine\src\rendering\ShadowHeightfield.cpp;C:\Game project\build-vs2026-x64\engine\engine.dir\Release\ShadowHeightfield.obj

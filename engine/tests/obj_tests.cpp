@@ -122,6 +122,34 @@ f 1//1 2//1 3//1
 f 1//1 1//1 2//1
 )OBJ";
 
+// M5.5: CONCAVE polygon (reflex vertex at "v 1 1 0" -- the notch). The old
+// corner-0 fan emitted a triangle extending into the notch region (or relied
+// on the middle fan triangle being exactly degenerate to accidentally tile).
+// Ear clipping must decompose it into exactly 3 triangles that tile the
+// polygon and stay inside it.
+const char* kConcavePentagon = R"OBJ(v 0 0 0
+v 2 0 0
+v 2 2 0
+v 1 1 0
+v 0 2 0
+f 1 2 3 4 5
+)OBJ";
+
+// M5.5: malformed corner tokens. atoll() silently read "1.5" as corner 1,
+// "2x" as corner 2, and "x" as corner 0; strict parsing must drop these
+// faces loudly (skippedFaces), leaving only the one valid face.
+const char* kGarbageCorners = R"OBJ(v 0 0 0
+v 1 0 0
+v 0 1 0
+vn 0 0 1
+f 1//1 2//1 3//1
+f 1.5//1 2//1 3//1
+f x//1 2//1 3//1
+f 0//1 2//1 3//1
+f 1//1 2x//1 3//1
+f 1 2
+)OBJ";
+
 } // namespace
 
 int main() {
@@ -143,11 +171,15 @@ int main() {
     const std::string quadPath = dir + "/quad.obj";
     const std::string pentPath = dir + "/pentagon.obj";
     const std::string degenPath = dir + "/degenerate.obj";
+    const std::string concavePath = dir + "/concave.obj";
+    const std::string garbagePath = dir + "/garbage_corners.obj";
 
     writeFile(triPath, kTriangle);
     writeFile(quadPath, kQuadWithVt);
     writeFile(pentPath, kPentagonNoNormals);
     writeFile(degenPath, kWithDegenerate);
+    writeFile(concavePath, kConcavePentagon);
+    writeFile(garbagePath, kGarbageCorners);
 
     std::printf("[obj] basic triangle (v//vn)\n");
     {
@@ -202,6 +234,93 @@ int main() {
         expectTrue(r.ok, "degenerate-face file still loads");
         expectTrue(r.triangleCount == 1, "only the valid triangle is kept");
         expectTrue(r.skippedFaces == 1, "degenerate face counted as skipped");
+    }
+
+    std::printf("[obj] concave polygon ear-clipped (M5.5)\n");
+    {
+        // centerToOrigin = false: the geometric assertions below use the
+        // AUTHORED absolute coordinates (loadOBJ defaults would translate
+        // the bbox center to the origin).
+        engine::LoadObjOptions opts;
+        opts.centerToOrigin = false;
+        opts.targetRadius   = 0.0f;
+        engine::LoadObjResult r = engine::loadOBJ(concavePath, opts);
+        expectTrue(r.ok, "concave load succeeds");
+        expectTrue(r.triangleCount == 3, "concave pentagon -> exactly 3 triangles");
+
+        // The authored polygon (XY plane, CCW, area 3.0): square [0,2]^2 with
+        // a triangular notch above the lines (2,2)-(1,1) and (1,1)-(0,2).
+        const engine::Vec3 poly[5] = {
+            engine::Vec3(0, 0, 0), engine::Vec3(2, 0, 0), engine::Vec3(2, 2, 0),
+            engine::Vec3(1, 1, 0), engine::Vec3(0, 2, 0)
+        };
+
+        // Ray-cast point-in-polygon (xy components; polygon is planar).
+        auto insidePoly = [](float px, float py) -> bool {
+            const float xs[5] = { 0.0f, 2.0f, 2.0f, 1.0f, 0.0f };
+            const float ys[5] = { 0.0f, 0.0f, 2.0f, 1.0f, 2.0f };
+            bool inside = false;
+            for (int i = 0, j = 4; i < 5; j = i++) {
+                if ((ys[i] > py) != (ys[j] > py) &&
+                    px < (xs[j] - xs[i]) * (py - ys[i]) / (ys[j] - ys[i]) + xs[i]) {
+                    inside = !inside;
+                }
+            }
+            return inside;
+        };
+
+        float totalArea = 0.0f;
+        bool allCentroidsInside = true;
+        bool allVerticesAreCorners = true;
+        for (std::size_t t = 0; t + 2 < r.indices.size(); t += 3) {
+            const engine::Vertex& va = r.vertices[r.indices[t + 0]];
+            const engine::Vertex& vb = r.vertices[r.indices[t + 1]];
+            const engine::Vertex& vc = r.vertices[r.indices[t + 2]];
+            const engine::Vec3 a(va.x, va.y, va.z);
+            const engine::Vec3 b(vb.x, vb.y, vb.z);
+            const engine::Vec3 c(vc.x, vc.y, vc.z);
+
+            // Area accumulation: tiling must sum to the polygon area exactly
+            // (outside-extension or overlap would both move the sum).
+            const engine::Vec3 ab = b - a, ac = c - a;
+            totalArea += 0.5f * engine::length(engine::cross(ab, ac));
+
+            // Every vertex must be one of the 5 authored corners.
+            for (const engine::Vec3* v : { &a, &b, &c }) {
+                bool isCorner = false;
+                for (const engine::Vec3& p : poly) {
+                    if (std::fabs(v->x - p.x) < 1e-5f &&
+                        std::fabs(v->y - p.y) < 1e-5f &&
+                        std::fabs(v->z - p.z) < 1e-5f) {
+                        isCorner = true;
+                    }
+                }
+                if (!isCorner) allVerticesAreCorners = false;
+            }
+
+            // Centroid strictly inside the polygon.
+            const float cx = (a.x + b.x + c.x) / 3.0f;
+            const float cy = (a.y + b.y + c.y) / 3.0f;
+            if (!insidePoly(cx, cy)) {
+                allCentroidsInside = false;
+            }
+        }
+        expectNear(totalArea, 3.0f, 1e-4f, "triangles tile the polygon exactly (area sum)");
+        expectTrue(allVerticesAreCorners, "no vertex outside the authored corner set");
+        expectTrue(allCentroidsInside, "no triangle centroid outside the polygon");
+    }
+
+    std::printf("[obj] malformed corner tokens rejected (M5.5)\n");
+    {
+        engine::LoadObjResult r = engine::loadOBJ(garbagePath);
+        expectTrue(r.ok, "garbage-corner file still loads");
+        expectTrue(r.triangleCount == 1, "only the valid face loads");
+        // "1.5//1", "x//1", "0//1", "2x//1" faces + the 2-corner face.
+        expectTrue(r.skippedFaces == 5, "all 5 malformed faces counted as skipped");
+        expectTrue(r.warnings.find("skipped 5") != std::string::npos,
+                   "skip warning emitted for malformed corners");
+        // Nothing from garbage faces leaked into the vertex buffer.
+        expectTrue(r.vertices.size() == 3, "only the valid triangle's 3 vertices emitted");
     }
 
     std::printf("[obj] missing file + normalization option\n");
